@@ -3,7 +3,7 @@
 //! Tests the full library functionality.
 
 const std = @import("std");
-const ztun = @import("ztun");
+const ztun = @import("tun");
 const Device = ztun.Device;
 const Ipv4Address = ztun.Ipv4Address;
 

@@ -3,10 +3,10 @@
 //! Tests individual functions with no external dependencies.
 
 const std = @import("std");
-const ztun = @import("ztun");
-const DeviceConfig = @import("../src/device.zig").DeviceConfig;
-const Ipv4Address = @import("../src/device.zig").Ipv4Address;
-const Ipv6Address = @import("../src/device.zig").Ipv6Address;
+const ztun = @import("tun");
+const DeviceConfig = ztun.DeviceConfig;
+const Ipv4Address = ztun.Ipv4Address;
+const Ipv6Address = ztun.Ipv6Address;
 
 // ==================== IPv4 Address Tests ====================
 
