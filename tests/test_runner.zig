@@ -7,6 +7,7 @@
 //! swap src/dst, fix checksum, send it back, then exit.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ztun = @import("tun");
 const Device = ztun.Device;
 const Ipv4Address = ztun.Ipv4Address;
@@ -94,15 +95,18 @@ fn checksum(data: []const u8) u16 {
 fn testSyncIcmpEchoReply(_: *anyopaque) bool {
     const allocator = std.heap.page_allocator;
 
+    // Print platform info for debugging
+    std.debug.print("  Platform: {s}\n", .{@tagName(builtin.os.tag)});
+
     const tun_addr: Ipv4Address = .{ 10, 0, 0, 1 };
     var builder = ztun.DeviceBuilder.init();
     _ = builder.setName("ztun-test");
     _ = builder.setMtu(1500);
     _ = builder.setIpv4(tun_addr, 24, null);
 
-    const device = builder.build() catch {
-        std.debug.print("  Skipping: Failed to create TUN device (may need root privileges)\n", .{});
-        return true;
+    const device = builder.build() catch |err| {
+        std.debug.print("  Failed to create TUN device: {} (os={s})\n", .{ err, @tagName(builtin.os.tag) });
+        return false;  // Test fails if we can't create device
     };
     defer device.destroy();
 

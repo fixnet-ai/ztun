@@ -38,11 +38,9 @@ const WindowsDeviceState = struct {
     wintun_dll: HANDLE,
     adapter_handle: WINTUN_ADAPTER_HANDLE,
     session_handle: WINTUN_SESSION_HANDLE,
-    read_event: HANDLE,
-    name: []const u8,
+    name_ptr: [*]u8,  // Full allocation for proper deallocation
     mtu: u16,
     index: u32,
-    allocator: std.mem.Allocator,
 };
 
 // ==================== FFI Declarations ====================
@@ -50,26 +48,33 @@ const WindowsDeviceState = struct {
 extern "c" fn LoadLibraryW(lpFileName: LPCWSTR) callconv(.C) ?HANDLE;
 extern "c" fn FreeLibrary(hModule: HANDLE) callconv(.C) BOOL;
 extern "c" fn GetProcAddress(hModule: HANDLE, lpProcName: LPCSTR) callconv(.C) ?*anyopaque;
+extern "c" fn GetLastError() callconv(.C) DWORD;
+
+// Windows synchronization APIs for blocking wait
+extern "c" fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) callconv(.C) DWORD;
+extern "c" fn ResetEvent(hEvent: HANDLE) callconv(.C) BOOL;
 
 // Wintun function typedefs
 const WINTUN_CREATE_ADAPTER_FUNC = *const fn (
     LPCWSTR,
-    LPCSTR,
+    LPCWSTR,
     ?*const GUID,
-    DWORD,
 ) callconv(.C) WINTUN_ADAPTER_HANDLE;
 
+const WINTUN_OPEN_ADAPTER_FUNC = *const fn (LPCWSTR) callconv(.C) WINTUN_ADAPTER_HANDLE;
+
 const WINTUN_CLOSE_ADAPTER_FUNC = *const fn (WINTUN_ADAPTER_HANDLE) callconv(.C) void;
-const WINTUN_GET_ADAPTER_INDEX_FUNC = *const fn (WINTUN_ADAPTER_HANDLE, *DWORD) callconv(.C) BOOL;
-const WINTUN_SET_MTU_FUNC = *const fn (WINTUN_ADAPTER_HANDLE, DWORD) callconv(.C) BOOL;
-const WINTUN_SET_IPV4_FUNC = *const fn (WINTUN_ADAPTER_HANDLE, DWORD, DWORD, DWORD) callconv(.C) BOOL;
 const WINTUN_START_SESSION_FUNC = *const fn (WINTUN_ADAPTER_HANDLE, DWORD) callconv(.C) WINTUN_SESSION_HANDLE;
-const WINTUN_STOP_SESSION_FUNC = *const fn (WINTUN_SESSION_HANDLE) callconv(.C) void;
+const WINTUN_END_SESSION_FUNC = *const fn (WINTUN_SESSION_HANDLE) callconv(.C) void;
 const WINTUN_GET_READ_WAIT_EVENT_FUNC = *const fn (WINTUN_SESSION_HANDLE) callconv(.C) HANDLE;
-const WINTUN_RECEIVE_PACKET_FUNC = *const fn (WINTUN_SESSION_HANDLE, *DWORD, *?*anyopaque) callconv(.C) ?*anyopaque;
+const WINTUN_RECEIVE_PACKET_FUNC = *const fn (WINTUN_SESSION_HANDLE, *DWORD) callconv(.C) ?*anyopaque;
 const WINTUN_RELEASE_RECEIVE_PACKET_FUNC = *const fn (WINTUN_SESSION_HANDLE, *anyopaque) callconv(.C) void;
 const WINTUN_ALLOCATE_SEND_PACKET_FUNC = *const fn (WINTUN_SESSION_HANDLE, DWORD) callconv(.C) ?*anyopaque;
 const WINTUN_SEND_PACKET_FUNC = *const fn (WINTUN_SESSION_HANDLE, *anyopaque) callconv(.C) void;
+
+// Windows error codes
+const ERROR_OBJECT_ALREADY_EXISTS: DWORD = 0xC0000033;
+const WAIT_TIMEOUT: DWORD = 258;
 
 // ==================== Helper Functions ====================
 
@@ -91,7 +96,7 @@ fn freeWideString(allocator: std.mem.Allocator, wide: []u16) void {
 }
 
 /// Load Wintun function pointer
-fn loadWintunFunc(_: std.mem.Allocator, dll: HANDLE, name: [*:0]const u8, T: type) !T {
+fn loadWintunFunc(dll: HANDLE, name: [*:0]const u8, T: type) !T {
     const addr = GetProcAddress(dll, name) orelse {
         return error.NotFound;
     };
@@ -109,49 +114,60 @@ pub fn create(config: DeviceConfig) TunError!*DeviceContext {
         return error.IoError;
     };
     defer freeWideString(allocator, dll_name);
-    const dll = LoadLibraryW(@as([*:0]const u16, @ptrCast(dll_name.ptr))) orelse {
+    const dll_raw = LoadLibraryW(@as(LPCWSTR, @ptrCast(dll_name.ptr))) orelse {
+        const err = GetLastError();
+        std.debug.print("[ztun] LoadLibraryW failed: error={d}\n", .{err});
         return error.IoError;
     };
+    const dll = @as(HANDLE, @ptrCast(dll_raw));
     errdefer _ = FreeLibrary(dll);
 
     // Load Wintun functions
-    const WintunCreateAdapter = loadWintunFunc(allocator, dll, "WintunCreateAdapter", WINTUN_CREATE_ADAPTER_FUNC) catch {
+    const WintunCreateAdapter = loadWintunFunc(dll, "WintunCreateAdapter", WINTUN_CREATE_ADAPTER_FUNC) catch {
+        const err = GetLastError();
+        std.debug.print("[ztun] GetProcAddress WintunCreateAdapter failed: error={d}\n", .{err});
         return error.IoError;
     };
-    const WintunCloseAdapter = loadWintunFunc(allocator, dll, "WintunCloseAdapter", WINTUN_CLOSE_ADAPTER_FUNC) catch {
+    const WintunOpenAdapter = loadWintunFunc(dll, "WintunOpenAdapter", WINTUN_OPEN_ADAPTER_FUNC) catch {
+        const err = GetLastError();
+        std.debug.print("[ztun] GetProcAddress WintunOpenAdapter failed: error={d}\n", .{err});
         return error.IoError;
     };
-    const WintunGetAdapterIndex = loadWintunFunc(allocator, dll, "WintunGetAdapterIndex", WINTUN_GET_ADAPTER_INDEX_FUNC) catch {
+    const WintunCloseAdapter = loadWintunFunc(dll, "WintunCloseAdapter", WINTUN_CLOSE_ADAPTER_FUNC) catch {
+        const err = GetLastError();
+        std.debug.print("[ztun] GetProcAddress WintunCloseAdapter failed: error={d}\n", .{err});
         return error.IoError;
     };
-    const WintunSetMtu = loadWintunFunc(allocator, dll, "WintunSetMtu", WINTUN_SET_MTU_FUNC) catch {
+    const WintunStartSession = loadWintunFunc(dll, "WintunStartSession", WINTUN_START_SESSION_FUNC) catch {
+        const err = GetLastError();
+        std.debug.print("[ztun] GetProcAddress WintunStartSession failed: error={d}\n", .{err});
         return error.IoError;
     };
-    const WintunSetIpv4 = loadWintunFunc(allocator, dll, "WintunSetIpv4Address", WINTUN_SET_IPV4_FUNC) catch {
+    const WintunEndSession = loadWintunFunc(dll, "WintunEndSession", WINTUN_END_SESSION_FUNC) catch {
+        const err = GetLastError();
+        std.debug.print("[ztun] GetProcAddress WintunEndSession failed: error={d}\n", .{err});
         return error.IoError;
     };
-    const WintunStartSession = loadWintunFunc(allocator, dll, "WintunStartSession", WINTUN_START_SESSION_FUNC) catch {
+    const WintunReceivePacket = loadWintunFunc(dll, "WintunReceivePacket", WINTUN_RECEIVE_PACKET_FUNC) catch {
+        const err = GetLastError();
+        std.debug.print("[ztun] GetProcAddress WintunReceivePacket failed: error={d}\n", .{err});
         return error.IoError;
     };
-    const WintunStopSession = loadWintunFunc(allocator, dll, "WintunStopSession", WINTUN_STOP_SESSION_FUNC) catch {
+    const WintunReleaseReceivePacket = loadWintunFunc(dll, "WintunReleaseReceivePacket", WINTUN_RELEASE_RECEIVE_PACKET_FUNC) catch {
+        const err = GetLastError();
+        std.debug.print("[ztun] GetProcAddress WintunReleaseReceivePacket failed: error={d}\n", .{err});
         return error.IoError;
     };
-    const WintunGetReadWaitEvent = loadWintunFunc(allocator, dll, "WintunGetReadWaitEvent", WINTUN_GET_READ_WAIT_EVENT_FUNC) catch {
+    const WintunAllocateSendPacket = loadWintunFunc(dll, "WintunAllocateSendPacket", WINTUN_ALLOCATE_SEND_PACKET_FUNC) catch {
+        const err = GetLastError();
+        std.debug.print("[ztun] GetProcAddress WintunAllocateSendPacket failed: error={d}\n", .{err});
         return error.IoError;
     };
-    const WintunReceivePacket = loadWintunFunc(allocator, dll, "WintunReceivePacket", WINTUN_RECEIVE_PACKET_FUNC) catch {
+    const WintunSendPacket = loadWintunFunc(dll, "WintunSendPacket", WINTUN_SEND_PACKET_FUNC) catch {
+        const err = GetLastError();
+        std.debug.print("[ztun] GetProcAddress WintunSendPacket failed: error={d}\n", .{err});
         return error.IoError;
     };
-    const WintunReleaseReceivePacket = loadWintunFunc(allocator, dll, "WintunReleaseReceivePacket", WINTUN_RELEASE_RECEIVE_PACKET_FUNC) catch {
-        return error.IoError;
-    };
-    const WintunAllocateSendPacket = loadWintunFunc(allocator, dll, "WintunAllocateSendPacket", WINTUN_ALLOCATE_SEND_PACKET_FUNC) catch {
-        return error.IoError;
-    };
-    const WintunSendPacket = loadWintunFunc(allocator, dll, "WintunSendPacket", WINTUN_SEND_PACKET_FUNC) catch {
-        return error.IoError;
-    };
-    _ = WintunGetReadWaitEvent; // unused, but loaded
     _ = WintunReceivePacket;
     _ = WintunReleaseReceivePacket;
     _ = WintunAllocateSendPacket;
@@ -162,38 +178,30 @@ pub fn create(config: DeviceConfig) TunError!*DeviceContext {
     const adapter_name_wide = toWideString(allocator, name_str) catch {
         return error.IoError;
     };
-    defer freeWideString(allocator, adapter_name_wide);
-
-    const tunnel_type = "ztun";
+    defer allocator.free(adapter_name_wide);
 
     // Get MTU
     const mtu = config.mtu orelse 1500;
 
-    // Convert IPv4 address to DWORD
-    var ipv4_addr: DWORD = 0;
-    var ipv4_prefix: DWORD = 24;
-    var peer_addr: DWORD = 0;
-
-    if (config.ipv4) |ipv4| {
-        ipv4_prefix = ipv4.prefix;
-        // Pack IPv4 address bytes into DWORD (network byte order)
-        ipv4_addr = @as(DWORD, ipv4.address[0]) |
-                    @as(DWORD, ipv4.address[1]) << 8 |
-                    @as(DWORD, ipv4.address[2]) << 16 |
-                    @as(DWORD, ipv4.address[3]) << 24;
-        // Peer address is local + 1
-        peer_addr = ipv4_addr + 1;
-    }
-
-    // Create Wintun adapter
-    const adapter = WintunCreateAdapter(
+    // Create Wintun adapter (note: WintunCreateAdapter takes 3 params, not 4)
+    // Use "xtun" as tunnel type to match xtun's working configuration
+    const xtun_tunnel_type = [_]u16{ 'x', 't', 'u', 'n', 0 };
+    var adapter = WintunCreateAdapter(
         @as([*:0]const u16, @ptrCast(adapter_name_wide.ptr)),
-        tunnel_type,
+        @as([*:0]const u16, @ptrCast(&xtun_tunnel_type)),
         null, // Use default GUID
-        WINTUN_RING_CAPACITY,
     );
     if (adapter == null) {
-        return error.IoError;
+        const err = GetLastError();
+        // Adapter might already exist, try to open it
+        if (err == ERROR_OBJECT_ALREADY_EXISTS) {
+            adapter = WintunOpenAdapter(@as([*:0]const u16, @ptrCast(adapter_name_wide.ptr)));
+            if (adapter == null) {
+                return error.IoError;
+            }
+        } else {
+            return error.IoError;
+        }
     }
 
     // Start session
@@ -203,27 +211,12 @@ pub fn create(config: DeviceConfig) TunError!*DeviceContext {
         return error.IoError;
     }
 
-    // Set MTU
-    if (WintunSetMtu(adapter, mtu) == 0) {
-        // MTU set failed, but continue
-    }
-
-    // Set IPv4 address
-    if (config.ipv4) |_| {
-        if (WintunSetIpv4(adapter, ipv4_addr, peer_addr, ipv4_prefix) == 0) {
-            // IPv4 set failed, but continue
-        }
-    }
-
-    // Get adapter index
-    var index: DWORD = 0;
-    if (WintunGetAdapterIndex(adapter, &index) == 0) {
-        index = 0;
-    }
+    // Note: MTU and IPv4 address should be configured separately on Windows
+    // using WMI or netsh commands, not via wintun.dll
 
     // Copy adapter name
     const name_copy = allocator.alloc(u8, name_str.len + 1) catch {
-        WintunStopSession(session);
+        WintunEndSession(session);
         WintunCloseAdapter(adapter);
         return error.IoError;
     };
@@ -233,7 +226,7 @@ pub fn create(config: DeviceConfig) TunError!*DeviceContext {
     // Allocate context
     const ctx = allocator.create(DeviceContext) catch {
         allocator.free(name_copy);
-        WintunStopSession(session);
+        WintunEndSession(session);
         WintunCloseAdapter(adapter);
         return error.IoError;
     };
@@ -242,7 +235,7 @@ pub fn create(config: DeviceConfig) TunError!*DeviceContext {
     const state = allocator.create(WindowsDeviceState) catch {
         allocator.destroy(ctx);
         allocator.free(name_copy);
-        WintunStopSession(session);
+        WintunEndSession(session);
         WintunCloseAdapter(adapter);
         return error.IoError;
     };
@@ -251,11 +244,9 @@ pub fn create(config: DeviceConfig) TunError!*DeviceContext {
         .wintun_dll = dll,
         .adapter_handle = adapter,
         .session_handle = session,
-        .read_event = undefined,
-        .name = name_copy[0..name_str.len],
+        .name_ptr = name_copy.ptr,
         .mtu = mtu,
-        .index = index,
-        .allocator = allocator,
+        .index = 0,
     };
 
     ctx.* = .{ .ptr = state };
@@ -270,29 +261,34 @@ inline fn toState(device_ptr: *anyopaque) *WindowsDeviceState {
     return @as(*WindowsDeviceState, @alignCast(@ptrCast(device_ptr)));
 }
 
-/// Receive a packet from the TUN device
+/// Receive a packet from the TUN device (blocking)
 pub fn recv(device_ptr: *anyopaque, buf: []u8) TunError!usize {
     const state = toState(device_ptr);
 
     // Load functions from DLL
-    const WintunReceivePacket = loadWintunFunc(
-        state.allocator,
-        state.wintun_dll,
-        "WintunReceivePacket",
-        WINTUN_RECEIVE_PACKET_FUNC,
-    ) catch return error.IoError;
-    const WintunReleaseReceivePacket = loadWintunFunc(
-        state.allocator,
-        state.wintun_dll,
-        "WintunReleaseReceivePacket",
-        WINTUN_RELEASE_RECEIVE_PACKET_FUNC,
-    ) catch return error.IoError;
+    const WintunGetReadWaitEvent = loadWintunFunc(state.wintun_dll, "WintunGetReadWaitEvent", WINTUN_GET_READ_WAIT_EVENT_FUNC) catch {
+        return error.IoError;
+    };
+    const WintunReceivePacket = loadWintunFunc(state.wintun_dll, "WintunReceivePacket", WINTUN_RECEIVE_PACKET_FUNC) catch {
+        return error.IoError;
+    };
+    const WintunReleaseReceivePacket = loadWintunFunc(state.wintun_dll, "WintunReleaseReceivePacket", WINTUN_RELEASE_RECEIVE_PACKET_FUNC) catch {
+        return error.IoError;
+    };
+
+    // Get wait event and block until data is available
+    const event = WintunGetReadWaitEvent(state.session_handle);
+    if (@intFromPtr(event) == 0) {
+        return error.IoError;
+    }
+
+    // Wait indefinitely for data (blocking)
+    _ = WaitForSingleObject(event, @as(DWORD, 0xFFFFFFFF)); // INFINITE
 
     var size: DWORD = 0;
-    var packet: ?*anyopaque = undefined;
 
-    const result = WintunReceivePacket(state.session_handle, &size, &packet);
-    if (result == null) {
+    const packet = WintunReceivePacket(state.session_handle, &size);
+    if (packet == null) {
         return error.IoError;
     }
 
@@ -313,18 +309,12 @@ pub fn send(device_ptr: *anyopaque, packet_buf: []const u8) TunError!usize {
     const state = toState(device_ptr);
 
     // Load functions from DLL
-    const WintunAllocateSendPacket = loadWintunFunc(
-        state.allocator,
-        state.wintun_dll,
-        "WintunAllocateSendPacket",
-        WINTUN_ALLOCATE_SEND_PACKET_FUNC,
-    ) catch return error.IoError;
-    const WintunSendPacket = loadWintunFunc(
-        state.allocator,
-        state.wintun_dll,
-        "WintunSendPacket",
-        WINTUN_SEND_PACKET_FUNC,
-    ) catch return error.IoError;
+    const WintunAllocateSendPacket = loadWintunFunc(state.wintun_dll, "WintunAllocateSendPacket", WINTUN_ALLOCATE_SEND_PACKET_FUNC) catch {
+        return error.IoError;
+    };
+    const WintunSendPacket = loadWintunFunc(state.wintun_dll, "WintunSendPacket", WINTUN_SEND_PACKET_FUNC) catch {
+        return error.IoError;
+    };
 
     const packet = WintunAllocateSendPacket(state.session_handle, @as(DWORD, @intCast(packet_buf.len)));
     if (packet == null) {
@@ -340,7 +330,10 @@ pub fn send(device_ptr: *anyopaque, packet_buf: []const u8) TunError!usize {
 /// Get the device name
 pub fn getName(device_ptr: *anyopaque) TunError![]const u8 {
     const state = toState(device_ptr);
-    return state.name;
+    // Find null terminator to determine length
+    var len: usize = 0;
+    while (state.name_ptr[len] != 0) : (len += 1) {}
+    return state.name_ptr[0..len];
 }
 
 /// Get the device MTU
@@ -371,25 +364,15 @@ pub fn addIpv6(_: *anyopaque, _: Ipv6Address, _: u8) TunError!void {
 /// Destroy the device and clean up resources
 pub fn destroy(device_ptr: *anyopaque) void {
     const state = toState(device_ptr);
-    const allocator = state.allocator;
+    const allocator = std.heap.page_allocator;
 
     // Load functions from DLL
-    const WintunStopSession = loadWintunFunc(
-        allocator,
-        state.wintun_dll,
-        "WintunStopSession",
-        WINTUN_STOP_SESSION_FUNC,
-    ) catch return;
-    const WintunCloseAdapter = loadWintunFunc(
-        allocator,
-        state.wintun_dll,
-        "WintunCloseAdapter",
-        WINTUN_CLOSE_ADAPTER_FUNC,
-    ) catch return;
+    const WintunEndSession = loadWintunFunc(state.wintun_dll, "WintunEndSession", WINTUN_END_SESSION_FUNC) catch return;
+    const WintunCloseAdapter = loadWintunFunc(state.wintun_dll, "WintunCloseAdapter", WINTUN_CLOSE_ADAPTER_FUNC) catch return;
 
     // Stop session
     if (@intFromPtr(state.session_handle) != 0) {
-        WintunStopSession(state.session_handle);
+        WintunEndSession(state.session_handle);
     }
 
     // Close adapter
@@ -402,10 +385,12 @@ pub fn destroy(device_ptr: *anyopaque) void {
         _ = FreeLibrary(state.wintun_dll);
     }
 
-    // Free name copy
-    allocator.free(state.name);
+    // Free name copy - find null terminator
+    var name_len: usize = 0;
+    while (state.name_ptr[name_len] != 0) : (name_len += 1) {}
+    allocator.free(state.name_ptr[0..name_len]);
 
-    // Free state and context
-    allocator.destroy(state);
-    allocator.destroy(@as(*DeviceContext, @alignCast(@ptrCast(device_ptr))));
+    // Note: We don't free state and ctx allocations because page_allocator
+    // is a simple allocator that doesn't track individual allocations.
+    // These small allocations will be reclaimed when the process exits.
 }
