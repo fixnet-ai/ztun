@@ -28,8 +28,8 @@ const GUID = extern struct {
 };
 
 // WINTUN types
-const WINTUN_ADAPTER_HANDLE = *opaque {};
-const WINTUN_SESSION_HANDLE = *opaque {};
+const WINTUN_ADAPTER_HANDLE = ?*opaque {};
+const WINTUN_SESSION_HANDLE = ?*opaque {};
 const WINTUN_RING_CAPACITY: u32 = 0x20_0000;
 
 // ==================== Device State ====================
@@ -75,9 +75,12 @@ const WINTUN_SEND_PACKET_FUNC = *const fn (WINTUN_SESSION_HANDLE, *anyopaque) ca
 
 /// Convert ASCII string to UTF-16
 fn toWideString(allocator: std.mem.Allocator, str: []const u8) ![]u16 {
-    const wide_len = try std.unicode.utf8ToUtf16LeAllocLen(str);
+    // Count UTF-16 code units needed (ASCII = same length)
+    const wide_len = str.len;
     const wide = try allocator.alloc(u16, wide_len + 1);
-    std.unicode.utf8ToUtf16Le(wide, str) catch unreachable;
+    for (str, 0..) |c, i| {
+        wide[i] = c; // ASCII characters map 1:1 to UTF-16
+    }
     wide[wide_len] = 0;
     return wide;
 }
@@ -106,7 +109,7 @@ pub fn create(config: DeviceConfig) TunError!*DeviceContext {
         return error.IoError;
     };
     defer freeWideString(allocator, dll_name);
-    const dll = LoadLibraryW(dll_name.ptr) orelse {
+    const dll = LoadLibraryW(@as([*:0]const u16, @ptrCast(dll_name.ptr))) orelse {
         return error.IoError;
     };
     errdefer _ = FreeLibrary(dll);
@@ -184,7 +187,7 @@ pub fn create(config: DeviceConfig) TunError!*DeviceContext {
 
     // Create Wintun adapter
     const adapter = WintunCreateAdapter(
-        adapter_name_wide.ptr,
+        @as([*:0]const u16, @ptrCast(adapter_name_wide.ptr)),
         tunnel_type,
         null, // Use default GUID
         WINTUN_RING_CAPACITY,
@@ -248,7 +251,7 @@ pub fn create(config: DeviceConfig) TunError!*DeviceContext {
         .wintun_dll = dll,
         .adapter_handle = adapter,
         .session_handle = session,
-        .read_event = null,
+        .read_event = undefined,
         .name = name_copy[0..name_str.len],
         .mtu = mtu,
         .index = index,
@@ -328,8 +331,8 @@ pub fn send(device_ptr: *anyopaque, packet_buf: []const u8) TunError!usize {
         return error.IoError;
     }
 
-    @memcpy(@as([*]u8, @ptrCast(packet))[0..packet_buf.len], packet_buf);
-    WintunSendPacket(state.session_handle, packet);
+    @memcpy(@as([*]u8, @ptrCast(packet.?))[0..packet_buf.len], packet_buf);
+    WintunSendPacket(state.session_handle, packet.?);
 
     return packet_buf.len;
 }
@@ -385,17 +388,17 @@ pub fn destroy(device_ptr: *anyopaque) void {
     ) catch return;
 
     // Stop session
-    if (state.session_handle != null) {
+    if (@intFromPtr(state.session_handle) != 0) {
         WintunStopSession(state.session_handle);
     }
 
     // Close adapter
-    if (state.adapter_handle != null) {
+    if (@intFromPtr(state.adapter_handle) != 0) {
         WintunCloseAdapter(state.adapter_handle);
     }
 
     // Free DLL
-    if (state.wintun_dll != null) {
+    if (@intFromPtr(state.wintun_dll) != 0) {
         _ = FreeLibrary(state.wintun_dll);
     }
 
@@ -404,5 +407,5 @@ pub fn destroy(device_ptr: *anyopaque) void {
 
     // Free state and context
     allocator.destroy(state);
-    allocator.destroy(@as(*DeviceContext, @ptrCast(device_ptr)));
+    allocator.destroy(@as(*DeviceContext, @alignCast(@ptrCast(device_ptr))));
 }

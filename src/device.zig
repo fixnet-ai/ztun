@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 // Import platform-specific implementation directly
 const linux_impl = if (builtin.os.tag == .linux) @import("device_linux.zig") else struct {};
 const macos_impl = if (builtin.os.tag == .macos) @import("device_macos.zig") else struct {};
+const windows_impl = if (builtin.os.tag == .windows) @import("device_windows.zig") else struct {};
 
 /// Error type for TUN operations
 pub const TunError = error{
@@ -61,6 +62,7 @@ pub const Device = struct {
         const ctx_ptr = switch (builtin.os.tag) {
             .linux => try linux_impl.create(config),
             .macos => try macos_impl.create(config),
+            .windows => try windows_impl.create(config),
             else => unreachable,
         };
         return Device{ .ctx = ctx_ptr };
@@ -71,6 +73,7 @@ pub const Device = struct {
         return switch (builtin.os.tag) {
             .linux => linux_impl.recv(self.ctx.ptr, buf),
             .macos => macos_impl.recv(self.ctx.ptr, buf),
+            .windows => windows_impl.recv(self.ctx.ptr, buf),
             else => unreachable,
         };
     }
@@ -80,6 +83,7 @@ pub const Device = struct {
         return switch (builtin.os.tag) {
             .linux => linux_impl.send(self.ctx.ptr, buf),
             .macos => macos_impl.send(self.ctx.ptr, buf),
+            .windows => windows_impl.send(self.ctx.ptr, buf),
             else => unreachable,
         };
     }
@@ -89,6 +93,7 @@ pub const Device = struct {
         return switch (builtin.os.tag) {
             .linux => linux_impl.getName(self.ctx.ptr),
             .macos => macos_impl.getName(self.ctx.ptr),
+            .windows => windows_impl.getName(self.ctx.ptr),
             else => unreachable,
         };
     }
@@ -98,6 +103,7 @@ pub const Device = struct {
         return switch (builtin.os.tag) {
             .linux => linux_impl.getMtu(self.ctx.ptr),
             .macos => macos_impl.getMtu(self.ctx.ptr),
+            .windows => windows_impl.getMtu(self.ctx.ptr),
             else => unreachable,
         };
     }
@@ -107,6 +113,7 @@ pub const Device = struct {
         return switch (builtin.os.tag) {
             .linux => linux_impl.getIfIndex(self.ctx.ptr),
             .macos => macos_impl.getIfIndex(self.ctx.ptr),
+            .windows => windows_impl.getIfIndex(self.ctx.ptr),
             else => unreachable,
         };
     }
@@ -116,6 +123,7 @@ pub const Device = struct {
         return switch (builtin.os.tag) {
             .linux => linux_impl.setNonBlocking(self.ctx.ptr, nonblocking),
             .macos => macos_impl.setNonBlocking(self.ctx.ptr, nonblocking),
+            .windows => windows_impl.setNonBlocking(self.ctx.ptr, nonblocking),
             else => unreachable,
         };
     }
@@ -125,6 +133,7 @@ pub const Device = struct {
         return switch (builtin.os.tag) {
             .linux => linux_impl.addIpv4(self.ctx.ptr, address, prefix),
             .macos => macos_impl.addIpv4(self.ctx.ptr, address, prefix),
+            .windows => windows_impl.addIpv4(self.ctx.ptr, address, prefix),
             else => unreachable,
         };
     }
@@ -134,6 +143,7 @@ pub const Device = struct {
         return switch (builtin.os.tag) {
             .linux => linux_impl.addIpv6(self.ctx.ptr, address, prefix),
             .macos => macos_impl.addIpv6(self.ctx.ptr, address, prefix),
+            .windows => windows_impl.addIpv6(self.ctx.ptr, address, prefix),
             else => unreachable,
         };
     }
@@ -143,6 +153,7 @@ pub const Device = struct {
         return switch (builtin.os.tag) {
             .linux => linux_impl.destroy(self.ctx.ptr),
             .macos => macos_impl.destroy(self.ctx.ptr),
+            .windows => windows_impl.destroy(self.ctx.ptr),
             else => {},
         };
     }
