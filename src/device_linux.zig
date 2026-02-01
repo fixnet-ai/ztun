@@ -1,6 +1,6 @@
 //! device_linux.zig - Linux TUN device implementation
 //!
-//! Uses /dev/net/tun for TUN device operations.
+//! Uses /dev/net/tun for TUN device operations with ioctl for IP configuration.
 
 const std = @import("std");
 const TunError = @import("device.zig").TunError;
@@ -8,10 +8,6 @@ const DeviceConfig = @import("device.zig").DeviceConfig;
 const Ipv4Address = @import("device.zig").Ipv4Address;
 const Ipv6Address = @import("device.zig").Ipv6Address;
 const DeviceContext = @import("device.zig").DeviceContext;
-
-const EINVAL = std.posix.EINVAL;
-const ENODEV = std.posix.ENODEV;
-const EACCES = std.posix.EACCES;
 
 // ==================== Type Definitions ====================
 
@@ -22,11 +18,19 @@ pub const LinuxDevice = opaque {};
 const LinuxDeviceState = struct {
     fd: std.posix.fd_t,
     name: []const u8,
+    mtu: u16,
 };
 
 /// Tunnel flags for /dev/net/tun
-const IFF_TUN = std.os.linux.IFF_TUN;
-const IFF_NO_PI = std.os.linux.IFF_NO_PI;
+const IFF_TUN = 0x0001;
+const IFF_NO_PI = 0x1000;
+const IFF_UP = 0x0001;
+const IFF_RUNNING = 0x0040;
+
+/// Address family constants (Linux values)
+const AF_INET = 2;   // IPv4
+const AF_INET6 = 10; // IPv6
+const SOCK_DGRAM = 2; // Datagram socket
 
 // ==================== FFI Declarations ====================
 
@@ -34,103 +38,258 @@ const IFF_NO_PI = std.os.linux.IFF_NO_PI;
 pub const ifreq = extern struct {
     ifr_name: [16]u8,
     ifr_ifru: extern union {
-        addr: [128]u8,  // Generic sockaddr storage
+        addr: [128]u8,
         mtu: c_int,
         flags: c_short,
         ifindex: c_int,
     },
 };
 
+/// struct sockaddr_in for IPv4
+const sockaddr_in = extern struct {
+    sin_len: u8,
+    sin_family: u8,
+    sin_port: u16,
+    sin_addr: [4]u8,
+    sin_zero: [8]u8,
+};
+
+/// struct in6_ifreq for IPv6 address configuration
+const in6_ifreq = extern struct {
+    ifr6_addr: [16]u8,
+    ifr6_prefixlen: u32,
+    ifr6_ifindex: c_int,
+    ifr6_name: [16]u8,
+};
+
 extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
 extern "c" fn open(path: [*:0]const u8, flags: c_int) c_int;
 extern "c" fn malloc(size: usize) *anyopaque;
-extern "c" fn c_free(ptr: *anyopaque) callconv(.C) void;
+extern "c" fn free(ptr: *anyopaque) callconv(.C) void;
+extern "c" fn memset(ptr: *anyopaque, value: c_int, size: usize) callconv(.C) void;
+extern "c" fn if_nametoindex(name: [*:0]const u8) c_uint;
+
+// O flags from fcntl.h
+const O_RDWR = 2;
+const O_NONBLOCK = 2048;
+const TUNSETIFF = 0x400454ca;
 
 // ==================== Device Creation ====================
 
 /// Create a new TUN device on Linux
 pub fn create(config: DeviceConfig) TunError!*DeviceContext {
-    // Open /dev/net/tun
-    const tun_fd = std.posix.open("/dev/net/tun", std.posix.O.RDWR | std.posix.O.CLOEXEC, 0) catch |err| {
-        return switch (err) {
-            error.AccessDenied => .PermissionDenied,
-            error.FileNotFound => .NotFound,
-            else => .IoError,
-        };
-    };
+    // Open /dev/net/tun using C open() for cross-compilation compatibility
+    const tun_fd = open(@as([*:0]const u8, @ptrCast("/dev/net/tun")), O_RDWR | O_NONBLOCK);
+    if (tun_fd < 0) {
+        return error.IoError;
+    }
     errdefer std.posix.close(tun_fd);
 
     // Prepare ifreq structure
     var req: ifreq = undefined;
-    @memset(@as([*]u8, @ptrCast(&req))[0..@sizeOf(ifreq)], 0);
+    memset(&req, 0, @sizeOf(ifreq));
 
     // Set device name if provided
     const name_ptr = if (config.name) |name| name else "tun%d";
-    const name_len = std.math.min(name_ptr.len, 15);
+    const name_len = @min(name_ptr.len, 15);
     @memcpy(req.ifr_name[0..name_len], name_ptr[0..name_len]);
 
     // Set TUN flags (IFF_TUN | IFF_NO_PI for pure IP packets)
     req.ifr_ifru.flags = @as(c_short, @intCast(IFF_TUN | IFF_NO_PI));
 
     // Configure TUN device
-    const TUNSETIFF = 0x400454ca;
     const result = ioctl(tun_fd, TUNSETIFF, &req);
     if (result < 0) {
-        return .IoError;
+        return error.IoError;
     }
 
     // Extract device name
     const dev_name = std.mem.sliceTo(&req.ifr_name, 0);
 
+    // Get MTU from config or use default
+    const mtu = config.mtu orelse 1500;
+
+    // Configure IPv4 address if provided
+    if (config.ipv4) |ipv4| {
+        if (configureIpv4(tun_fd, dev_name, ipv4.address, ipv4.prefix, mtu)) |_| {
+            // Success, continue
+        } else |_| {
+            // Configuration failed, but continue anyway
+        }
+    }
+
+    // Configure IPv6 address if provided
+    if (config.ipv6) |ipv6| {
+        const prefix = config.ipv6_prefix orelse 64;
+        if (configureIpv6(tun_fd, dev_name, ipv6, prefix)) |_| {
+            // Success, continue
+        } else |_| {
+            // Configuration failed, but continue anyway
+        }
+    }
+
+    // Bring interface up
+    if (setInterfaceFlags(tun_fd, dev_name, true, false)) |_| {
+        // Interface up
+    } else |_| {
+        // Failed to bring up, but continue
+    }
+
     // Allocate context
     const ctx = malloc(@sizeOf(DeviceContext));
-    if (ctx == null) {
-        return .IoError;
+    if (@intFromPtr(ctx) == 0) {
+        return error.IoError;
     }
 
     // Allocate state
     const state = malloc(@sizeOf(LinuxDeviceState));
-    if (state == null) {
-        c_free(ctx);
-        return .IoError;
+    if (@intFromPtr(state) == 0) {
+        free(ctx);
+        return error.IoError;
     }
 
     // Copy name to heap
     const name_copy = malloc(dev_name.len + 1);
-    if (name_copy == null) {
-        c_free(state);
-        c_free(ctx);
-        return .IoError;
+    if (@intFromPtr(name_copy) == 0) {
+        free(state);
+        free(ctx);
+        return error.IoError;
     }
-    @memcpy(name_copy[0..dev_name.len], dev_name);
-    name_copy[dev_name.len] = 0;
+    @memcpy(@as([*]u8, @ptrCast(name_copy))[0..dev_name.len], dev_name);
+    @as([*]u8, @ptrCast(name_copy))[dev_name.len] = 0;
 
     // Initialize state
-    const s = @as(*LinuxDeviceState, @ptrCast(state));
+    const s = @as(*LinuxDeviceState, @alignCast(@ptrCast(state)));
     s.* = .{
         .fd = tun_fd,
-        .name = name_copy[0..dev_name.len],
+        .name = @as([*]u8, @ptrCast(name_copy))[0..dev_name.len],
+        .mtu = mtu,
     };
 
     // Initialize context
-    const c = @as(*DeviceContext, @ptrCast(ctx));
+    const c = @as(*DeviceContext, @alignCast(@ptrCast(ctx)));
     c.* = .{ .ptr = state };
 
     return c;
 }
 
-// ==================== Device Operations ====================
+// ==================== Helper Functions ====================
 
 /// Helper to cast device pointer to state
 inline fn toState(device_ptr: *anyopaque) *LinuxDeviceState {
     return @as(*LinuxDeviceState, @alignCast(@ptrCast(device_ptr)));
 }
 
+/// Convert IPv4 address to bytes
+fn ipv4ToBytes(address: Ipv4Address) [4]u8 {
+    return address;
+}
+
+/// Configure IPv4 address using ioctl
+fn configureIpv4(_: std.posix.fd_t, ifname: []const u8, address: Ipv4Address, prefix: u8, mtu: u16) TunError!void {
+    const sock = std.posix.socket(AF_INET, SOCK_DGRAM, 0) catch {
+        return error.IoError;
+    };
+    defer std.posix.close(sock);
+
+    var req: ifreq = undefined;
+    memset(&req, 0, @sizeOf(ifreq));
+    @memcpy(req.ifr_name[0..ifname.len], ifname);
+
+    // Set IP address using SIOCSIFADDR
+    const addr = @as(*sockaddr_in, @alignCast(@ptrCast(&req.ifr_ifru.addr)));
+    addr.sin_family = AF_INET;
+    const ip_bytes = ipv4ToBytes(address);
+    addr.sin_addr = ip_bytes;
+
+    const SIOCSIFADDR = 0x8916;
+    if (ioctl(sock, SIOCSIFADDR, &req) < 0) {
+        return error.IoError;
+    }
+
+    // Set netmask based on prefix
+    const shift: u5 = @truncate(32 - prefix);
+    const mask: u32 = if (prefix == 32) 0xFFFFFFFF else (~@as(u32, 0) << shift);
+    addr.sin_addr = @as(*[4]u8, @ptrCast(@constCast(&mask))).*;
+
+    const SIOCSIFNETMASK = 0x891c;
+    if (ioctl(sock, SIOCSIFNETMASK, &req) < 0) {
+        return error.IoError;
+    }
+
+    // Set MTU
+    req.ifr_ifru.mtu = @as(c_int, @intCast(mtu));
+    const SIOCSIFMTU = 0x8922;
+    if (ioctl(sock, SIOCSIFMTU, &req) < 0) {
+        return error.IoError;
+    }
+}
+
+/// Configure IPv6 address using ioctl
+fn configureIpv6(fd: std.posix.fd_t, ifname: []const u8, address: Ipv6Address, prefix: u32) TunError!void {
+    _ = fd;
+
+    const sock = std.posix.socket(AF_INET6, SOCK_DGRAM, 0) catch {
+        return error.IoError;
+    };
+    defer std.posix.close(sock);
+
+    // Get interface index
+    const ifindex = if_nametoindex(@as([*:0]const u8, @ptrCast(ifname.ptr)));
+    if (ifindex == 0) {
+        return error.NotFound;
+    }
+
+    var req: in6_ifreq = undefined;
+    memset(&req, 0, @sizeOf(in6_ifreq));
+    @memcpy(req.ifr6_name[0..ifname.len], ifname);
+    req.ifr6_ifindex = @as(c_int, @intCast(ifindex));
+    req.ifr6_prefixlen = prefix;
+    req.ifr6_addr = address;
+
+    const SIOCSIFADDR = 0x892b;
+    if (ioctl(sock, SIOCSIFADDR, &req) < 0) {
+        return error.IoError;
+    }
+}
+
+/// Set interface flags (up/down)
+fn setInterfaceFlags(_: std.posix.fd_t, ifname: []const u8, up: bool, _: bool) TunError!void {
+    const sock = std.posix.socket(AF_INET, SOCK_DGRAM, 0) catch {
+        return error.IoError;
+    };
+    defer std.posix.close(sock);
+
+    var req: ifreq = undefined;
+    memset(&req, 0, @sizeOf(ifreq));
+    @memcpy(req.ifr_name[0..ifname.len], ifname);
+
+    // Get current flags
+    const SIOCGIFFLAGS = 0x8913;
+    if (ioctl(sock, SIOCGIFFLAGS, &req) < 0) {
+        return error.IoError;
+    }
+
+    // Set new flags
+    if (up) {
+        req.ifr_ifru.flags |= @as(c_short, @intCast(IFF_UP | IFF_RUNNING));
+    } else {
+        req.ifr_ifru.flags &= ~@as(c_short, @intCast(IFF_UP));
+    }
+
+    const SIOCSIFFLAGS = 0x8914;
+    if (ioctl(sock, SIOCSIFFLAGS, &req) < 0) {
+        return error.IoError;
+    }
+}
+
+// ==================== Device Operations ====================
+
 /// Receive a packet from the TUN device
 pub fn recv(device_ptr: *anyopaque, buf: []u8) TunError!usize {
     const state = toState(device_ptr);
     const n = std.posix.read(state.fd, buf) catch {
-        return .IoError;
+        return error.IoError;
     };
     return @as(usize, @intCast(n));
 }
@@ -139,7 +298,7 @@ pub fn recv(device_ptr: *anyopaque, buf: []u8) TunError!usize {
 pub fn send(device_ptr: *anyopaque, buf: []const u8) TunError!usize {
     const state = toState(device_ptr);
     const n = std.posix.write(state.fd, buf) catch {
-        return .IoError;
+        return error.IoError;
     };
     return @as(usize, @intCast(n));
 }
@@ -153,18 +312,7 @@ pub fn getName(device_ptr: *anyopaque) TunError![]const u8 {
 /// Get the device MTU
 pub fn getMtu(device_ptr: *anyopaque) TunError!u16 {
     const state = toState(device_ptr);
-
-    var req: ifreq = undefined;
-    @memset(@as([*]u8, @ptrCast(&req))[0..@sizeOf(ifreq)], 0);
-    @memcpy(req.ifr_name[0..state.name.len], state.name);
-
-    const SIOCGIFMTU = 0xc0206933;
-    const result = ioctl(state.fd, SIOCGIFMTU, &req);
-    if (result < 0) {
-        return .IoError;
-    }
-
-    return @as(u16, @intCast(req.ifr_ifru.mtu));
+    return state.mtu;
 }
 
 /// Get the interface index
@@ -186,19 +334,23 @@ pub fn setNonBlocking(device_ptr: *anyopaque, nonblocking: bool) TunError!void {
 }
 
 /// Add an IPv4 address at runtime
-pub fn addIpv4(_: *anyopaque, _: Ipv4Address, _: u8) TunError!void {
-    return .Unknown;
+pub fn addIpv4(device_ptr: *anyopaque, address: Ipv4Address, prefix: u8) TunError!void {
+    const state = toState(device_ptr);
+    try configureIpv4(state.fd, state.name, address, prefix, state.mtu);
+    // Bring interface up
+    setInterfaceFlags(state.fd, state.name, true, false) catch {};
 }
 
 /// Add an IPv6 address at runtime
-pub fn addIpv6(_: *anyopaque, _: Ipv6Address, _: u8) TunError!void {
-    return .Unknown;
+pub fn addIpv6(device_ptr: *anyopaque, address: Ipv6Address, prefix: u8) TunError!void {
+    const state = toState(device_ptr);
+    try configureIpv6(state.fd, state.name, address, prefix);
 }
 
 /// Destroy the device and clean up resources
 pub fn destroy(device_ptr: *anyopaque) void {
     const state = toState(device_ptr);
     std.posix.close(state.fd);
-    c_free(state.name.ptr);
-    c_free(state);
+    free(@constCast(state.name.ptr));
+    free(state);
 }

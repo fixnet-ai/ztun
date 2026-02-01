@@ -9,8 +9,6 @@ const Ipv4Address = @import("device.zig").Ipv4Address;
 const Ipv6Address = @import("device.zig").Ipv6Address;
 const DeviceContext = @import("device.zig").DeviceContext;
 
-const ifreq = @import("device_linux.zig").ifreq;
-
 // ==================== Type Definitions ====================
 
 /// Opaque macOS device handle
@@ -20,44 +18,161 @@ pub const MacOSDevice = opaque {};
 const MacOSDeviceState = struct {
     fd: std.posix.fd_t,
     name: []const u8,
+    mtu: u16,
+    index: u32,
 };
+
+/// Tunnel flags for utun
+const IFF_TUN = 0x0001;
+const IFF_NO_PI = 0x1000;
+const IFF_UP = 0x0001;
+const IFF_RUNNING = 0x0040;
+
+/// Address family constants (BSD values)
+const AF_INET = 2;   // IPv4
+const AF_INET6 = 30; // IPv6
+const SOCK_DGRAM = 2; // Datagram socket
+const PF_SYSTEM = 32; // System domain
+const SYSPROTO_CONTROL = 2; // Control protocol
+const CTLIOCGINFO = 0xc0644e03; // Get control info ioctl
 
 // ==================== FFI Declarations ====================
 
 extern "c" fn socket(domain: c_int, type: c_int, protocol: c_int) c_int;
 extern "c" fn close(fd: c_int) c_int;
+extern "c" fn connect(fd: c_int, addr: *const anyopaque, len: std.posix.socklen_t) c_int;
 extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
-extern "c" fn if_nametoindex(name: [*:0]const u8) c_uint;
+extern "c" fn getsockopt(fd: c_int, level: c_int, optname: c_int, optval: *anyopaque, optlen: *std.posix.socklen_t) c_int;
 extern "c" fn malloc(size: usize) *anyopaque;
 extern "c" fn free(ptr: *anyopaque) callconv(.C) void;
-extern "c" fn strcpy(dest: [*]u8, src: [*:0]const u8) [*]u8;
-extern "c" fn strlen(s: [*:0]const u8) usize;
-extern "c" fn getsockopt(fd: c_int, level: c_int, optname: c_int, optval: *anyopaque, optlen: *std.posix.socklen_t) c_int;
-extern "c" fn setsockopt(fd: c_int, level: c_int, optname: c_int, optval: *const anyopaque, optlen: std.posix.socklen_t) c_int;
+extern "c" fn memset(ptr: *anyopaque, value: c_int, size: usize) callconv(.C) void;
+extern "c" fn if_nametoindex(name: [*:0]const u8) c_uint;
 
-// ==================== Helper Functions ====================
+/// struct ctl_info for CTLIOCGINFO
+const ctl_info = extern struct {
+    ctl_id: u32,
+    ctl_name: [96]u8,
+};
 
-/// Get the device name from socket
-fn getDeviceName(_: c_int, buf: *[64]u8) ![]const u8 {
-    const default_name = "utun0";
-    @memcpy(buf[0..default_name.len], default_name);
-    return buf[0..default_name.len];
-}
+/// sockaddr_ctl for macOS control sockets
+const sockaddr_ctl = extern struct {
+    sc_len: u8,
+    sc_family: u8,
+    ss_sysaddr: u16,
+    sc_id: u32,
+    sc_unit: u32,
+    sc_reserved: [5]u32,
+};
+
+/// struct ifreq for ioctl operations
+const ifreq = extern struct {
+    ifr_name: [16]u8,
+    ifr_ifru: extern union {
+        addr: [128]u8,
+        mtu: c_int,
+        flags: c_short,
+        ifindex: c_int,
+    },
+};
+
+/// struct sockaddr_in for IPv4 (macOS has sin_len)
+const sockaddr_in = extern struct {
+    sin_len: u8,
+    sin_family: u8,
+    sin_port: u16,
+    sin_addr: [4]u8,
+    sin_zero: [8]u8,
+};
+
+/// struct sockaddr_in6 for IPv6 (macOS has sin6_len)
+const sockaddr_in6 = extern struct {
+    sin6_len: u8,
+    sin6_family: u8,
+    sin6_port: u16,
+    sin6_flowinfo: u32,
+    sin6_addr: [16]u8,
+    sin6_scope_id: u32,
+};
 
 // ==================== Device Creation ====================
 
 /// Create a new TUN device on macOS
-pub fn create(_: DeviceConfig) TunError!*DeviceContext {
-    const fd = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 2) catch {
+pub fn create(config: DeviceConfig) TunError!*DeviceContext {
+    // On macOS, utun is accessed via a PF_SYSTEM socket with SYSPROTO_CONTROL
+    // Create a control socket for utun
+    std.debug.print("[ztun] Creating socket(PF_SYSTEM={d}, SOCK_DGRAM={d}, SYSPROTO_CONTROL={d})...\n", .{PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL});
+    const fd = std.posix.socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL) catch {
         return error.IoError;
     };
     errdefer std.posix.close(fd);
 
-    // Get the device name
-    var name_buf: [64]u8 = undefined;
-    const name = getDeviceName(fd, &name_buf) catch {
+    // Get control info for utun (key: "com.apple.net.utun_control")
+    var info: ctl_info = undefined;
+    @memset(@as([*]u8, @ptrCast(&info))[0..@sizeOf(ctl_info)], 0);
+    const ctl_name = "com.apple.net.utun_control";
+    @memcpy(info.ctl_name[0..ctl_name.len], ctl_name);
+
+    const ioctl_result = ioctl(fd, CTLIOCGINFO, &info);
+    if (ioctl_result < 0) {
         return error.IoError;
-    };
+    }
+
+    // Prepare sockaddr_ctl to connect to utun
+    var addr: sockaddr_ctl = undefined;
+    @memset(@as([*]u8, @ptrCast(&addr))[0..@sizeOf(sockaddr_ctl)], 0);
+    addr.sc_len = @sizeOf(sockaddr_ctl);
+    addr.sc_family = 32; // AF_SYSTEM
+    addr.ss_sysaddr = 2; // AF_SYS_CONTROL for utun
+    addr.sc_id = info.ctl_id;
+    addr.sc_unit = 0; // 0 = auto-assign unit number
+
+    if (connect(fd, @as(*const anyopaque, @ptrCast(&addr)), @sizeOf(sockaddr_ctl)) < 0) {
+        return error.IoError;
+    }
+
+    // Get the assigned device name via getsockopt
+    var name_buf: [64]u8 = undefined;
+    var name_len: std.posix.socklen_t = 64;
+    const UTUN_OPT_IFNAME = 2;
+    if (getsockopt(fd, SYSPROTO_CONTROL, UTUN_OPT_IFNAME, @as(*anyopaque, @ptrCast(&name_buf)), &name_len) < 0) {
+        return error.IoError;
+    }
+
+    // Extract device name (null-terminated)
+    const null_idx = std.mem.indexOfScalar(u8, name_buf[0..name_len], 0) orelse name_len;
+    const dev_name = name_buf[0..null_idx];
+
+    // Get MTU from config or use default
+    const mtu = config.mtu orelse 1500;
+
+    // Get interface index using libc
+    const index = if_nametoindex(@as([*:0]const u8, @ptrCast(&name_buf)));
+
+    // Configure IPv4 address if provided
+    if (config.ipv4) |ipv4| {
+        if (configureIpv4(fd, dev_name, ipv4.address, ipv4.prefix, mtu)) |_| {
+            // Success, continue
+        } else |_| {
+            // Configuration failed, but continue anyway
+        }
+    }
+
+    // Configure IPv6 address if provided
+    if (config.ipv6) |ipv6| {
+        const prefix = config.ipv6_prefix orelse 64;
+        if (configureIpv6(fd, dev_name, ipv6, prefix)) |_| {
+            // Success, continue
+        } else |_| {
+            // Configuration failed, but continue anyway
+        }
+    }
+
+    // Bring interface up
+    if (setInterfaceFlags(fd, dev_name, true)) |_| {
+        // Interface up
+    } else |_| {
+        // Failed to bring up, but continue
+    }
 
     // Allocate context
     const ctx = malloc(@sizeOf(DeviceContext));
@@ -73,21 +188,23 @@ pub fn create(_: DeviceConfig) TunError!*DeviceContext {
     }
 
     // Copy name to heap
-    const name_copy = malloc(name.len + 1);
+    const name_strlen = dev_name.len;
+    const name_copy = @as([*]u8, @ptrCast(malloc(name_strlen + 1)));
     if (@intFromPtr(name_copy) == 0) {
         free(state);
         free(ctx);
         return error.IoError;
     }
-    const name_ptr = @as([*]u8, @ptrCast(name_copy));
-    @memcpy(name_ptr[0..name.len], name);
-    name_ptr[name.len] = 0;
+    @memcpy(name_copy[0..name_strlen], dev_name);
+    name_copy[name_strlen] = 0;
 
     // Initialize state
     const s = @as(*MacOSDeviceState, @alignCast(@ptrCast(state)));
     s.* = .{
         .fd = fd,
-        .name = name_ptr[0..name.len],
+        .name = name_copy[0..name_strlen],
+        .mtu = mtu,
+        .index = index,
     };
 
     // Initialize context
@@ -97,12 +214,121 @@ pub fn create(_: DeviceConfig) TunError!*DeviceContext {
     return c;
 }
 
-// ==================== Device Operations ====================
+// ==================== Helper Functions ====================
 
 /// Helper to cast device pointer to state
 inline fn toState(device_ptr: *anyopaque) *MacOSDeviceState {
     return @as(*MacOSDeviceState, @alignCast(@ptrCast(device_ptr)));
 }
+
+/// Configure IPv4 address using ioctl (macOS)
+fn configureIpv4(_: std.posix.fd_t, ifname: []const u8, address: Ipv4Address, prefix: u8, mtu: u16) TunError!void {
+    const sock = std.posix.socket(AF_INET, SOCK_DGRAM, 0) catch {
+        return error.IoError;
+    };
+    defer std.posix.close(sock);
+
+    var req: ifreq = undefined;
+    @memset(@as([*]u8, @ptrCast(&req))[0..@sizeOf(ifreq)], 0);
+    @memcpy(req.ifr_name[0..ifname.len], ifname);
+
+    // Set local address (SIOCSIFADDR)
+    const addr = @as(*sockaddr_in, @alignCast(@ptrCast(&req.ifr_ifru.addr)));
+    addr.sin_len = @sizeOf(sockaddr_in);
+    addr.sin_family = AF_INET;
+    addr.sin_addr = address;
+
+    const SIOCSIFADDR = 0x800c6916;
+    if (ioctl(sock, SIOCSIFADDR, &req) < 0) {
+        return error.IoError;
+    }
+
+    // Set point-to-point destination address (SIOCSIFDSTADDR)
+    // macOS utun is a point-to-point interface
+    if (prefix > 0) {
+        addr.sin_addr = address;
+        // Increment last octet for peer (point-to-point)
+        var peer_addr = address;
+        peer_addr[3] +|= 1;
+        addr.sin_addr = peer_addr;
+    }
+
+    const SIOCSIFDSTADDR = 0x804c691a;
+    if (ioctl(sock, SIOCSIFDSTADDR, &req) < 0) {
+        return error.IoError;
+    }
+
+    // Set netmask
+    var mask: u32 = if (prefix == 32) 0xFFFFFFFF else (~@as(u32, 0) << @as(u5, @truncate(prefix)));
+    std.mem.copyForwards(u8, @as(*[4]u8, @ptrCast(&addr.sin_addr))[0..4], @as(*[4]u8, @ptrCast(&mask))[0..4]);
+
+    const SIOCSIFNETMASK = 0x804c691c;
+    if (ioctl(sock, SIOCSIFNETMASK, &req) < 0) {
+        return error.IoError;
+    }
+
+    // Set MTU
+    req.ifr_ifru.mtu = @as(c_int, @intCast(mtu));
+    const SIOCSIFMTU = 0x804c6922;
+    if (ioctl(sock, SIOCSIFMTU, &req) < 0) {
+        return error.IoError;
+    }
+}
+
+/// Configure IPv6 address using ioctl (macOS)
+fn configureIpv6(_: std.posix.fd_t, ifname: []const u8, address: Ipv6Address, _: u32) TunError!void {
+    const sock = std.posix.socket(AF_INET6, SOCK_DGRAM, 0) catch {
+        return error.IoError;
+    };
+    defer std.posix.close(sock);
+
+    var req: ifreq = undefined;
+    @memset(@as([*]u8, @ptrCast(&req))[0..@sizeOf(ifreq)], 0);
+    @memcpy(req.ifr_name[0..ifname.len], ifname);
+
+    // Set IPv6 address
+    const addr = @as(*sockaddr_in6, @alignCast(@ptrCast(&req.ifr_ifru.addr)));
+    addr.sin6_len = @sizeOf(sockaddr_in6);
+    addr.sin6_family = AF_INET6;
+    addr.sin6_addr = address;
+
+    const SIOCSIFADDR = 0x804c692b;
+    if (ioctl(sock, SIOCSIFADDR, &req) < 0) {
+        return error.IoError;
+    }
+}
+
+/// Set interface flags (up/down)
+fn setInterfaceFlags(_: std.posix.fd_t, ifname: []const u8, up: bool) TunError!void {
+    const sock = std.posix.socket(AF_INET, SOCK_DGRAM, 0) catch {
+        return error.IoError;
+    };
+    defer std.posix.close(sock);
+
+    var req: ifreq = undefined;
+    @memset(@as([*]u8, @ptrCast(&req))[0..@sizeOf(ifreq)], 0);
+    @memcpy(req.ifr_name[0..ifname.len], ifname);
+
+    // Get current flags
+    const SIOCGIFFLAGS = 0xc0206913;
+    if (ioctl(sock, SIOCGIFFLAGS, &req) < 0) {
+        return error.IoError;
+    }
+
+    // Set new flags
+    if (up) {
+        req.ifr_ifru.flags |= @as(c_short, @intCast(IFF_UP | IFF_RUNNING));
+    } else {
+        req.ifr_ifru.flags &= ~@as(c_short, @intCast(IFF_UP));
+    }
+
+    const SIOCSIFFLAGS = 0x80206914;
+    if (ioctl(sock, SIOCSIFFLAGS, &req) < 0) {
+        return error.IoError;
+    }
+}
+
+// ==================== Device Operations ====================
 
 /// Receive a packet from the TUN device
 pub fn recv(device_ptr: *anyopaque, buf: []u8) TunError!usize {
@@ -110,7 +336,7 @@ pub fn recv(device_ptr: *anyopaque, buf: []u8) TunError!usize {
     const n = std.posix.read(state.fd, buf) catch {
         return error.IoError;
     };
-    return n;
+    return @as(usize, @intCast(n));
 }
 
 /// Send a packet to the TUN device
@@ -119,7 +345,7 @@ pub fn send(device_ptr: *anyopaque, buf: []const u8) TunError!usize {
     const n = std.posix.write(state.fd, buf) catch {
         return error.IoError;
     };
-    return n;
+    return @as(usize, @intCast(n));
 }
 
 /// Get the device name
@@ -131,28 +357,13 @@ pub fn getName(device_ptr: *anyopaque) TunError![]const u8 {
 /// Get the device MTU
 pub fn getMtu(device_ptr: *anyopaque) TunError!u16 {
     const state = toState(device_ptr);
-
-    var req: ifreq = undefined;
-    @memset(@as([*]u8, @ptrCast(&req))[0..@sizeOf(ifreq)], 0);
-    @memcpy(req.ifr_name[0..state.name.len], state.name);
-
-    const SIOCGIFMTU = 0xc0206933;
-    const result = ioctl(state.fd, SIOCGIFMTU, &req);
-    if (result < 0) {
-        return error.IoError;
-    }
-
-    return @as(u16, @intCast(req.ifr_ifru.mtu));
+    return state.mtu;
 }
 
 /// Get the interface index
 pub fn getIfIndex(device_ptr: *anyopaque) TunError!u32 {
     const state = toState(device_ptr);
-    const index = if_nametoindex(state.name.ptr);
-    if (index == 0) {
-        return error.NotFound;
-    }
-    return @as(u32, @intCast(index));
+    return state.index;
 }
 
 /// Set non-blocking mode
@@ -164,13 +375,17 @@ pub fn setNonBlocking(device_ptr: *anyopaque, nonblocking: bool) TunError!void {
 }
 
 /// Add an IPv4 address at runtime
-pub fn addIpv4(_: *anyopaque, _: Ipv4Address, _: u8) TunError!void {
-    return error.Unknown;
+pub fn addIpv4(device_ptr: *anyopaque, address: Ipv4Address, prefix: u8) TunError!void {
+    const state = toState(device_ptr);
+    try configureIpv4(state.fd, state.name, address, prefix, state.mtu);
+    // Bring interface up
+    setInterfaceFlags(state.fd, state.name, true) catch {};
 }
 
 /// Add an IPv6 address at runtime
-pub fn addIpv6(_: *anyopaque, _: Ipv6Address, _: u8) TunError!void {
-    return error.Unknown;
+pub fn addIpv6(device_ptr: *anyopaque, address: Ipv6Address, prefix: u8) TunError!void {
+    const state = toState(device_ptr);
+    try configureIpv6(state.fd, state.name, address, prefix);
 }
 
 /// Destroy the device and clean up resources

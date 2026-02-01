@@ -139,9 +139,7 @@ fn buildTestRunner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: st
     // Install to zig-out/bin
     const install_step = b.addInstallArtifact(test_runner, .{});
 
-    // Add run step (for `zig build test`)
-    const run_test_runner = b.addRunArtifact(test_runner);
+    // Test step only builds, does not run (requires sudo)
     const test_step = b.step("test", "Build test_runner executable (run with: sudo ./zig-out/bin/test_runner)");
-    test_step.dependOn(&run_test_runner.step);
     test_step.dependOn(&install_step.step);
 }
