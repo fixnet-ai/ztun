@@ -262,6 +262,7 @@ inline fn toState(device_ptr: *anyopaque) *WindowsDeviceState {
 }
 
 /// Receive a packet from the TUN device (blocking)
+/// Uses Wintun's recommended pattern: wait once, then batch process all available packets
 pub fn recv(device_ptr: *anyopaque, buf: []u8) TunError!usize {
     const state = toState(device_ptr);
 
@@ -276,7 +277,7 @@ pub fn recv(device_ptr: *anyopaque, buf: []u8) TunError!usize {
         return error.IoError;
     };
 
-    // Get wait event and block until data is available
+    // Get wait event
     const event = WintunGetReadWaitEvent(state.session_handle);
     if (@intFromPtr(event) == 0) {
         return error.IoError;
@@ -285,21 +286,39 @@ pub fn recv(device_ptr: *anyopaque, buf: []u8) TunError!usize {
     // Wait indefinitely for data (blocking)
     _ = WaitForSingleObject(event, @as(DWORD, 0xFFFFFFFF)); // INFINITE
 
+    // Batch process: consume all available packets, return the first one
+    var first_packet: ?*anyopaque = null;
+    var first_size: DWORD = 0;
+
     var size: DWORD = 0;
+    while (true) {
+        const packet = WintunReceivePacket(state.session_handle, &size);
+        if (packet == null) {
+            break; // No more packets
+        }
 
-    const packet = WintunReceivePacket(state.session_handle, &size);
-    if (packet == null) {
+        if (first_packet == null) {
+            // Save first packet for return
+            first_packet = packet;
+            first_size = size;
+        } else {
+            // Discard additional packets (could be buffered in future)
+            WintunReleaseReceivePacket(state.session_handle, packet.?);
+        }
+    }
+
+    if (first_packet == null) {
         return error.IoError;
     }
 
-    const packet_size = @as(usize, @intCast(size));
+    const packet_size = @as(usize, @intCast(first_size));
     if (packet_size > buf.len) {
-        WintunReleaseReceivePacket(state.session_handle, packet.?);
+        WintunReleaseReceivePacket(state.session_handle, first_packet.?);
         return error.IoError;
     }
 
-    @memcpy(buf[0..packet_size], @as([*]u8, @ptrCast(packet.?))[0..packet_size]);
-    WintunReleaseReceivePacket(state.session_handle, packet.?);
+    @memcpy(buf[0..packet_size], @as([*]u8, @ptrCast(first_packet.?))[0..packet_size]);
+    WintunReleaseReceivePacket(state.session_handle, first_packet.?);
 
     return packet_size;
 }
