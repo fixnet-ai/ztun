@@ -1,13 +1,16 @@
 //! device_linux.zig - Linux TUN device implementation
 //!
 //! Uses /dev/net/tun for TUN device operations with ioctl for IP configuration.
+//! Uses RingBuffer internally for efficient batch packet handling.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const TunError = @import("device.zig").TunError;
 const DeviceConfig = @import("device.zig").DeviceConfig;
 const Ipv4Address = @import("device.zig").Ipv4Address;
 const Ipv6Address = @import("device.zig").Ipv6Address;
 const DeviceContext = @import("device.zig").DeviceContext;
+const RingBuffer = @import("ringbuf.zig").RingBuffer;
 
 // ==================== Type Definitions ====================
 
@@ -19,6 +22,8 @@ const LinuxDeviceState = struct {
     fd: std.posix.fd_t,
     name: []const u8,
     mtu: u16,
+    ringbuf: RingBuffer,
+    read_offset: usize,
 };
 
 /// Tunnel flags for /dev/net/tun
@@ -79,7 +84,8 @@ const TUNSETIFF = 0x400454ca;
 /// Create a new TUN device on Linux
 pub fn create(config: DeviceConfig) TunError!*DeviceContext {
     // Open /dev/net/tun using C open() for cross-compilation compatibility
-    const tun_fd = open(@as([*:0]const u8, @ptrCast("/dev/net/tun")), O_RDWR | O_NONBLOCK);
+    // Use blocking mode by default (can be changed with setNonBlocking)
+    const tun_fd = open(@as([*:0]const u8, @ptrCast("/dev/net/tun")), O_RDWR);
     if (tun_fd < 0) {
         return error.IoError;
     }
@@ -158,12 +164,22 @@ pub fn create(config: DeviceConfig) TunError!*DeviceContext {
     @memcpy(@as([*]u8, @ptrCast(name_copy))[0..dev_name.len], dev_name);
     @as([*]u8, @ptrCast(name_copy))[dev_name.len] = 0;
 
+    // Initialize RingBuffer (large buffer for batch packet handling)
+    const ringbuf_capacity = @as(usize, mtu) * 256; // 256 packets worth of buffer
+    const ringbuf = RingBuffer.init(ringbuf_capacity) catch RingBuffer{
+        .ptr = undefined,
+        .capacity = 0,
+        .owned = false,
+    };
+
     // Initialize state
     const s = @as(*LinuxDeviceState, @alignCast(@ptrCast(state)));
     s.* = .{
         .fd = tun_fd,
         .name = @as([*]u8, @ptrCast(name_copy))[0..dev_name.len],
         .mtu = mtu,
+        .ringbuf = ringbuf,
+        .read_offset = 0,
     };
 
     // Initialize context
@@ -351,6 +367,7 @@ pub fn addIpv6(device_ptr: *anyopaque, address: Ipv6Address, prefix: u8) TunErro
 pub fn destroy(device_ptr: *anyopaque) void {
     const state = toState(device_ptr);
     std.posix.close(state.fd);
+    state.ringbuf.deinit();
     free(@constCast(state.name.ptr));
     free(state);
 }

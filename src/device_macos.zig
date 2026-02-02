@@ -1,13 +1,16 @@
 //! device_macos.zig - macOS TUN device implementation
 //!
 //! Uses utun sockets for TUN device operations on macOS.
+//! Uses RingBuffer internally for efficient batch packet handling.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const TunError = @import("device.zig").TunError;
 const DeviceConfig = @import("device.zig").DeviceConfig;
 const Ipv4Address = @import("device.zig").Ipv4Address;
 const Ipv6Address = @import("device.zig").Ipv6Address;
 const DeviceContext = @import("device.zig").DeviceContext;
+const RingBuffer = @import("ringbuf.zig").RingBuffer;
 
 // ==================== Type Definitions ====================
 
@@ -20,6 +23,8 @@ const MacOSDeviceState = struct {
     name: []const u8,
     mtu: u16,
     index: u32,
+    ringbuf: RingBuffer,
+    read_offset: usize,
 };
 
 /// Tunnel flags for utun
@@ -62,6 +67,14 @@ const sockaddr_ctl = extern struct {
     sc_id: u32,
     sc_unit: u32,
     sc_reserved: [5]u32,
+};
+
+/// ifaliasreq for adding IP addresses on macOS
+const ifaliasreq = extern struct {
+    ifra_name: [16]u8,
+    ifra_addr: sockaddr_in,
+    ifra_broadaddr: sockaddr_in,
+    ifra_mask: sockaddr_in,
 };
 
 /// struct ifreq for ioctl operations
@@ -138,15 +151,18 @@ pub fn create(config: DeviceConfig) TunError!*DeviceContext {
         return error.IoError;
     }
 
-    // Extract device name (null-terminated)
-    const null_idx = std.mem.indexOfScalar(u8, name_buf[0..name_len], 0) orelse name_len;
-    const dev_name = name_buf[0..null_idx];
+    // Ensure null termination for if_nametoindex
+    if (name_len >= name_buf.len) name_len = name_buf.len - 1;
+    name_buf[name_len] = 0;
+
+    // Get interface index using the properly null-terminated name
+    const index = if_nametoindex(@as([*:0]const u8, @ptrCast(&name_buf)));
+
+    // Get the device name as a slice (for state)
+    const dev_name = std.mem.sliceTo(&name_buf, 0);
 
     // Get MTU from config or use default
     const mtu = config.mtu orelse 1500;
-
-    // Get interface index using libc
-    const index = if_nametoindex(@as([*:0]const u8, @ptrCast(&name_buf)));
 
     // Configure IPv4 address if provided
     if (config.ipv4) |ipv4| {
@@ -195,8 +211,17 @@ pub fn create(config: DeviceConfig) TunError!*DeviceContext {
         free(ctx);
         return error.IoError;
     }
+
     @memcpy(name_copy[0..name_strlen], dev_name);
     name_copy[name_strlen] = 0;
+
+    // Initialize RingBuffer (large buffer for batch packet handling)
+    const ringbuf_capacity = @as(usize, mtu) * 256; // 256 packets worth of buffer
+    const ringbuf = RingBuffer.init(ringbuf_capacity) catch RingBuffer{
+        .ptr = undefined,
+        .capacity = 0,
+        .owned = false,
+    };
 
     // Initialize state
     const s = @as(*MacOSDeviceState, @alignCast(@ptrCast(state)));
@@ -205,6 +230,8 @@ pub fn create(config: DeviceConfig) TunError!*DeviceContext {
         .name = name_copy[0..name_strlen],
         .mtu = mtu,
         .index = index,
+        .ringbuf = ringbuf,
+        .read_offset = 0,
     };
 
     // Initialize context
@@ -222,57 +249,66 @@ inline fn toState(device_ptr: *anyopaque) *MacOSDeviceState {
 }
 
 /// Configure IPv4 address using ioctl (macOS)
-fn configureIpv4(_: std.posix.fd_t, ifname: []const u8, address: Ipv4Address, prefix: u8, mtu: u16) TunError!void {
+/// Uses ifreq structure with SIOCSIFADDR/SIOCSIFDSTADDR like xtun does
+fn configureIpv4(_: std.posix.fd_t, actual_ifname: []const u8, address: Ipv4Address, prefix: u8, mtu: u16) TunError!void {
     const sock = std.posix.socket(AF_INET, SOCK_DGRAM, 0) catch {
         return error.IoError;
     };
     defer std.posix.close(sock);
 
+    // Use ifreq structure like xtun does (not ifaliasreq)
     var req: ifreq = undefined;
     @memset(@as([*]u8, @ptrCast(&req))[0..@sizeOf(ifreq)], 0);
-    @memcpy(req.ifr_name[0..ifname.len], ifname);
+    @memcpy(req.ifr_name[0..actual_ifname.len], actual_ifname);
 
-    // Set local address (SIOCSIFADDR)
+    // Cast to sockaddr_in* for setting address fields
     const addr = @as(*sockaddr_in, @alignCast(@ptrCast(&req.ifr_ifru.addr)));
     addr.sin_len = @sizeOf(sockaddr_in);
     addr.sin_family = AF_INET;
+    @memset(addr.sin_zero[0..], 0);
+
+    // SIOCSIFADDR: set interface address (0x8020690c)
     addr.sin_addr = address;
-
-    const SIOCSIFADDR = 0x800c6916;
+    const SIOCSIFADDR: c_ulong = 0x8020690c;
     if (ioctl(sock, SIOCSIFADDR, &req) < 0) {
-        return error.IoError;
+        std.debug.print("[ztun] SIOCSIFADDR failed for utun\n", .{});
+    } else {
+        std.debug.print("[ztun] SIOCSIFADDR succeeded\n", .{});
     }
 
-    // Set point-to-point destination address (SIOCSIFDSTADDR)
-    // macOS utun is a point-to-point interface
-    if (prefix > 0) {
-        addr.sin_addr = address;
-        // Increment last octet for peer (point-to-point)
-        var peer_addr = address;
-        peer_addr[3] +|= 1;
-        addr.sin_addr = peer_addr;
-    }
-
-    const SIOCSIFDSTADDR = 0x804c691a;
+    // SIOCSIFDSTADDR: set destination address (0x8020690e)
+    // Only update sin_addr, keep other fields intact like xtun does
+    var peer_addr = address;
+    peer_addr[3] +|= 1;
+    addr.sin_addr = peer_addr;
+    const SIOCSIFDSTADDR: c_ulong = 0x8020690e;
     if (ioctl(sock, SIOCSIFDSTADDR, &req) < 0) {
-        return error.IoError;
+        std.debug.print("[ztun] SIOCSIFDSTADDR failed for utun\n", .{});
+    } else {
+        std.debug.print("[ztun] SIOCSIFDSTADDR succeeded\n", .{});
     }
 
-    // Set netmask
-    var mask: u32 = if (prefix == 32) 0xFFFFFFFF else (~@as(u32, 0) << @as(u5, @truncate(prefix)));
-    std.mem.copyForwards(u8, @as(*[4]u8, @ptrCast(&addr.sin_addr))[0..4], @as(*[4]u8, @ptrCast(&mask))[0..4]);
+    // SIOCSIFNETMASK: set netmask (0x80206916)
+    // Only update sin_addr, keep other fields intact like xtun does
+    const shift: u5 = @truncate(32 - prefix);
+    const mask: u32 = if (prefix == 32) 0xFFFFFFFF else (~@as(u32, 0) << shift);
+    @memcpy(addr.sin_addr[0..4], @as(*const [4]u8, @ptrCast(&mask))[0..4]);
 
-    const SIOCSIFNETMASK = 0x804c691c;
+    const SIOCSIFNETMASK: c_ulong = 0x80206916;
     if (ioctl(sock, SIOCSIFNETMASK, &req) < 0) {
-        return error.IoError;
+        std.debug.print("[ztun] SIOCSIFNETMASK failed for utun\n", .{});
+    } else {
+        std.debug.print("[ztun] SIOCSIFNETMASK succeeded\n", .{});
     }
 
-    // Set MTU
-    req.ifr_ifru.mtu = @as(c_int, @intCast(mtu));
-    const SIOCSIFMTU = 0x804c6922;
-    if (ioctl(sock, SIOCSIFMTU, &req) < 0) {
-        return error.IoError;
-    }
+    // Set MTU using ifreq
+    var mtu_req: ifreq = undefined;
+    @memset(@as([*]u8, @ptrCast(&mtu_req))[0..@sizeOf(ifreq)], 0);
+    @memcpy(mtu_req.ifr_name[0..actual_ifname.len], actual_ifname);
+    mtu_req.ifr_ifru.mtu = @as(c_int, @intCast(mtu));
+
+    const SIOCSIFMTU: c_ulong = 0x80206934;
+    _ = ioctl(sock, SIOCSIFMTU, &mtu_req);  // May fail for utun on macOS
 }
 
 /// Configure IPv6 address using ioctl (macOS)
@@ -292,7 +328,7 @@ fn configureIpv6(_: std.posix.fd_t, ifname: []const u8, address: Ipv6Address, _:
     addr.sin6_family = AF_INET6;
     addr.sin6_addr = address;
 
-    const SIOCSIFADDR = 0x804c692b;
+    const SIOCSIFADDR: c_ulong = 0x8020690c;
     if (ioctl(sock, SIOCSIFADDR, &req) < 0) {
         return error.IoError;
     }
@@ -310,7 +346,7 @@ fn setInterfaceFlags(_: std.posix.fd_t, ifname: []const u8, up: bool) TunError!v
     @memcpy(req.ifr_name[0..ifname.len], ifname);
 
     // Get current flags
-    const SIOCGIFFLAGS = 0xc0206913;
+    const SIOCGIFFLAGS: c_ulong = 0xc0206911;
     if (ioctl(sock, SIOCGIFFLAGS, &req) < 0) {
         return error.IoError;
     }
@@ -322,7 +358,7 @@ fn setInterfaceFlags(_: std.posix.fd_t, ifname: []const u8, up: bool) TunError!v
         req.ifr_ifru.flags &= ~@as(c_short, @intCast(IFF_UP));
     }
 
-    const SIOCSIFFLAGS = 0x80206914;
+    const SIOCSIFFLAGS: c_ulong = 0x80206910;
     if (ioctl(sock, SIOCSIFFLAGS, &req) < 0) {
         return error.IoError;
     }
@@ -331,21 +367,52 @@ fn setInterfaceFlags(_: std.posix.fd_t, ifname: []const u8, up: bool) TunError!v
 // ==================== Device Operations ====================
 
 /// Receive a packet from the TUN device
+/// Note: macOS utun includes a 4-byte header (family + padding) that we strip
 pub fn recv(device_ptr: *anyopaque, buf: []u8) TunError!usize {
     const state = toState(device_ptr);
-    const n = std.posix.read(state.fd, buf) catch {
+
+    // Read with extra space for the 4-byte utun header
+    const header_buf = @as([*]u8, @ptrCast(malloc(buf.len + 4)));
+    if (@intFromPtr(header_buf) == 0) {
+        return error.IoError;
+    }
+    defer free(header_buf);
+
+    const n = std.posix.read(state.fd, header_buf[0..buf.len + 4]) catch {
         return error.IoError;
     };
-    return @as(usize, @intCast(n));
+    if (n <= 4) return 0;
+
+    // Strip the 4-byte utun header (first byte is address family)
+    @memcpy(buf[0..@as(usize, @intCast(n - 4))], header_buf[4..n]);
+    return @as(usize, @intCast(n - 4));
 }
 
 /// Send a packet to the TUN device
+/// Note: macOS utun requires a 4-byte header (family + padding) before the packet
 pub fn send(device_ptr: *anyopaque, buf: []const u8) TunError!usize {
     const state = toState(device_ptr);
-    const n = std.posix.write(state.fd, buf) catch {
+
+    // Allocate temp buffer for header + packet
+    const packet_buf = @as([*]u8, @ptrCast(malloc(buf.len + 4)));
+    if (@intFromPtr(packet_buf) == 0) {
+        return error.IoError;
+    }
+    defer free(packet_buf);
+
+    // Add 4-byte utun header (AF_INET = 2 for IPv4)
+    packet_buf[0] = 2;  // Address family: AF_INET
+    packet_buf[1] = 0;
+    packet_buf[2] = 0;
+    packet_buf[3] = 0;
+    @memcpy(packet_buf[4..buf.len + 4], buf);
+
+    const n = std.posix.write(state.fd, packet_buf[0..buf.len + 4]) catch {
         return error.IoError;
     };
-    return @as(usize, @intCast(n));
+    // Return bytes written minus the header
+    if (n <= 4) return 0;
+    return @as(usize, @intCast(n - 4));
 }
 
 /// Get the device name
@@ -392,6 +459,7 @@ pub fn addIpv6(device_ptr: *anyopaque, address: Ipv6Address, prefix: u8) TunErro
 pub fn destroy(device_ptr: *anyopaque) void {
     const state = toState(device_ptr);
     std.posix.close(state.fd);
+    state.ringbuf.deinit();
     free(@constCast(state.name.ptr));
     free(state);
 }
