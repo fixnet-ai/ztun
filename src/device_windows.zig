@@ -81,6 +81,50 @@ const WINTUN_SEND_PACKET_FUNC = *const fn (WINTUN_SESSION_HANDLE, *anyopaque) ca
 const ERROR_OBJECT_ALREADY_EXISTS: DWORD = 0xC0000033;
 const WAIT_TIMEOUT: DWORD = 258;
 
+// IP Helper API types
+const NET_LUID = extern struct {
+    Value: u64,
+};
+
+const SOCKADDR_IN = extern struct {
+    sin_family: u16,
+    sin_port: u16,
+    sin_addr: [4]u8,
+    sin_zero: [8]u8,
+};
+
+const SOCKADDR_IN6 = extern struct {
+    sin6_family: u16,
+    sin6_port: u16,
+    sin6_flowinfo: u32,
+    sin6_addr: [16]u8,
+    sin6_scope_id: u32,
+};
+
+const SOCKADDR_STORAGE = extern struct {
+    ss_family: u16,
+    __ss_padding: [126]u8,
+};
+
+const MIB_UNICASTIPADDRESS_ROW = extern struct {
+    Address: SOCKADDR_STORAGE,
+    InterfaceLuid: NET_LUID,
+    InterfaceIndex: u32,
+    PrefixOrigin: u32,
+    SuffixOrigin: u32,
+    ValidLifetime: u32,
+    PreferredLifetime: u32,
+    OnLinkPrefixLength: u8,
+    SkipAsSource: BOOL,
+    DadState: u32,
+    ScopeId: u32,
+};
+
+// IP Helper API functions
+extern "c" fn InitializeUnicastIpAddressEntry(row: *MIB_UNICASTIPADDRESS_ROW) callconv(.C) void;
+extern "c" fn CreateUnicastIpAddressEntry(row: *const MIB_UNICASTIPADDRESS_ROW) callconv(.C) DWORD;
+extern "c" fn GetAdapterLUID(adapter: WINTUN_ADAPTER_HANDLE, luid: *NET_LUID) callconv(.C) void;
+
 // ==================== Helper Functions ====================
 
 /// Convert ASCII string to UTF-16
@@ -269,6 +313,67 @@ pub fn create(config: DeviceConfig) TunError!*DeviceContext {
     return ctx;
 }
 
+// ==================== IPv4/IPv6 Configuration ====================
+
+/// Configure IPv4 address using Windows IP Helper API
+fn configureIpv4(adapter_handle: WINTUN_ADAPTER_HANDLE, address: Ipv4Address, prefix: u8) TunError!void {
+    var address_row: MIB_UNICASTIPADDRESS_ROW = undefined;
+
+    // Initialize address row
+    InitializeUnicastIpAddressEntry(&address_row);
+
+    // Get adapter LUID
+    GetAdapterLUID(adapter_handle, &address_row.InterfaceLuid);
+
+    // Set IPv4 address (already in network byte order)
+    const ipv4_addr = @as(*SOCKADDR_IN, @alignCast(@ptrCast(&address_row.Address)));
+    ipv4_addr.sin_family = @as(u16, @bitCast(@as(i16, -1))); // AF_INET = 2
+    @memcpy(ipv4_addr.sin_addr[0..4], &address);
+
+    address_row.OnLinkPrefixLength = prefix;
+    address_row.DadState = 2; // IpDadStatePreferred
+    address_row.SkipAsSource = @as(c_int, 1);
+
+    // Create the address entry
+    const result = CreateUnicastIpAddressEntry(&address_row);
+    if (result != 0 and result != ERROR_OBJECT_ALREADY_EXISTS) {
+        std.debug.print("[ztun] CreateUnicastIpAddressEntry failed: error={d}\n", .{result});
+        return error.IoError;
+    }
+
+    std.debug.print("[ztun] Windows IPv4 configured: {d}.{d}.{d}.{d}/{d}\n",
+        .{ address[0], address[1], address[2], address[3], prefix });
+}
+
+/// Configure IPv6 address using Windows IP Helper API
+fn configureIpv6(adapter_handle: WINTUN_ADAPTER_HANDLE, address: Ipv6Address, prefix: u32) TunError!void {
+    var address_row: MIB_UNICASTIPADDRESS_ROW = undefined;
+
+    // Initialize address row
+    InitializeUnicastIpAddressEntry(&address_row);
+
+    // Get adapter LUID
+    GetAdapterLUID(adapter_handle, &address_row.InterfaceLuid);
+
+    // Set IPv6 address (already in network byte order)
+    const ipv6_addr = @as(*SOCKADDR_IN6, @alignCast(@ptrCast(&address_row.Address)));
+    ipv6_addr.sin6_family = @as(u16, @bitCast(@as(i16, -10))); // AF_INET6 = 23
+    @memcpy(ipv6_addr.sin6_addr[0..16], &address);
+
+    address_row.OnLinkPrefixLength = @as(u8, @intCast(prefix));
+    address_row.DadState = 2; // IpDadStatePreferred
+    address_row.SkipAsSource = @as(c_int, 1);
+
+    // Create the address entry
+    const result = CreateUnicastIpAddressEntry(&address_row);
+    if (result != 0 and result != ERROR_OBJECT_ALREADY_EXISTS) {
+        std.debug.print("[ztun] CreateUnicastIpAddressEntry (IPv6) failed: error={d}\n", .{result});
+        return error.IoError;
+    }
+
+    std.debug.print("[ztun] Windows IPv6 configured: /{d}\n", .{prefix});
+}
+
 // ==================== Device Operations ====================
 
 /// Helper to cast device pointer to state
@@ -386,13 +491,15 @@ pub fn getIfIndex(device_ptr: *anyopaque) TunError!u32 {
 pub fn setNonBlocking(_: *anyopaque, _: bool) TunError!void {}
 
 /// Add an IPv4 address at runtime
-pub fn addIpv4(_: *anyopaque, _: Ipv4Address, _: u8) TunError!void {
-    return error.Unknown;
+pub fn addIpv4(device_ptr: *anyopaque, address: Ipv4Address, prefix: u8) TunError!void {
+    const state = toState(device_ptr);
+    try configureIpv4(state.adapter_handle, address, prefix);
 }
 
 /// Add an IPv6 address at runtime
-pub fn addIpv6(_: *anyopaque, _: Ipv6Address, _: u8) TunError!void {
-    return error.Unknown;
+pub fn addIpv6(device_ptr: *anyopaque, address: Ipv6Address, prefix: u8) TunError!void {
+    const state = toState(device_ptr);
+    try configureIpv6(state.adapter_handle, address, prefix);
 }
 
 /// Destroy the device and clean up resources

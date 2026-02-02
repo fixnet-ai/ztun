@@ -290,9 +290,12 @@ fn configureIpv4(_: std.posix.fd_t, actual_ifname: []const u8, address: Ipv4Addr
 
     // SIOCSIFNETMASK: set netmask (0x80206916)
     // Only update sin_addr, keep other fields intact like xtun does
+    // Note: sin_addr must be in network byte order (big-endian)
     const shift: u5 = @truncate(32 - prefix);
     const mask: u32 = if (prefix == 32) 0xFFFFFFFF else (~@as(u32, 0) << shift);
-    @memcpy(addr.sin_addr[0..4], @as(*const [4]u8, @ptrCast(&mask))[0..4]);
+    // Convert to network byte order (big-endian) using @byteSwap
+    const mask_be = @byteSwap(mask);
+    @memcpy(addr.sin_addr[0..4], @as(*const [4]u8, @ptrCast(&mask_be))[0..4]);
 
     const SIOCSIFNETMASK: c_ulong = 0x80206916;
     if (ioctl(sock, SIOCSIFNETMASK, &req) < 0) {

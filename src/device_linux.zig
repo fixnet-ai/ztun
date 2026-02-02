@@ -223,10 +223,12 @@ fn configureIpv4(_: std.posix.fd_t, ifname: []const u8, address: Ipv4Address, pr
         return error.IoError;
     }
 
-    // Set netmask based on prefix
+    // Set netmask based on prefix (must be in network byte order)
     const shift: u5 = @truncate(32 - prefix);
     const mask: u32 = if (prefix == 32) 0xFFFFFFFF else (~@as(u32, 0) << shift);
-    addr.sin_addr = @as(*[4]u8, @ptrCast(@constCast(&mask))).*;
+    // Convert to network byte order (big-endian)
+    const mask_be = @byteSwap(mask);
+    @memcpy(addr.sin_addr[0..4], @as(*const [4]u8, @ptrCast(&mask_be))[0..4]);
 
     const SIOCSIFNETMASK = 0x891c;
     if (ioctl(sock, SIOCSIFNETMASK, &req) < 0) {
