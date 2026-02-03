@@ -1,4 +1,4 @@
-//! ztun - Cross-platform TUN device library in pure Zig
+//! tun - Cross-platform TUN device library in pure Zig
 //!
 //! A synchronous, cross-platform TUN device library providing:
 //! - Device creation and configuration
@@ -13,6 +13,7 @@ pub const Ipv4Address = @import("device.zig").Ipv4Address;
 pub const Ipv6Address = @import("device.zig").Ipv6Address;
 pub const NetworkAddress = @import("device.zig").NetworkAddress;
 pub const DeviceConfig = @import("device.zig").DeviceConfig;
+pub const RingBuffer = @import("ringbuf.zig").RingBuffer;
 
 // Re-export platform module
 pub const platform = @import("platform.zig");

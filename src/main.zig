@@ -27,7 +27,7 @@
 //! - macOS (using utun sockets)
 //! - BSD variants (future)
 
-const tun = @import("tun.zig");
+const tun = @import("tun");
 
 // Export public API
 pub const DeviceBuilder = tun.DeviceBuilder;

@@ -49,38 +49,99 @@ const cinclude_dirs = &[_][]const u8{
 const zig_modules = &[_]framework.ZigModule{
     .{
         .name = "tun",
-        .file = "src/tun.zig",
-        .deps = &[_][]const u8{ "builder", "device", "platform", "device_linux", "device_macos", "device_windows" },
+        .file = "src/tun/mod.zig",
+        .deps = &[_][]const u8{ "builder", "device", "platform", "device_linux", "device_macos", "device_windows", "ringbuf" },
     },
     .{
         .name = "device",
-        .file = "src/device.zig",
-        .deps = &[_][]const u8{ "device_linux", "device_macos", "device_windows" },
+        .file = "src/tun/device.zig",
+        .deps = &[_][]const u8{ "device_linux", "device_macos", "device_windows", "ringbuf" },
     },
     .{
         .name = "device_linux",
-        .file = "src/device_linux.zig",
-        .deps = &[_][]const u8{ "device" },
+        .file = "src/tun/device_linux.zig",
+        .deps = &[_][]const u8{ "device", "ringbuf" },
     },
     .{
         .name = "device_macos",
-        .file = "src/device_macos.zig",
-        .deps = &[_][]const u8{ "device", "device_linux" },
+        .file = "src/tun/device_macos.zig",
+        .deps = &[_][]const u8{ "device", "ringbuf" },
     },
     .{
         .name = "device_windows",
-        .file = "src/device_windows.zig",
-        .deps = &[_][]const u8{ "device" },
+        .file = "src/tun/device_windows.zig",
+        .deps = &[_][]const u8{ "device", "ringbuf" },
     },
     .{
         .name = "builder",
-        .file = "src/builder.zig",
+        .file = "src/tun/builder.zig",
         .deps = &[_][]const u8{ "device" },
     },
     .{
         .name = "platform",
-        .file = "src/platform.zig",
+        .file = "src/tun/platform.zig",
         .deps = &[_][]const u8{},
+    },
+    .{
+        .name = "ringbuf",
+        .file = "src/tun/ringbuf.zig",
+        .deps = &[_][]const u8{},
+    },
+    // IP stack submodules (all in src/ipstack/)
+    .{
+        .name = "ipstack_checksum",
+        .file = "src/ipstack/checksum.zig",
+        .deps = &[_][]const u8{},
+    },
+    .{
+        .name = "ipstack_ipv4",
+        .file = "src/ipstack/ipv4.zig",
+        .deps = &[_][]const u8{ "ipstack_checksum" },
+    },
+    .{
+        .name = "ipstack_ipv6",
+        .file = "src/ipstack/ipv6.zig",
+        .deps = &[_][]const u8{ "ipstack_checksum" },
+    },
+    .{
+        .name = "ipstack_tcp",
+        .file = "src/ipstack/tcp.zig",
+        .deps = &[_][]const u8{ "ipstack_checksum", "ipstack_ipv4" },
+    },
+    .{
+        .name = "ipstack_udp",
+        .file = "src/ipstack/udp.zig",
+        .deps = &[_][]const u8{ "ipstack_checksum", "ipstack_ipv4" },
+    },
+    .{
+        .name = "ipstack_icmp",
+        .file = "src/ipstack/icmp.zig",
+        .deps = &[_][]const u8{ "ipstack_checksum", "ipstack_ipv4", "ipstack_ipv6" },
+    },
+    .{
+        .name = "ipstack_callbacks",
+        .file = "src/ipstack/callbacks.zig",
+        .deps = &[_][]const u8{ "ipstack_connection" },
+    },
+    .{
+        .name = "ipstack_connection",
+        .file = "src/ipstack/connection.zig",
+        .deps = &[_][]const u8{},
+    },
+    .{
+        .name = "ipstack",
+        .file = "src/ipstack/mod.zig",
+        .deps = &[_][]const u8{
+            "ipstack_checksum",
+            "ipstack_ipv4",
+            "ipstack_ipv6",
+            "ipstack_tcp",
+            "ipstack_udp",
+            "ipstack_icmp",
+            "ipstack_callbacks",
+            "ipstack_connection",
+            "tun",
+        },
     },
 };
 
