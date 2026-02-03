@@ -62,7 +62,7 @@ pub const RingBuffer = struct {
         const addr = try mm.mmap(null, capacity, mm.PROT.READ | mm.PROT.WRITE, map_flags, -1, 0);
 
         return .{
-            .ptr = @as([*]u8, @ptrCast(addr.ptr)),
+            .ptr = @as([*]align(std.mem.page_size) u8, @ptrCast(addr.ptr)),
             .capacity = capacity,
             .owned = true,
         };
@@ -77,7 +77,8 @@ pub const RingBuffer = struct {
             const kernel32 = win.kernel32;
             _ = kernel32.VirtualFree(self.ptr, 0, win.MEM_RELEASE);
         } else {
-            const aligned_ptr = @as([*]align(4096) u8, @alignCast(self.ptr));
+            // Use proper alignment based on page size
+            const aligned_ptr = @as([*]align(std.mem.page_size) u8, @alignCast(self.ptr));
             posix.munmap(aligned_ptr[0..self.capacity]);
         }
 

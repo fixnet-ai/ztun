@@ -4,7 +4,7 @@
 //! - Device creation and configuration
 //! - IPv4/IPv6 address management
 //! - Packet send/receive operations
-//! - Platform-specific optimizations (Linux, macOS, Windows)
+//! - Platform-specific optimizations (Linux, macOS, Windows, Android, iOS)
 
 pub const DeviceBuilder = @import("builder.zig").DeviceBuilder;
 pub const Device = @import("device.zig").Device;
@@ -18,9 +18,18 @@ pub const DeviceConfig = @import("device.zig").DeviceConfig;
 pub const platform = @import("platform.zig");
 
 // Re-export platform-specific types
-pub usingnamespace switch (@import("builtin").os.tag) {
-    .linux => @import("device_linux.zig"),
-    .macos => @import("device_macos.zig"),
-    .windows => @import("device_windows.zig"),
-    else => struct {},
-};
+// Note: using inline blocks because switch on os.tag doesn't include .android/.ios
+const builtin = @import("builtin");
+
+const is_android = builtin.os.tag == .linux and
+    (builtin.abi == .android or builtin.target.os.tag == .android);
+const is_ios = builtin.os.tag == .ios;
+
+pub usingnamespace if (is_android or builtin.os.tag == .linux)
+    @import("device_linux.zig")
+else if (is_ios or builtin.os.tag == .macos)
+    @import("device_macos.zig")
+else if (builtin.os.tag == .windows)
+    @import("device_windows.zig")
+else
+    struct {};

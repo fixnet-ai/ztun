@@ -134,4 +134,162 @@ pub fn build(b: *std.Build) void {
     const all_tests_step = b.step("all-tests", "Build test_runner for all supported targets");
     const build_all_tests = framework.buildAllTests(b, optimize, config, &framework.standard_targets, &framework.standard_target_names);
     all_tests_step.dependOn(build_all_tests);
+
+    // ==================== Android Build Steps ====================
+
+    // Build standalone Android test executable (minimal C imports)
+    const android_test_step = b.step("android-test", "Build standalone Android test executable");
+
+    const android_target = b.resolveTargetQuery(.{
+        .cpu_arch = .x86_64,
+        .os_tag = .linux,
+        .abi = .android,
+    });
+
+    const android_test = b.addExecutable(.{
+        .name = "test_android",
+        .root_source_file = b.path("tests/test_android.zig"),
+        .target = android_target,
+        .optimize = std.builtin.OptimizeMode.ReleaseSmall,
+    });
+
+    // Set sysroot for Android NDK
+    const ndk_sysroot = "/Users/modasi/Library/Android/sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/darwin-x86_64/sysroot";
+
+    // Add include paths for C imports
+    android_test.root_module.addCSourceFiles(.{
+        .files = &[_][]const u8{},
+        .flags = &[_][]const u8{ "-isysroot", ndk_sysroot },
+    });
+    android_test.root_module.addSystemIncludePath(.{ .cwd_relative = ndk_sysroot ++ "/usr/include" });
+    android_test.root_module.addSystemIncludePath(.{ .cwd_relative = ndk_sysroot ++ "/usr/include/x86_64-linux-android" });
+
+    // Add library paths
+    android_test.root_module.addLibraryPath(.{ .cwd_relative = ndk_sysroot ++ "/usr/lib/x86_64-linux-android/21" });
+    android_test.root_module.addLibraryPath(.{ .cwd_relative = ndk_sysroot ++ "/usr/lib/x86_64-linux-android" });
+
+    // Link libraries - must use linkLibC() with libc file for Android
+    android_test.linkLibC();
+    android_test.setLibCFile(.{ .cwd_relative = "/Users/modasi/.zvm/0.13.0/libc/x86_64-linux-android.txt" });
+    android_test.linkSystemLibrary("log");
+
+    // Install to bin/x86_64-linux-android/
+    const android_install = b.addInstallArtifact(android_test, .{
+        .dest_dir = .{ .override = .{ .custom = b.dupe("bin/x86_64-linux-android") } },
+    });
+    android_test_step.dependOn(&android_install.step);
+
+    // Build test_runner for Android with full ztun modules
+    const android_runner_step = b.step("android-runner", "Build test_runner for Android with full ztun modules");
+
+    const android_runner = b.addExecutable(.{
+        .name = "test_runner",
+        .root_source_file = b.path("tests/test_runner.zig"),
+        .target = android_target,
+        .optimize = std.builtin.OptimizeMode.ReleaseSmall,
+    });
+
+    // Add Zig modules
+    const modules = framework.createModules(b, config);
+    var iter = modules.map.iterator();
+    while (iter.next()) |entry| {
+        android_runner.root_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    }
+
+    // Add C sources with sysroot
+    android_runner.root_module.addCSourceFiles(.{
+        .files = config.c_sources,
+        .flags = &[_][]const u8{ "-std=c99", "-Wall", "-Wextra", "-O2", "-isysroot", ndk_sysroot },
+    });
+    android_runner.root_module.addSystemIncludePath(.{ .cwd_relative = ndk_sysroot ++ "/usr/include" });
+    android_runner.root_module.addSystemIncludePath(.{ .cwd_relative = ndk_sysroot ++ "/usr/include/x86_64-linux-android" });
+    android_runner.root_module.addSystemIncludePath(.{ .cwd_relative = "src" });
+
+    // Add library paths
+    android_runner.root_module.addLibraryPath(.{ .cwd_relative = ndk_sysroot ++ "/usr/lib/x86_64-linux-android/21" });
+    android_runner.root_module.addLibraryPath(.{ .cwd_relative = ndk_sysroot ++ "/usr/lib/x86_64-linux-android" });
+
+    // Link libraries
+    android_runner.linkLibC();
+    android_runner.setLibCFile(.{ .cwd_relative = "/Users/modasi/.zvm/0.13.0/libc/x86_64-linux-android.txt" });
+    android_runner.linkSystemLibrary("log");
+
+    // Install
+    const runner_install = b.addInstallArtifact(android_runner, .{
+        .dest_dir = .{ .override = .{ .custom = b.dupe("bin/x86_64-linux-android") } },
+    });
+    android_runner_step.dependOn(&runner_install.step);
+
+    // ==================== iOS Simulator Build Steps ====================
+
+    // Build standalone iOS Simulator test executable
+    const ios_test_step = b.step("ios-test", "Build standalone iOS Simulator test executable");
+
+    const ios_sim_target = b.resolveTargetQuery(.{
+        .cpu_arch = .x86_64,
+        .os_tag = .ios,
+        .abi = .simulator,
+    });
+
+    const ios_test = b.addExecutable(.{
+        .name = "test_ios",
+        .root_source_file = b.path("tests/test_ios.zig"),
+        .target = ios_sim_target,
+        .optimize = std.builtin.OptimizeMode.ReleaseSmall,
+    });
+
+    // Set sysroot for iOS Simulator SDK
+    const ios_sim_sysroot = "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator26.0.sdk";
+
+    // Add include paths for C imports
+    ios_test.root_module.addCSourceFiles(.{
+        .files = &[_][]const u8{},
+        .flags = &[_][]const u8{ "-isysroot", ios_sim_sysroot },
+    });
+    ios_test.root_module.addSystemIncludePath(.{ .cwd_relative = ios_sim_sysroot ++ "/usr/include" });
+
+    // Link libraries
+    ios_test.linkLibC();
+    ios_test.setLibCFile(.{ .cwd_relative = "/Users/modasi/.zvm/0.13.0/libc/x86_64-ios-simulator.txt" });
+
+    // Install to bin/x86_64-ios-sim/
+    const ios_install = b.addInstallArtifact(ios_test, .{
+        .dest_dir = .{ .override = .{ .custom = b.dupe("bin/x86_64-ios-sim") } },
+    });
+    ios_test_step.dependOn(&ios_install.step);
+
+    // Build test_runner for iOS Simulator with full ztun modules
+    const ios_runner_step = b.step("ios-runner", "Build test_runner for iOS Simulator with full ztun modules");
+
+    const ios_runner = b.addExecutable(.{
+        .name = "test_runner",
+        .root_source_file = b.path("tests/test_runner.zig"),
+        .target = ios_sim_target,
+        .optimize = std.builtin.OptimizeMode.ReleaseSmall,
+    });
+
+    // Add Zig modules
+    const ios_modules = framework.createModules(b, config);
+    var ios_iter = ios_modules.map.iterator();
+    while (ios_iter.next()) |entry| {
+        ios_runner.root_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    }
+
+    // Add C sources with sysroot
+    ios_runner.root_module.addCSourceFiles(.{
+        .files = config.c_sources,
+        .flags = &[_][]const u8{ "-std=c99", "-Wall", "-Wextra", "-O2", "-isysroot", ios_sim_sysroot },
+    });
+    ios_runner.root_module.addSystemIncludePath(.{ .cwd_relative = ios_sim_sysroot ++ "/usr/include" });
+    ios_runner.root_module.addSystemIncludePath(.{ .cwd_relative = "src" });
+
+    // Link libraries
+    ios_runner.linkLibC();
+    ios_runner.setLibCFile(.{ .cwd_relative = "/Users/modasi/.zvm/0.13.0/libc/x86_64-ios-simulator.txt" });
+
+    // Install
+    const ios_runner_install = b.addInstallArtifact(ios_runner, .{
+        .dest_dir = .{ .override = .{ .custom = b.dupe("bin/x86_64-ios-sim") } },
+    });
+    ios_runner_step.dependOn(&ios_runner_install.step);
 }
