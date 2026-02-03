@@ -21,9 +21,10 @@ pub const platform = @import("platform.zig");
 // Note: using inline blocks because switch on os.tag doesn't include .android/.ios
 const builtin = @import("builtin");
 
-const is_android = builtin.os.tag == .linux and
-    (builtin.abi == .android or builtin.target.os.tag == .android);
-const is_ios = builtin.os.tag == .ios;
+// Detect Android by ABI (works during cross-compilation)
+const is_android = builtin.os.tag == .linux and builtin.abi == .android;
+// Detect iOS by ABI (simulator uses different ABI)
+const is_ios = builtin.os.tag == .ios or builtin.abi == .simulator;
 
 pub usingnamespace if (is_android or builtin.os.tag == .linux)
     @import("device_linux.zig")
