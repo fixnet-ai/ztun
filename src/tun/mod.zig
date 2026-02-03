@@ -18,6 +18,11 @@ pub const RingBuffer = @import("ringbuf.zig").RingBuffer;
 // Re-export platform module
 pub const platform = @import("platform.zig");
 
+// Re-export iOS-specific types (PacketFlow wrapper)
+pub const IosDevice = @import("device_ios.zig").IosDevice;
+pub const PacketReadFn = @import("device_ios.zig").PacketReadFn;
+pub const PacketWriteFn = @import("device_ios.zig").PacketWriteFn;
+
 // Re-export platform-specific types
 // Note: using inline blocks because switch on os.tag doesn't include .android/.ios
 const builtin = @import("builtin");

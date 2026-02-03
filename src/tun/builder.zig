@@ -91,4 +91,16 @@ pub const DeviceBuilder = struct {
 
         return Device.create(config);
     }
+
+    /// Create a Device from an existing file descriptor (Android VpnService)
+    ///
+    /// This is used when the TUN device is created by Android's VpnService
+    /// and the file descriptor is passed to native code via JNI.
+    ///
+    /// - fd: File descriptor from ParcelFileDescriptor.getFd()
+    /// - name: Optional device name (obtained from kernel if null)
+    /// - mtu: MTU for the device (required, cannot be inferred from fd)
+    pub fn createFromFd(fd: std.posix.fd_t, name: ?[:0]const u8, mtu: u16) TunError!Device {
+        return Device.createFromFd(fd, name, mtu);
+    }
 };

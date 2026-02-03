@@ -78,8 +78,80 @@ extern "c" fn if_nametoindex(name: [*:0]const u8) c_uint;
 const O_RDWR = 2;
 const O_NONBLOCK = 2048;
 const TUNSETIFF = 0x400454ca;
+const TUNGETIFF = 0x400454d2;
 
 // ==================== Device Creation ====================
+
+/// Create a TUN device from an existing file descriptor (Android VpnService)
+///
+/// This function takes ownership of the fd and will close it on destroy.
+/// The fd should be a valid TUN device file descriptor obtained from
+/// Android's ParcelFileDescriptor.getFd() via JNI.
+///
+/// - fd: Existing file descriptor for the TUN device
+/// - name: Optional name for the device (obtained from fd if null)
+/// - mtu: MTU for the device (required, cannot be inferred from fd)
+pub fn createFromFd(fd: std.posix.fd_t, name: ?[:0]const u8, mtu: u16) TunError!*DeviceContext {
+    // Allocate context
+    const ctx = malloc(@sizeOf(DeviceContext));
+    if (@intFromPtr(ctx) == 0) {
+        return error.IoError;
+    }
+
+    // Allocate state
+    const state = malloc(@sizeOf(LinuxDeviceState));
+    if (@intFromPtr(state) == 0) {
+        free(ctx);
+        return error.IoError;
+    }
+
+    // Get device name from kernel if not provided
+    const dev_name = if (name) |n| n else blk: {
+        var req: ifreq = undefined;
+        memset(&req, 0, @sizeOf(ifreq));
+        const result = ioctl(fd, TUNGETIFF, &req);
+        if (result < 0) {
+            free(state);
+            free(ctx);
+            return error.IoError;
+        }
+        break :blk std.mem.sliceTo(&req.ifr_name, 0);
+    };
+
+    // Copy name to heap
+    const name_copy = malloc(dev_name.len + 1);
+    if (@intFromPtr(name_copy) == 0) {
+        free(state);
+        free(ctx);
+        return error.IoError;
+    }
+    @memcpy(@as([*]u8, @ptrCast(name_copy))[0..dev_name.len], dev_name);
+    @as([*]u8, @ptrCast(name_copy))[dev_name.len] = 0;
+
+    // Initialize RingBuffer (large buffer for batch packet handling)
+    const ringbuf_capacity = @as(usize, mtu) * 256;
+    const ringbuf = RingBuffer.init(ringbuf_capacity) catch RingBuffer{
+        .ptr = undefined,
+        .capacity = 0,
+        .owned = false,
+    };
+
+    // Initialize state with external fd flag
+    const s = @as(*LinuxDeviceState, @alignCast(@ptrCast(state)));
+    s.* = .{
+        .fd = fd,
+        .name = @as([*]u8, @ptrCast(name_copy))[0..dev_name.len],
+        .mtu = mtu,
+        .ringbuf = ringbuf,
+        .read_offset = 0,
+    };
+
+    // Initialize context
+    const c = @as(*DeviceContext, @alignCast(@ptrCast(ctx)));
+    c.* = .{ .ptr = state };
+
+    return c;
+}
 
 /// Create a new TUN device on Linux
 pub fn create(config: DeviceConfig) TunError!*DeviceContext {

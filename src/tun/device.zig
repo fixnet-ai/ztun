@@ -27,6 +27,8 @@ pub const TunError = error{
     NotFound,
     /// Permission denied
     PermissionDenied,
+    /// Operation not supported on this platform
+    NotSupported,
     /// Unknown error
     Unknown,
 };
@@ -63,6 +65,26 @@ pub const DeviceContext = struct {
 /// Provides synchronous send/receive operations for TUN interfaces.
 pub const Device = struct {
     ctx: *DeviceContext,
+
+    /// Create a TUN device from an existing file descriptor
+    ///
+    /// This is used by Android VpnService where the fd is obtained from
+    /// ParcelFileDescriptor.getFd() via JNI.
+    ///
+    /// - fd: Existing file descriptor for the TUN device
+    /// - dev_name: Optional device name (obtained from kernel if null)
+    /// - dev_mtu: MTU for the device
+    pub fn createFromFd(fd: std.posix.fd_t, dev_name: ?[:0]const u8, dev_mtu: u16) TunError!Device {
+        const ctx_ptr = if (is_android or builtin.os.tag == .linux)
+            linux_impl.createFromFd(fd, dev_name, dev_mtu)
+        else if (is_ios or builtin.os.tag == .macos)
+            error.NotSupported
+        else if (builtin.os.tag == .windows)
+            error.NotSupported
+        else
+            unreachable;
+        return Device{ .ctx = ctx_ptr };
+    }
 
     /// Create a new TUN device with the given configuration
     pub fn create(config: DeviceConfig) TunError!Device {
