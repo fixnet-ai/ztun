@@ -1,0 +1,1 @@
+../devenv/.lima/lima-deploy.sh

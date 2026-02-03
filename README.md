@@ -34,9 +34,54 @@ try device.send(buf[0..len]);
 ## Build Commands
 
 ```bash
-zig build              # Build native + run unit tests
-zig build test         # Build native + run integration tests (requires sudo)
-zig build all          # Build all platforms (no tests)
+zig build              # Build native library + run unit tests
+zig build test         # Build test_runner to bin/macos/ (requires sudo)
+zig build all          # Build static libraries for all targets to lib/{target}/
+zig build all-tests    # Build test_runner for all targets to bin/{target}/
+```
+
+### Output Structure
+
+```
+zig-out/
+├── lib/                    # Static libraries by platform
+│   ├── x86_64-linux-gnu/libztun.a
+│   ├── x86_64-windows-gnu/ztun.lib
+│   ├── aarch64-macos/libztun.a
+│   └── ...
+└── bin/                    # Test executables by platform
+    ├── x86_64-linux-gnu/ztun_test_runner
+    ├── x86_64-windows-gnu/ztun_test_runner.exe
+    ├── x86_64-macos/ztun_test_runner
+    └── ...
+```
+
+## Multi-Platform Testing
+
+### macOS (Native)
+
+```bash
+sudo ./zig-out/bin/macos/ztun_test_runner
+```
+
+### Linux (Lima VM)
+
+```bash
+# Build for Linux
+zig build -Dtarget=x86_64-linux-gnu
+
+# Run on Lima VM (via shared directory)
+.lima/lima-exec.sh sudo /Users/modasi/works/2025/fixnet/ztun/zig-out/bin/x86_64-linux-gnu/ztun_test_runner
+```
+
+### Windows VM
+
+```bash
+# Deploy to Windows VM
+.windows/windows-deploy.sh
+
+# Run on Windows VM
+.windows/windows-exec.sh
 ```
 
 ## macOS Notes

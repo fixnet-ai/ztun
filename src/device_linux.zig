@@ -336,9 +336,9 @@ pub fn getMtu(device_ptr: *anyopaque) TunError!u16 {
 /// Get the interface index
 pub fn getIfIndex(device_ptr: *anyopaque) TunError!u32 {
     const state = toState(device_ptr);
-    const index = std.posix.if_nametoindex(state.name.ptr);
+    const index = if_nametoindex(@as([*:0]const u8, @ptrCast(state.name.ptr)));
     if (index == 0) {
-        return .NotFound;
+        return error.NotFound;
     }
     return @as(u32, @intCast(index));
 }
@@ -346,9 +346,10 @@ pub fn getIfIndex(device_ptr: *anyopaque) TunError!u32 {
 /// Set non-blocking mode
 pub fn setNonBlocking(device_ptr: *anyopaque, nonblocking: bool) TunError!void {
     const state = toState(device_ptr);
-    const flags = std.posix.fcntl(state.fd, std.posix.F.GETFL, 0) catch return .IoError;
-    const new_flags = if (nonblocking) flags | std.posix.O.NONBLOCK else flags & ~std.posix.O.NONBLOCK;
-    std.posix.fcntl(state.fd, std.posix.F.SETFL, new_flags) catch return .IoError;
+    const flags = std.posix.fcntl(state.fd, std.posix.F.GETFL, 0) catch return error.IoError;
+    const nonblock_flag = @as(@TypeOf(flags), O_NONBLOCK);
+    const new_flags = if (nonblocking) flags | nonblock_flag else flags & ~nonblock_flag;
+    _ = std.posix.fcntl(state.fd, std.posix.F.SETFL, new_flags) catch return error.IoError;
 }
 
 /// Add an IPv4 address at runtime

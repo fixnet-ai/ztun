@@ -2,11 +2,29 @@
 //!
 //! Build commands:
 //!   zig build              - Build native library and unit tests
-//!   zig build test         - Build test_runner executable to zig-out/bin
-//!   zig build all          - Build for all supported targets
+//!   zig build test         - Build test_runner executable to bin/macos/
+//!   zig build all          - Build static libraries for all targets
+//!   zig build all-tests    - Build test_runner for all targets
+//!
+//! Output structure:
+//!   zig-out/
+//!   ├── lib/                    # Static libraries by platform
+//!   │   ├── x86_64-linux-gnu/
+//!   │   ├── aarch64-linux-gnu/
+//!   │   ├── x86_64-macos/
+//!   │   ├── aarch64-macos/
+//!   │   ├── x86_64-windows-gnu/
+//!   │   └── ...
+//!   └── bin/                    # Test executables by platform
+//!       ├── macos/              # Native macOS
+//!       ├── linux-gnu/          # Cross-compiled Linux
+//!       ├── windows/            # Cross-compiled Windows
+//!       └── ...
 //!
 //! Note: test_runner requires root privileges. Run with:
-//!   sudo ./zig-out/bin/test_runner
+//!   sudo ./zig-out/bin/macos/ztun_test_runner
+//!   # Or on Linux VM:
+//!   sudo /opt/ztest/ztun_test_runner
 
 const std = @import("std");
 const framework = @import("build_tools/build_framework.zig");
@@ -97,49 +115,23 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Build native static library
+    // Build native static library to zig-out/
     const lib = framework.buildNativeLib(b, target, optimize, config);
     b.installArtifact(lib);
 
     // Build unit tests (default step)
     framework.buildUnitTests(b, target, optimize, config);
 
-    // Build test_runner executable (not auto-run, requires sudo)
-    buildTestRunner(b, target, optimize, config);
+    // Build test_runner executable to bin/{os}/
+    framework.buildTestRunner(b, target, optimize, config);
 
-    // Build all targets (no tests)
-    const all_targets_step = b.step("all", "Build for all supported targets");
+    // Build all static library targets (no tests)
+    const all_targets_step = b.step("all", "Build static libraries for all supported targets");
     const build_all = framework.buildAllTargets(b, optimize, config, &framework.standard_targets, &framework.standard_target_names);
     all_targets_step.dependOn(build_all);
-}
 
-/// Build test_runner executable to zig-out/bin (manual run with sudo)
-fn buildTestRunner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cfg: framework.ProjectConfig) void {
-    const test_runner_spec = for (cfg.test_files) |spec| {
-        if (spec.exe_name != null) {
-            break spec;
-        }
-    } else return;
-
-    const test_runner = b.addExecutable(.{
-        .name = test_runner_spec.exe_name.?,
-        .root_source_file = b.path(test_runner_spec.file),
-        .target = target,
-        .optimize = optimize,
-    });
-    test_runner.linkLibC();
-
-    // Add Zig modules
-    const modules = framework.createModules(b, cfg);
-    var iter = modules.map.iterator();
-    while (iter.next()) |entry| {
-        test_runner.root_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
-    }
-
-    // Install to zig-out/bin
-    const install_step = b.addInstallArtifact(test_runner, .{});
-
-    // Test step only builds, does not run (requires sudo)
-    const test_step = b.step("test", "Build test_runner executable (run with: sudo ./zig-out/bin/test_runner)");
-    test_step.dependOn(&install_step.step);
+    // Build all test_runner targets for VM deployment
+    const all_tests_step = b.step("all-tests", "Build test_runner for all supported targets");
+    const build_all_tests = framework.buildAllTests(b, optimize, config, &framework.standard_targets, &framework.standard_target_names);
+    all_tests_step.dependOn(build_all_tests);
 }

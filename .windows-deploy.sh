@@ -1,0 +1,1 @@
+../devenv/.windows/windows-deploy.sh

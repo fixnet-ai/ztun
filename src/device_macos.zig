@@ -41,6 +41,9 @@ const PF_SYSTEM = 32; // System domain
 const SYSPROTO_CONTROL = 2; // Control protocol
 const CTLIOCGINFO = 0xc0644e03; // Get control info ioctl
 
+/// File status flags for fcntl
+const O_NONBLOCK = 0x0004; // BSD/FNDELAY flag for non-blocking I/O
+
 // ==================== FFI Declarations ====================
 
 extern "c" fn socket(domain: c_int, type: c_int, protocol: c_int) c_int;
@@ -440,8 +443,9 @@ pub fn getIfIndex(device_ptr: *anyopaque) TunError!u32 {
 pub fn setNonBlocking(device_ptr: *anyopaque, nonblocking: bool) TunError!void {
     const state = toState(device_ptr);
     const flags = std.posix.fcntl(state.fd, std.posix.F.GETFL, 0) catch return error.IoError;
-    const new_flags = if (nonblocking) flags | std.posix.O.NONBLOCK else flags & ~std.posix.O.NONBLOCK;
-    std.posix.fcntl(state.fd, std.posix.F.SETFL, new_flags) catch return error.IoError;
+    const nonblock_flag = @as(@TypeOf(flags), O_NONBLOCK);
+    const new_flags = if (nonblocking) flags | nonblock_flag else flags & ~nonblock_flag;
+    _ = std.posix.fcntl(state.fd, std.posix.F.SETFL, new_flags) catch return error.IoError;
 }
 
 /// Add an IPv4 address at runtime
