@@ -34,6 +34,12 @@ const is_android = builtin.os.tag == .linux and builtin.abi == .android;
 // Detect iOS by ABI (simulator uses different ABI)
 const is_ios = builtin.os.tag == .ios or builtin.abi == .simulator;
 
+// Import platform-specific modules
+const linux_mod = if (is_android or builtin.os.tag == .linux) @import("device_linux.zig") else struct {};
+const macos_mod = if (is_ios or builtin.os.tag == .macos) @import("device_macos.zig") else struct {};
+const windows_mod = if (builtin.os.tag == .windows) @import("device_windows.zig") else struct {};
+
+// Re-export platform functions using usingnamespace
 pub usingnamespace if (is_android or builtin.os.tag == .linux)
     @import("device_linux.zig")
 else if (is_ios or builtin.os.tag == .macos)
@@ -42,3 +48,24 @@ else if (builtin.os.tag == .windows)
     @import("device_windows.zig")
 else
     struct {};
+
+/// Create DeviceOps for the current platform
+/// This factory function creates a DeviceOps that handles all platform-specific
+/// header processing internally. The router receives pure IP packets.
+///
+/// Parameters:
+///   - fd: Raw TUN file descriptor
+///
+/// Returns: DeviceOps configured for the current platform
+pub fn createDeviceOps(fd: std.posix.fd_t) DeviceOps {
+    if (is_ios or builtin.os.tag == .macos) {
+        // macOS/iOS: Use utun-specific DeviceOps with 4-byte header handling
+        return macos_mod.createDeviceOps(fd);
+    } else if (builtin.os.tag == .windows) {
+        // Windows: Use Windows-specific DeviceOps
+        return windows_mod.createDeviceOps(fd);
+    } else {
+        // Linux/Android: No additional header processing needed
+        return linux_mod.createDeviceOps(fd);
+    }
+}

@@ -11,6 +11,7 @@ const DeviceConfig = @import("device.zig").DeviceConfig;
 const Ipv4Address = @import("device.zig").Ipv4Address;
 const Ipv6Address = @import("device.zig").Ipv6Address;
 const DeviceContext = @import("device.zig").DeviceContext;
+const DeviceOps = @import("device.zig").DeviceOps;
 const RingBuffer = @import("ringbuf.zig").RingBuffer;
 
 // ==================== Windows Types ====================
@@ -543,3 +544,42 @@ pub fn destroy(device_ptr: *anyopaque) void {
     // is a simple allocator that doesn't track individual allocations.
     // These small allocations will be reclaimed when the process exits.
 }
+
+// ==================== DeviceOps for Router ====================
+
+/// Create DeviceOps for Windows Wintun device from raw file descriptor
+/// Windows Wintun uses a different I/O model than Linux/macOS.
+///
+/// Parameters:
+///   - fd: Raw file descriptor (not used for Windows wintun)
+///
+/// Returns: DeviceOps configured for Windows
+pub fn createDeviceOps(_: std.posix.fd_t) DeviceOps {
+    // For Windows, the device_ops model doesn't apply the same way
+    // Wintun uses its own I/O mechanism via the DLL
+    // Return a no-op DeviceOps for compatibility
+    return DeviceOps{
+        .ctx = undefined,
+        .readFn = windowsRead,
+        .writeFn = windowsWrite,
+        .fdFn = windowsFd,
+        .destroyFn = windowsDestroy,
+    };
+}
+
+fn windowsRead(_: *anyopaque, _: []u8) TunError!usize {
+    return error.NotSupported;
+}
+
+fn windowsWrite(_: *anyopaque, _: []const u8) TunError!usize {
+    return error.NotSupported;
+}
+
+fn windowsFd(_: *anyopaque) std.posix.fd_t {
+    return -1;
+}
+
+fn windowsDestroy(_: *anyopaque) void {
+    // Nothing to destroy for the no-op DeviceOps
+}
+

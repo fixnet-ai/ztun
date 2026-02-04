@@ -480,15 +480,38 @@ pub fn destroy(device_ptr: *anyopaque) void {
 
 // ==================== DeviceOps for Router ====================
 
-/// Create DeviceOps for macOS utun device from DeviceContext
-/// This provides an interface for Router to use utun with proper 4-byte header handling
-pub fn createDeviceOpsFromContext(ctx_ptr: *anyopaque) DeviceOps {
-    return createDeviceOpsMacOS(ctx_ptr);
+/// Create DeviceOps for macOS utun device from raw file descriptor
+/// This factory function creates a DeviceOps that handles the 4-byte utun header
+/// internally. The caller receives pure IP packets.
+///
+/// Parameters:
+///   - fd: Raw utun file descriptor
+///
+/// Returns: DeviceOps configured for macOS with 4-byte header handling
+pub fn createDeviceOps(fd: std.posix.fd_t) DeviceOps {
+    // Allocate macOS-specific state
+    const state = @as(*MacOSDeviceState, @ptrCast(malloc(@sizeOf(MacOSDeviceState)) orelse unreachable));
+
+    state.* = MacOSDeviceState{
+        .fd = fd,
+        .name = "",
+        .mtu = 1500,
+        .index = 0,
+        .ringbuf = undefined,
+        .read_offset = 0,
+    };
+
+    return DeviceOps{
+        .ctx = state,
+        .readFn = utunRead,
+        .writeFn = utunWrite,
+        .fdFn = utunFd,
+        .destroyFn = utunDestroy,
+    };
 }
 
-/// Create DeviceOps for macOS utun device from anyopaque
-/// Internal function used by mod.zig
-pub fn createDeviceOpsMacOS(state_ptr: *anyopaque) DeviceOps {
+/// Create DeviceOps from already-allocated state pointer
+pub fn createDeviceOpsFromState(state_ptr: *anyopaque) DeviceOps {
     return DeviceOps{
         .ctx = state_ptr,
         .readFn = utunRead,
@@ -496,6 +519,18 @@ pub fn createDeviceOpsMacOS(state_ptr: *anyopaque) DeviceOps {
         .fdFn = utunFd,
         .destroyFn = utunDestroy,
     };
+}
+
+/// Create DeviceOps for macOS utun device from DeviceContext
+/// This provides an interface for Router to use utun with proper 4-byte header handling
+pub fn createDeviceOpsFromContext(ctx_ptr: *anyopaque) DeviceOps {
+    return createDeviceOpsFromState(ctx_ptr);
+}
+
+/// Create DeviceOps for macOS utun device from anyopaque (legacy alias)
+/// Internal function used by mod.zig
+pub fn createDeviceOpsMacOS(state_ptr: *anyopaque) DeviceOps {
+    return createDeviceOpsFromState(state_ptr);
 }
 
 fn utunRead(ctx: *anyopaque, buf: []u8) TunError!usize {

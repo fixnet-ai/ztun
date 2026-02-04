@@ -1060,21 +1060,21 @@ fn onTunReadable(
 
     router._stats.bytes_rx += n;
 
-    // Skip the 4-byte utun header (AF_INET + reserved bytes)
-    // The actual IP packet starts at offset 4
-    const ip_offset: usize = 4;
-    if (n < ip_offset + 20) {
-        std.debug.print("[TUN] Packet too small ({}) after skipping utun header\n", .{n});
+    // The packet buffer now contains a pure IP packet (no platform-specific headers)
+    // DeviceOps.read() is responsible for stripping any platform-specific headers
+    // (e.g., macOS utun 4-byte header) before returning
+    if (n < 20) {
+        std.debug.print("[TUN] Packet too small ({}) for IP header\n", .{n});
         router.submitTunRead();
         return .disarm;
     }
 
-    // Dump received packet (skip utun header)
-    const packet_data = router.packet_buf[ip_offset..n];
+    // Use the packet directly - it's already a pure IP packet
+    const packet_data = router.packet_buf[0..n];
     const src_ip = std.mem.readInt(u32, packet_data[12..16], .big);
     const dst_ip = std.mem.readInt(u32, packet_data[16..20], .big);
     const protocol = packet_data[9];
-    std.debug.print("\n[TUN] READ: {} bytes from TUN (IP packet: {} bytes)\n", .{n, n - ip_offset});
+    std.debug.print("\n[TUN] READ: {} bytes from TUN\n", .{n});
     std.debug.print("[TUN]   src={s} dst={s} proto={}\n", .{ fmtIp(src_ip), fmtIp(dst_ip), protocol });
     dumpPacket("[TUN]   packet", packet_data);
 

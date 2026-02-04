@@ -10,6 +10,7 @@ const DeviceConfig = @import("device.zig").DeviceConfig;
 const Ipv4Address = @import("device.zig").Ipv4Address;
 const Ipv6Address = @import("device.zig").Ipv6Address;
 const DeviceContext = @import("device.zig").DeviceContext;
+const DeviceOps = @import("device.zig").DeviceOps;
 const RingBuffer = @import("ringbuf.zig").RingBuffer;
 
 // ==================== Type Definitions ====================
@@ -451,4 +452,70 @@ pub fn destroy(device_ptr: *anyopaque) void {
     state.ringbuf.deinit();
     free(@constCast(state.name.ptr));
     free(state);
+}
+
+// ==================== DeviceOps for Router ====================
+
+/// Create DeviceOps for Linux TUN device from raw file descriptor
+/// Linux TUN devices don't require additional header processing.
+///
+/// Parameters:
+///   - fd: Raw TUN file descriptor
+///
+/// Returns: DeviceOps configured for Linux (no header handling needed)
+pub fn createDeviceOps(fd: std.posix.fd_t) DeviceOps {
+    return createDeviceOpsFromFd(fd);
+}
+
+/// Create DeviceOps from raw file descriptor
+pub fn createDeviceOpsFromFd(fd: std.posix.fd_t) DeviceOps {
+    // Allocate Linux-specific state
+    const state = @as(*LinuxDeviceState, @ptrCast(malloc(@sizeOf(LinuxDeviceState)) orelse unreachable));
+
+    state.* = LinuxDeviceState{
+        .fd = fd,
+        .name = "",
+        .mtu = 1500,
+        .ringbuf = undefined,
+        .read_offset = 0,
+    };
+
+    return DeviceOps{
+        .ctx = state,
+        .readFn = linuxRead,
+        .writeFn = linuxWrite,
+        .fdFn = linuxFd,
+        .destroyFn = linuxDestroy,
+    };
+}
+
+/// Create DeviceOps from already-allocated state pointer
+pub fn createDeviceOpsFromState(state_ptr: *anyopaque) DeviceOps {
+    return DeviceOps{
+        .ctx = state_ptr,
+        .readFn = linuxRead,
+        .writeFn = linuxWrite,
+        .fdFn = linuxFd,
+        .destroyFn = linuxDestroy,
+    };
+}
+
+fn linuxRead(ctx: *anyopaque, buf: []u8) TunError!usize {
+    const state = toState(ctx);
+    // Direct read - no header processing needed on Linux
+    return std.posix.read(state.fd, buf) catch return error.IoError;
+}
+
+fn linuxWrite(ctx: *anyopaque, buf: []const u8) TunError!usize {
+    const state = toState(ctx);
+    // Direct write - no header processing needed on Linux
+    return std.posix.write(state.fd, buf) catch return error.IoError;
+}
+
+fn linuxFd(ctx: *anyopaque) std.posix.fd_t {
+    return toState(ctx).fd;
+}
+
+fn linuxDestroy(ctx: *anyopaque) void {
+    destroy(ctx);
 }
