@@ -10,6 +10,7 @@ const DeviceConfig = @import("device.zig").DeviceConfig;
 const Ipv4Address = @import("device.zig").Ipv4Address;
 const Ipv6Address = @import("device.zig").Ipv6Address;
 const DeviceContext = @import("device.zig").DeviceContext;
+const DeviceOps = @import("device.zig").DeviceOps;
 const RingBuffer = @import("ringbuf.zig").RingBuffer;
 
 // ==================== Type Definitions ====================
@@ -475,4 +476,77 @@ pub fn destroy(device_ptr: *anyopaque) void {
     state.ringbuf.deinit();
     free(@constCast(state.name.ptr));
     free(state);
+}
+
+// ==================== DeviceOps for Router ====================
+
+/// Create DeviceOps for macOS utun device from DeviceContext
+/// This provides an interface for Router to use utun with proper 4-byte header handling
+pub fn createDeviceOpsFromContext(ctx_ptr: *anyopaque) DeviceOps {
+    return createDeviceOpsMacOS(ctx_ptr);
+}
+
+/// Create DeviceOps for macOS utun device from anyopaque
+/// Internal function used by mod.zig
+pub fn createDeviceOpsMacOS(state_ptr: *anyopaque) DeviceOps {
+    return DeviceOps{
+        .ctx = state_ptr,
+        .readFn = utunRead,
+        .writeFn = utunWrite,
+        .fdFn = utunFd,
+        .destroyFn = utunDestroy,
+    };
+}
+
+fn utunRead(ctx: *anyopaque, buf: []u8) TunError!usize {
+    const state = toState(ctx);
+
+    // Read with extra space for the 4-byte utun header
+    const header_buf = @as([*]u8, @ptrCast(malloc(buf.len + 4)));
+    if (@intFromPtr(header_buf) == 0) {
+        return error.IoError;
+    }
+    defer free(header_buf);
+
+    const n = std.posix.read(state.fd, header_buf[0..buf.len + 4]) catch {
+        return error.IoError;
+    };
+    if (n <= 4) return 0;
+
+    // Strip the 4-byte utun header (first byte is address family)
+    @memcpy(buf[0..@as(usize, @intCast(n - 4))], header_buf[4..n]);
+    return @as(usize, @intCast(n - 4));
+}
+
+fn utunWrite(ctx: *anyopaque, buf: []const u8) TunError!usize {
+    const state = toState(ctx);
+
+    // Allocate temp buffer for header + packet
+    const packet_buf = @as([*]u8, @ptrCast(malloc(buf.len + 4)));
+    if (@intFromPtr(packet_buf) == 0) {
+        return error.IoError;
+    }
+    defer free(packet_buf);
+
+    // Add 4-byte utun header (AF_INET = 2 for IPv4)
+    packet_buf[0] = 2;
+    packet_buf[1] = 0;
+    packet_buf[2] = 0;
+    packet_buf[3] = 0;
+    @memcpy(packet_buf[4..buf.len + 4], buf);
+
+    const n = std.posix.write(state.fd, packet_buf[0..buf.len + 4]) catch {
+        return error.IoError;
+    };
+    if (n <= 4) return 0;
+    return @as(usize, @intCast(n - 4));
+}
+
+fn utunFd(ctx: *anyopaque) std.posix.fd_t {
+    const state = toState(ctx);
+    return state.fd;
+}
+
+fn utunDestroy(ctx: *anyopaque) void {
+    destroy(ctx);
 }

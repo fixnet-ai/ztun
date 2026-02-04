@@ -167,7 +167,7 @@ fn parseIpv4(ip_str: []const u8) !u32 {
 /// Packet buffer for forwarding
 pub const Packet = struct {
     /// Raw packet data
-    data: []u8,
+    data: []const u8,
 
     /// Source 4-tuple
     src_ip: u32,
@@ -332,6 +332,28 @@ pub const Router = struct {
     /// Allocator for allocations
     allocator: std.mem.Allocator,
 
+    /// Get TUN file descriptor (from device_ops or raw fd)
+    inline fn tunFd(router: *Router) std.posix.fd_t {
+        if (router.config.tun.device_ops) |dev| {
+            return dev.fd();
+        }
+        return router.config.tun.fd;
+    }
+
+    /// Write to TUN device (uses device_ops if available)
+    fn writeToTunDevice(router: *Router, data: []const u8) !void {
+        if (router.config.tun.device_ops) |dev| {
+            // Use device operations (handles platform-specific headers)
+            const written = dev.write(data) catch return error.WriteFailed;
+            router._stats.bytes_tx += written;
+        } else {
+            // Raw fd - write directly
+            const tun = router.config.tun.fd;
+            const written = std.posix.write(tun, data) catch return error.WriteFailed;
+            router._stats.bytes_tx += written;
+        }
+    }
+
     /// Create a new Router instance
     pub fn init(allocator: std.mem.Allocator, config: RouterConfig) !Router {
         // Initialize NAT table if configured
@@ -469,7 +491,7 @@ pub const Router = struct {
         router.tun_completion = .{
             .op = .{
                 .read = .{
-                    .fd = router.config.tun.fd,
+                    .fd = router.tunFd(),
                     .buffer = .{ .slice = &router.packet_buf },
                 },
             },
@@ -854,16 +876,12 @@ pub const Router = struct {
 
     /// Write packet back to TUN (for local handling)
     fn writeToTun(router: *Router, packet: *const Packet) !void {
-        const tun = router.config.tun.fd;
-        const written = std.posix.write(tun, packet.data) catch return error.WriteFailed;
-        if (written != packet.data.len) return error.PartialWrite;
-        router._stats.bytes_tx += written;
+        try router.writeToTunDevice(packet.data);
     }
 
     /// Write raw buffer to TUN
+    /// Uses device_ops if available (handles platform-specific headers like macOS utun 4-byte header)
     fn writeToTunBuf(router: *Router, data: []const u8) !void {
-        const tun = router.config.tun.fd;
-
         // Dump packet being written
         if (data.len >= 20) {
             const src_ip = std.mem.readInt(u32, data[12..16], .big);
@@ -877,10 +895,9 @@ pub const Router = struct {
             dumpPacket("[TUN]   packet", data);
         }
 
-        const written = std.posix.write(tun, data) catch return error.WriteFailed;
-        if (written != data.len) return error.PartialWrite;
-        router._stats.bytes_tx += written;
-        std.debug.print("[TUN]   wrote {} bytes\n", .{written});
+        // Write using device_ops or raw fd
+        try router.writeToTunDevice(data);
+        std.debug.print("[TUN]   wrote {} bytes\n", .{data.len});
     }
 
     /// Handle ICMP echo request - send echo reply
@@ -909,27 +926,63 @@ pub const Router = struct {
         // Copy packet to write buffer
         @memcpy(router.write_buf[0..total_len], router.packet_buf[0..total_len]);
 
-        // Get src/dst IPs from original packet
+        // Get src/dst IPs from original packet (in network byte order)
         const src_ip = std.mem.readInt(u32, router.packet_buf[12..16], .big);
         const dst_ip = std.mem.readInt(u32, router.packet_buf[16..20], .big);
 
         std.debug.print("[ICMP]   src={s} dst={s}\n", .{ fmtIp(src_ip), fmtIp(dst_ip) });
 
-        // Swap IP addresses in IP header (offset 12-20)
+        // Swap IP addresses: reply goes back to original source
+        // Offset 12-16: destination IP in reply = original source IP
+        // Offset 16-20: source IP in reply = original destination IP
         std.mem.writeInt(u32, router.write_buf[12..16], src_ip, .big);
         std.mem.writeInt(u32, router.write_buf[16..20], dst_ip, .big);
 
         // Change ICMP type from 8 (Echo Request) to 0 (Echo Reply)
         router.write_buf[icmp_offset] = 0;
 
-        // Recalculate ICMP checksum
-        const checksum_bytes = router.write_buf[icmp_offset + 2..icmp_offset + 4];
-        const old_sum = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(checksum_bytes.ptr)), .big);
-        var sum = ~old_sum & 0xFFFF; // one's complement
-        // Adding 8 to checksum (since we changed 8 to 0)
-        sum +%= 8;
-        sum = ~sum & 0xFFFF;
-        std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(checksum_bytes.ptr)), sum, .big);
+        // Zero out checksum field before recalculating (MUST be 0 for correct calculation)
+        router.write_buf[icmp_offset + 2] = 0;
+        router.write_buf[icmp_offset + 3] = 0;
+
+        // Recalculate ICMP checksum (includes pseudo-header)
+        // ICMP checksum = one's complement of sum(pseudo-header + ICMP header + data)
+        // Pseudo-header: src_ip + dst_ip + zero + protocol (1) + ICMP length
+        const icmp_len = total_len - icmp_offset;
+
+        var sum: u32 = 0;
+
+        // Add pseudo-header: source IP
+        sum += src_ip >> 16;
+        sum += src_ip & 0xFFFF;
+
+        // Pseudo-header: destination IP
+        sum += dst_ip >> 16;
+        sum += dst_ip & 0xFFFF;
+
+        // Pseudo-header: zero + protocol (1 = ICMP)
+        sum += 1;
+
+        // Pseudo-header: ICMP length
+        sum += @as(u32, @intCast(icmp_len));
+
+        // Add ICMP header + data
+        var i: usize = icmp_offset;
+        while (i + 1 < total_len) : (i += 2) {
+            sum += std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(&router.write_buf[i])), .big);
+        }
+        if (i < total_len) {
+            sum += @as(u16, router.write_buf[i]) << 8;
+        }
+
+        // Fold and complement
+        while (sum >> 16 != 0) {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        const checksum = @as(u16, @truncate(~sum));
+
+        // Write checksum
+        std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(&router.write_buf[icmp_offset + 2])), checksum, .big);
 
         // Write reply back to TUN
         try router.writeToTunBuf(router.write_buf[0..total_len]);
@@ -937,7 +990,7 @@ pub const Router = struct {
     }
 
     /// Parse IP packet and extract 4-tuple
-    fn parsePacket(router: *Router, data: []const u8) !Packet {
+    fn parsePacket(_: *Router, data: []const u8) !Packet {
         // Parse IPv4 header (minimum 20 bytes)
         if (data.len < 20) return error.PacketTooSmall;
 
@@ -968,11 +1021,9 @@ pub const Router = struct {
             dst_port = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(dst_port_bytes.ptr)), .big);
         }
 
-        // Copy packet data to our buffer
-        @memcpy(router.packet_buf[0..data.len], data);
-
+        // Return packet info - data is already in our buffer
         return Packet{
-            .data = router.packet_buf[0..data.len],
+            .data = data,
             .src_ip = src_ip,
             .src_port = src_port,
             .dst_ip = dst_ip,
@@ -1009,16 +1060,26 @@ fn onTunReadable(
 
     router._stats.bytes_rx += n;
 
-    // Dump received packet
-    const src_ip = std.mem.readInt(u32, router.packet_buf[12..16], .big);
-    const dst_ip = std.mem.readInt(u32, router.packet_buf[16..20], .big);
-    const protocol = router.packet_buf[9];
-    std.debug.print("\n[TUN] READ: {} bytes from TUN\n", .{n});
+    // Skip the 4-byte utun header (AF_INET + reserved bytes)
+    // The actual IP packet starts at offset 4
+    const ip_offset: usize = 4;
+    if (n < ip_offset + 20) {
+        std.debug.print("[TUN] Packet too small ({}) after skipping utun header\n", .{n});
+        router.submitTunRead();
+        return .disarm;
+    }
+
+    // Dump received packet (skip utun header)
+    const packet_data = router.packet_buf[ip_offset..n];
+    const src_ip = std.mem.readInt(u32, packet_data[12..16], .big);
+    const dst_ip = std.mem.readInt(u32, packet_data[16..20], .big);
+    const protocol = packet_data[9];
+    std.debug.print("\n[TUN] READ: {} bytes from TUN (IP packet: {} bytes)\n", .{n, n - ip_offset});
     std.debug.print("[TUN]   src={s} dst={s} proto={}\n", .{ fmtIp(src_ip), fmtIp(dst_ip), protocol });
-    dumpPacket("[TUN]   packet", router.packet_buf[0..n]);
+    dumpPacket("[TUN]   packet", packet_data);
 
     // Check if this is an ICMP packet - handle echo request immediately
-    const ver_ihl = router.packet_buf[0];
+    const ver_ihl = packet_data[0];
     const ihl = ver_ihl & 0x0F;
     const header_len = @as(usize, ihl) * 4;
 
@@ -1032,7 +1093,7 @@ fn onTunReadable(
     }
 
     // Parse and forward packet
-    const packet = router.parsePacket(router.packet_buf[0..n]) catch {
+    const packet = router.parsePacket(packet_data) catch {
         std.debug.print("[TUN]   -> Failed to parse packet\n", .{});
         router.submitTunRead();
         return .disarm;

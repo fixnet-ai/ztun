@@ -13,6 +13,7 @@ pub const Ipv4Address = @import("device.zig").Ipv4Address;
 pub const Ipv6Address = @import("device.zig").Ipv6Address;
 pub const NetworkAddress = @import("device.zig").NetworkAddress;
 pub const DeviceConfig = @import("device.zig").DeviceConfig;
+pub const DeviceOps = @import("device.zig").DeviceOps;
 pub const RingBuffer = @import("ringbuf.zig").RingBuffer;
 
 // Re-export platform module
@@ -26,6 +27,7 @@ pub const PacketWriteFn = @import("device_ios.zig").PacketWriteFn;
 // Re-export platform-specific types
 // Note: using inline blocks because switch on os.tag doesn't include .android/.ios
 const builtin = @import("builtin");
+const std = @import("std");
 
 // Detect Android by ABI (works during cross-compilation)
 const is_android = builtin.os.tag == .linux and builtin.abi == .android;

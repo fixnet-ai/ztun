@@ -59,6 +59,47 @@ pub const DeviceContext = struct {
     ptr: *anyopaque,
 };
 
+/// Device operations interface for platform-specific TUN handling
+/// Allows Router to work with different TUN implementations (macOS utun, Linux tun, etc.)
+pub const DeviceOps = struct {
+    /// Opaque pointer to device-specific state
+    ctx: *anyopaque,
+
+    /// Read a packet from the device
+    /// Returns the number of bytes read (excluding any device-specific headers)
+    readFn: *const fn (ctx: *anyopaque, buf: []u8) TunError!usize,
+
+    /// Write a packet to the device
+    /// Takes raw IP packet (without device headers), writes with proper headers
+    writeFn: *const fn (ctx: *anyopaque, buf: []const u8) TunError!usize,
+
+    /// Get the file descriptor for libxev polling
+    fdFn: *const fn (ctx: *anyopaque) std.posix.fd_t,
+
+    /// Destroy the device and cleanup resources
+    destroyFn: *const fn (ctx: *anyopaque) void,
+
+    /// Read packet from TUN device (wrapper that handles device-specific headers)
+    pub fn read(self: *const DeviceOps, buf: []u8) TunError!usize {
+        return self.readFn(self.ctx, buf);
+    }
+
+    /// Write packet to TUN device (wrapper that handles device-specific headers)
+    pub fn write(self: *const DeviceOps, buf: []const u8) TunError!usize {
+        return self.writeFn(self.ctx, buf);
+    }
+
+    /// Get file descriptor for event loop
+    pub fn fd(self: *const DeviceOps) std.posix.fd_t {
+        return self.fdFn(self.ctx);
+    }
+
+    /// Destroy device and cleanup
+    pub fn destroy(self: *const DeviceOps) void {
+        self.destroyFn(self.ctx);
+    }
+};
+
 /// TUN device handle
 ///
 /// Provides synchronous send/receive operations for TUN interfaces.

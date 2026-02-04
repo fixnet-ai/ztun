@@ -142,8 +142,8 @@ pub fn parseHeader(data: [*]const u8, len: usize) ?PacketInfo {
     // Validate version (must be 6)
     if (getVersion(header) != 6) return null;
 
-    // Payload length includes extension headers + upper layer
-    const payload_len = @as(usize, header.payload_len);
+    // Payload length includes extension headers + upper layer (network byte order)
+    const payload_len = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(&header.payload_len)), .big);
     const total_len = HDR_SIZE + payload_len;
     if (total_len > PAYLOAD_MAX or total_len > len) return null;
 
@@ -177,8 +177,8 @@ pub fn buildHeader(
     // Version 6, Traffic Class 0, Flow Label 0
     header.ver_tc_flow = 0x60000000;
 
-    // Payload length + Next Header + Hop Limit
-    header.payload_len = @as(u16, payload_len);
+    // Payload length + Next Header + Hop Limit (write in network byte order)
+    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(&header.payload_len)), @as(u16, payload_len), .big);
     header.next_header = next_header;
     header.hop_limit = 64;
 

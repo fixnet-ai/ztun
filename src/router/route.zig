@@ -4,6 +4,50 @@
 
 const std = @import("std");
 
+/// TunError type for device operations
+pub const TunError = error{ IoError, NotFound, PermissionDenied, NotSupported, InvalidArgument, Unknown };
+
+/// Device operations interface for platform-specific TUN handling
+/// Allows Router to work with different TUN implementations (macOS utun, Linux tun, etc.)
+pub const DeviceOps = struct {
+    /// Opaque pointer to device-specific state
+    ctx: *anyopaque,
+
+    /// Read a packet from the device
+    /// Returns the number of bytes read (excluding any device-specific headers)
+    readFn: *const fn (ctx: *anyopaque, buf: []u8) TunError!usize,
+
+    /// Write a packet to the device
+    /// Takes raw IP packet (without device headers), writes with proper headers
+    writeFn: *const fn (ctx: *anyopaque, buf: []const u8) TunError!usize,
+
+    /// Get the file descriptor for libxev polling
+    fdFn: *const fn (ctx: *anyopaque) std.posix.fd_t,
+
+    /// Destroy the device and cleanup resources
+    destroyFn: *const fn (ctx: *anyopaque) void,
+
+    /// Read packet from TUN device (wrapper that handles device-specific headers)
+    pub fn read(self: *const DeviceOps, buf: []u8) TunError!usize {
+        return self.readFn(self.ctx, buf);
+    }
+
+    /// Write packet to TUN device (wrapper that handles device-specific headers)
+    pub fn write(self: *const DeviceOps, buf: []const u8) TunError!usize {
+        return self.writeFn(self.ctx, buf);
+    }
+
+    /// Get file descriptor for event loop
+    pub fn fd(self: *const DeviceOps) std.posix.fd_t {
+        return self.fdFn(self.ctx);
+    }
+
+    /// Destroy device and cleanup
+    pub fn destroy(self: *const DeviceOps) void {
+        self.destroyFn(self.ctx);
+    }
+};
+
 /// TUN device configuration provided by the application
 pub const TunConfig = struct {
     /// TUN device name (e.g., "tun0")
@@ -21,8 +65,12 @@ pub const TunConfig = struct {
     /// Maximum Transmission Unit
     mtu: u16,
 
-    /// TUN file descriptor (for libxev integration)
-    fd: std.posix.fd_t,
+    /// TUN file descriptor (for libxev integration, when not using device_ops)
+    fd: std.posix.fd_t = 0,
+
+    /// Device operations (optional, for platforms with device-specific headers like macOS utun)
+    /// When provided, Router uses these operations instead of raw fd
+    device_ops: ?*const DeviceOps = null,
 };
 
 /// Egress network interface configuration provided by the application

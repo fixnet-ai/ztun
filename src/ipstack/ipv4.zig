@@ -128,8 +128,8 @@ pub fn parseHeader(data: [*]const u8, len: usize) ?PacketInfo {
     if (len < hdr_size) return null;
     if (hdr_size > HDR_MAX_SIZE) return null;
 
-    // Validate total length
-    const total_len = @as(u16, header.total_len);
+    // Validate total length (network byte order -> big-endian)
+    const total_len = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(&header.total_len)), .big);
     if (total_len < hdr_size or @as(usize, total_len) > len) return null;
 
     // Check if this is a fragment
@@ -138,9 +138,13 @@ pub fn parseHeader(data: [*]const u8, len: usize) ?PacketInfo {
     const is_fragment = offset != 0 or (flags & FRAG_MORE) != 0;
     const is_first_fragment = (offset == 0);
 
+    // Read IP addresses from raw packet data (network byte order)
+    const src_ip = std.mem.readInt(u32, data[12..16], .big);
+    const dst_ip = std.mem.readInt(u32, data[16..20], .big);
+
     return PacketInfo{
-        .src_ip = header.src_addr,
-        .dst_ip = header.dst_addr,
+        .src_ip = src_ip,
+        .dst_ip = dst_ip,
         .protocol = header.protocol,
         .total_len = @as(usize, total_len),
         .header_len = hdr_size,
@@ -172,9 +176,9 @@ pub fn buildHeader(
     // Type of Service (default 0)
     header.tos = 0;
 
-    // Total length = header + payload
+    // Total length = header + payload (write in network byte order)
     const total_len = HDR_MIN_SIZE + payload_len;
-    header.total_len = @as(u16, total_len);
+    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(&header.total_len)), @as(u16, @intCast(total_len)), .big);
 
     // Identification (for fragmentation)
     header.identification = 0;
@@ -205,7 +209,8 @@ pub fn setChecksum(buf: [*]u8, ihl: u4) void {
 
     const hdr_size = @as(usize, ihl) * 4;
     const cs = checksum(buf, hdr_size);
-    header.checksum = cs;
+    // Write checksum in network byte order
+    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(&header.checksum)), cs, .big);
 }
 
 /// Build IPv4 header with checksum

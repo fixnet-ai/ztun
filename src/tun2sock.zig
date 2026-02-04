@@ -318,6 +318,7 @@ pub fn main() !u8 {
     const tun_ifindex = device.ifIndex() catch 0;
 
     // Create TUN configuration for router
+    // Note: device_ops is not used - router uses raw fd for TUN operations
     const tun_config = router.TunConfig{
         .name = try allocator.dupeZ(u8, tun_name),
         .ifindex = tun_ifindex,
@@ -325,6 +326,7 @@ pub fn main() !u8 {
         .prefix_len = args.prefix_len,
         .mtu = args.tun_mtu,
         .fd = device.getFd(),
+        .device_ops = null,
     };
 
     // Create egress configuration
