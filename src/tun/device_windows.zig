@@ -490,6 +490,11 @@ pub fn getIfIndex(device_ptr: *anyopaque) TunError!u32 {
 /// Set non-blocking mode (not applicable for Wintun)
 pub fn setNonBlocking(_: *anyopaque, _: bool) TunError!void {}
 
+/// Get the file descriptor (not applicable for Wintun, returns invalid fd)
+pub fn getFd(_: *anyopaque) std.posix.fd_t {
+    return -1;
+}
+
 /// Add an IPv4 address at runtime
 pub fn addIpv4(device_ptr: *anyopaque, address: Ipv4Address, prefix: u8) TunError!void {
     const state = toState(device_ptr);

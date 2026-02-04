@@ -6,49 +6,59 @@ ztun is a pure Zig TUN device library with transparent proxy forwarding capabili
 
 - **ztun.tun** - Cross-platform TUN device operations
 - **ztun.ipstack** - Static IP protocol stack (TCP/UDP/ICMP)
-- **ztun.router** - Transparent proxy forwarding engine
+- **ztun.router** - Transparent proxy forwarding engine with libxev async I/O
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     Application Layer                        │
-│  (tests/tun2sock.zig - uses zinternal app framework)        │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  - Parses command line arguments                            │
-│  - Creates TUN device with provided name/IP                 │
-│  - Detects egress interface                                 │
-│  - Implements route callback for routing decisions          │
-│  - Passes all configuration to Router.init()               │
-│                                                             │
-├─────────────────────────────────────────────────────────────┤
-│                     ztun.router Layer                        │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │  libxev Event Loop                                 │   │
-│  │  - TUN async read                                  │   │
-│  │  - TCP async connect                               │   │
-│  │  - UDP NAT session timeout                         │   │
-│  └─────────────────────────────────────────────────────┘   │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │  Router Core Components                            │   │
-│  │  - Route callback interface                        │   │
-│  │  - TCP connection pool                            │   │
-│  │  - UDP NAT session table                          │   │
-│  │  - Proxy forwarder (SOCKS5/HTTP)                  │   │
-│  └─────────────────────────────────────────────────────┘   │
-├─────────────────────────────────────────────────────────────┤
-│                     ztun.ipstack Layer                       │
-│  - IPv4/IPv6 packet parsing                                │
-│  - TCP state machine                                      │
-│  - UDP socket handling                                    │
-│  - ICMP echo handling                                     │
-├─────────────────────────────────────────────────────────────┤
-│                     ztun.tun Layer                          │
-│  - Cross-platform TUN device (Linux/macOS/Windows)         │
-│  - Packet send/recv                                       │
-│  - MTU handling                                           │
-└─────────────────────────────────────────────────────────────┘
++---------------------------------------------------------------------+
+|                     Application Layer                                |
+|  (src/tun2sock.zig - Standalone TUN to SOCKS5 forwarding app)      |
++---------------------------------------------------------------------+
+|                                                                     |
+|  - Parses command line arguments                                    |
+|  - Creates TUN device with provided name/IP                          |
+|  - Detects egress interface                                        |
+|  - Implements route callback for routing decisions                   |
+|  - Passes all configuration to Router.init()                       |
++---------------------------------------------------------------------+
+|                                                                     |
++---------------------------------------------------------------------+
+|                     ztun.router Layer                                |
+|  +-----------------------------------------------------------+     |
+|  |  libxev Event Loop                                       |     |
+|  |  - TUN async read (IO completion)                       |     |
+|  |  - TUN async write (IO completion)                      |     |
+|  |  - NAT cleanup timer (30s interval)                     |     |
+|  +-----------------------------------------------------------+     |
+|  +-----------------------------------------------------------+     |
+|  |  Router Core Components                                  |     |
+|  |  - Route callback interface (from application)           |     |
+|  |  - NAT session table (UDP forwarding)                   |     |
+|  |  - Packet buffer (64KB)                                 |     |
+|  |  - Statistics tracking                                  |     |
+|  +-----------------------------------------------------------+     |
+|  +-----------------------------------------------------------+     |
+|  |  Forwarding Handlers (stub implementations)              |     |
+|  |  - forwardToEgress() - Raw socket forwarding            |     |
+|  |  - forwardToProxy() - SOCKS5 proxy forwarding           |     |
+|  |  - forwardWithNat() - UDP NAT translation                |     |
+|  |  - writeToTun() - Local packet handling                 |     |
+|  |  - handleIcmpEcho() - Ping response                     |     |
+|  +-----------------------------------------------------------+     |
++---------------------------------------------------------------------+
+|                     ztun.ipstack Layer                               |
+|  - IPv4/IPv6 packet parsing (optional, for advanced use)           |
+|  - TCP protocol (optional)                                          |
+|  - UDP protocol (optional)                                          |
+|  - ICMP echo handling                                               |
++---------------------------------------------------------------------+
+|                     ztun.tun Layer                                  |
+|  - Cross-platform TUN device (Linux/macOS/Windows)                  |
+|  - DeviceBuilder for fluent API                                     |
+|  - Packet send/recv                                                |
+|  - MTU handling                                                    |
++---------------------------------------------------------------------+
 ```
 
 ## Key Design Principles
@@ -64,8 +74,9 @@ ztun is a pure Zig TUN device library with transparent proxy forwarding capabili
 ```
 ztun/
 ├── src/
-│   ├── main.zig              # Library entry point
-│   ├── tun/                   # TUN device module
+│   ├── main.zig              # Library entry point (exports tun module)
+│   ├── tun2sock.zig          # Standalone TUN to SOCKS5 forwarding app
+│   ├── tun/                  # TUN device module
 │   │   ├── mod.zig           # Main TUN interface
 │   │   ├── builder.zig       # TUN device builder
 │   │   ├── device.zig        # TUN device traits
@@ -73,9 +84,9 @@ ztun/
 │   │   ├── device_macos.zig  # macOS implementation
 │   │   ├── device_windows.zig # Windows implementation
 │   │   └── ringbuf.zig       # Ring buffer for batch I/O
-│   ├── ipstack/              # IP protocol stack
+│   ├── ipstack/              # IP protocol stack (optional for forwarding)
 │   │   ├── mod.zig           # IP stack entry
-│   │   ├── checksum.zig     # Internet checksum
+│   │   ├── checksum.zig      # Internet checksum
 │   │   ├── ipv4.zig          # IPv4 parsing/generation
 │   │   ├── ipv6.zig          # IPv6 parsing/generation
 │   │   ├── tcp.zig           # TCP protocol
@@ -84,16 +95,15 @@ ztun/
 │   │   ├── connection.zig    # TCP connection tracking
 │   │   └── callbacks.zig     # Protocol callbacks
 │   └── router/               # Forwarding engine
-│       ├── mod.zig           # Router main module
+│       ├── mod.zig           # Router main module (libxev integration)
 │       ├── route.zig         # Route types and config
 │       ├── nat.zig           # UDP NAT session table
 │       └── proxy/
-│           ├── socks5.zig    # SOCKS5 backend
-│           └── http.zig       # HTTP backend (planned)
+│           └── socks5.zig    # SOCKS5 protocol helpers
 ├── tests/
+│   ├── test_framework.zig    # Shared test framework
 │   ├── test_unit.zig         # Unit tests
-│   ├── test_runner.zig       # Integration tests
-│   └── tun2sock.zig          # TUN to SOCKS5 forwarding app
+│   └── test_runner.zig       # Integration tests
 ├── build.zig                  # Zig build script
 ├── build.zig.zon              # Build dependencies
 └── DESIGN.md                 # This document
@@ -122,6 +132,11 @@ pub const EgressConfig = struct {
 };
 
 // Proxy configuration (from application)
+pub const ProxyType = enum {
+    socks5,
+    http,
+};
+
 pub const ProxyConfig = struct {
     type: ProxyType,          // .socks5 or .http
     addr: [:0]const u8,       // Proxy address (e.g., "127.0.0.1:1080")
@@ -139,6 +154,7 @@ pub const RouterConfig = struct {
     udp_nat_size: usize = 8192,
     idle_timeout: u32 = 300,
     udp_timeout: u32 = 30,
+    nat_config: ?NatConfig = null,
 };
 ```
 
@@ -163,7 +179,7 @@ pub const RouteCallback = *const fn (
 ) RouteDecision;
 ```
 
-### Route Example
+### Route Example (from tun2sock.zig)
 
 ```zig
 fn routeCallback(
@@ -195,32 +211,32 @@ fn routeCallback(
 UDP forwarding requires NAT (Network Address Translation) for transparent proxy:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    UDP NAT Forwarding Flow                  │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  Client (10.0.0.2)                  Router                 │
-│       │                                 │                    │
-│       │  UDP: src=10.0.0.2:12345      │                    │
-│       │         dst=8.8.8.8:53        │                    │
-│       ├────────────────────────────────►│                    │
-│       │                                 │  Create NAT session│
-│       │                                 │  Rewrite source    │
-│       │  UDP (rewritten):               │                    │
-│       │  src= egress_ip:54321 ──────────┼─────────────────►  │
-│       │  dst=8.8.8.8:53               │                    │
-│       │                                 │                    │
-│       │                          Server (8.8.8.8)            │
-│       │                                 │                    │
-│       │  Response:                      │                    │
-│       │  src=8.8.8.8:53 ────────────────┼─────────────────►  │
-│       │  dst= egress_ip:54321          │                    │
-│       │                                 │  Lookup NAT session│
-│       │  UDP (restored):               │  Restore source    │
-│       │  src=8.8.8.8:53 ──────────────┼─────────────────►  │
-│       │  dst=10.0.0.2:12345           │                    │
-│       │                                 │                    │
-└─────────────────────────────────────────────────────────────┘
++---------------------------------------------------------------------+
+|                    UDP NAT Forwarding Flow                          |
++---------------------------------------------------------------------+
+|                                                                     |
+|  Client (10.0.0.2)                  Router                         |
+|       │                                 │                            |
+|       │  UDP: src=10.0.0.2:12345      │                            |
+|       │         dst=8.8.8.8:53        │                            |
+|       ├────────────────────────────────►│                            |
+|       │                                 │  Create NAT session       |
+|       │                                 │  Rewrite source          |
+|       │  UDP (rewritten):               │                            |
+|       │  src= egress_ip:54321 ──────────┼────────────────────────►  │
+|       │  dst=8.8.8.8:53               │                            |
+|       │                                 │                            |
+|       │                          Server (8.8.8.8)                    |
+|       │                                 │                            |
+|       │  Response:                      │                            |
+|       │  src=8.8.8.8:53 ────────────────┼────────────────────────►  │
+|       │  dst= egress_ip:54321          │                            |
+|       │                                 │  Lookup NAT session       |
+|       │  UDP (restored):               │  Restore source          |
+|       │  src=8.8.8.8:53 ──────────────┼────────────────────────►  │
+|       │  dst=10.0.0.2:12345           │                            |
+|       │                                 │                            |
++---------------------------------------------------------------------+
 ```
 
 ### NAT Configuration
@@ -234,112 +250,153 @@ pub const NatConfig = struct {
 };
 ```
 
-## SOCKS5 Proxy
+### NAT Table Implementation
 
-### Protocol Flow
+The NAT table uses open addressing hash table with linear probing:
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    SOCKS5 Protocol Flow                      │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  1. Client sends greeting:                                   │
-│     +----+------+-------+                                    │
-│     | VER | NMETH | METHODS |                               │
-│     +----+------+-------+                                    │
-│     | 05  |   1   |   00   |  (no auth)                     │
-│     +----+------+-------+                                    │
-│                                                             │
-│  2. Server selects auth method:                              │
-│     +----+-------+                                           │
-│     | VER | METHOD |                                         │
-│     +----+-------+                                           │
-│     | 05 |   00   |  (no auth accepted)                     │
-│     +----+-------+                                           │
-│                                                             │
-│  3. Client sends connect request:                           │
-│     +----+-----+------+------+------+------+                 │
-│     | VER | CMD |  RSV  | ATYP | BND.ADDR | BND.PORT |      │
-│     +----+-----+------+------+------+------+                 │
-│     | 05 |  01  |  00  |  01  |  IP:port  |              │
-│     +----+-----+------+------+------+------+                 │
-│                                                             │
-│  4. Server responds:                                        │
-│     +----+-----+------+------+------+------+                 │
-│     | VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |      │
-│     +----+-----+------+------+------+------+                 │
-│     | 05 |  00  |  00  |  01  |  IP:port  |              │
-│     +----+-----+------+------+------+------+                 │
-│                                                             │
-│  5. Forward data (both directions)                          │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Usage
-
-```zig
-// Create SOCKS5 connection
-const conn = try socks5Connect(proxy_addr, proxy_port);
-
-// Build connect request
-var buf: [256]u8 = undefined;
-const req_len = buildConnectRequest(&buf, dst_ip, dst_port);
-
-// Send/receive data
-const sent = try socks5Send(conn, buf[0..req_len]);
-```
+- **lookup()** - O(1) average lookup by 4-tuple
+- **insert()** - O(1) average insert with port allocation
+- **remove()** - O(1) average remove by 4-tuple
+- **reverseLookup()** - O(n) lookup by mapped port (for response packets)
+- **cleanup()** - Remove expired sessions (called every 30s)
 
 ## libxev Integration
 
 Zig 0.13.0 removed async/await syntax. We use libxev callback-based async I/O:
 
 ```zig
-const libxev = @import("libxev");
+const xev = @import("xev");
 
 pub const Router = struct {
-    loop: *libxev.Loop,
-    tun_io: libxev.IO,
-    tcp_pool: TcpPool,
-    nat_table: NatTable,
+    /// libxev event loop
+    loop: xev.Loop,
+
+    /// libxev completion for TUN reading
+    tun_completion: xev.Completion,
+
+    /// libxev completion for TUN writing
+    tun_write_completion: xev.Completion,
+
+    /// libxev timer for NAT cleanup
+    nat_timer: xev.Completion,
+
+    /// Configuration
     config: RouterConfig,
 
-    pub fn init(config: RouterConfig) !*Router {
-        const loop = libxev.Loop.new(.{});
+    /// NAT session table (for UDP forwarding)
+    nat_table: ?*NatTable,
 
-        // Submit TUN read to event loop
-        loop.io(&tun_io, config.tun.fd, .readable, onTunReadable, null);
+    /// Current state
+    state: RouterState,
 
-        return // ...
+    /// Packet buffer for TUN reads (64KB)
+    packet_buf: [65536]u8,
+
+    /// Write buffer for TUN writes (64KB)
+    write_buf: [65536]u8,
+
+    /// Statistics
+    _stats: RouterStats,
+
+    /// Memory allocator
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator, config: RouterConfig) !Router {
+        // Initialize NAT table if configured
+        var nat_table: ?*NatTable = null;
+        if (config.nat_config) |nat_cfg| {
+            nat_table = try NatTable.init(allocator, nat_cfg, config.udp_nat_size);
+        }
+
+        // Create libxev loop
+        return .{
+            .loop = try xev.Loop.init(.{}),
+            .tun_completion = .{},
+            .tun_write_completion = .{},
+            .nat_timer = .{},
+            .config = config,
+            .nat_table = nat_table,
+            .state = .init,
+            .packet_buf = undefined,
+            .write_buf = undefined,
+            ._stats = .{},
+            .allocator = allocator,
+        };
+    }
+
+    pub fn run(router: *Router) void {
+        router.state = .running;
+
+        // Submit initial TUN read
+        router.submitTunRead();
+
+        // Submit NAT cleanup timer if configured
+        if (router.config.nat_config != null) {
+            router.submitNatTimer();
+        }
+
+        // Run event loop
+        router.loop.run(.until_done) catch {};
+        router.state = .stopped;
     }
 };
 
-fn onTunReadable(self: *libxev.IO, revents: u32) void {
-    const router = @as(*Router, @ptrCast(self.userdata orelse return));
+/// TUN readable callback (libxev)
+fn onTunReadable(
+    userdata: ?*anyopaque,
+    loop: *xev.Loop,
+    completion: *xev.Completion,
+    result: xev.Result,
+) xev.CallbackAction {
+    const router = @as(*Router, @ptrCast(@alignCast(userdata orelse return .disarm)));
 
-    // Read packet from TUN
-    const n = std.posix.read(config.tun.fd, &buffer);
+    // Handle read result
+    const n = result.read catch {
+        router.submitTunRead();
+        return .disarm;
+    };
 
-    // Parse IP header, extract 4-tuple
-    const src_ip = extractSrcIp(&buffer);
-    const dst_ip = extractDstIp(&buffer);
-    const protocol = extractProtocol(&buffer);
+    router._stats.bytes_rx += n;
 
-    // Make routing decision
-    const decision = router.config.route_cb(
-        src_ip, src_port, dst_ip, dst_port, protocol,
-    );
-
-    switch (decision) {
-        .Direct => forwardToEgress(&buffer),
-        .Socks5 => forwardToProxy(&buffer),
-        .Drop => {},
-        .Local => _ = std.posix.write(config.tun.fd, &buffer),
-        .Nat => forwardWithNat(&buffer),
+    // Check if ICMP - handle echo immediately
+    if (protocol == 1) {
+        router.handleIcmpEcho(header_len) catch {};
+        router.submitTunRead();
+        return .disarm;
     }
 
-    // Resubmit read
-    loop.io(&tun_io, config.tun.fd, .readable, onTunReadable, null);
+    // Parse and forward packet
+    const packet = router.parsePacket(router.packet_buf[0..n]) catch {
+        router.submitTunRead();
+        return .disarm;
+    };
+
+    router.forwardPacket(&packet) catch {};
+    router.submitTunRead();
+    return .disarm;
+}
+
+/// NAT cleanup timer callback
+fn onNatTimer(
+    userdata: ?*anyopaque,
+    loop: *xev.Loop,
+    completion: *xev.Completion,
+    result: xev.Result,
+) xev.CallbackAction {
+    const router = @as(*Router, @ptrCast(@alignCast(userdata orelse return .disarm)));
+
+    _ = result.timer catch {
+        router.submitNatTimer();
+        return .disarm;
+    };
+
+    // Cleanup expired NAT sessions
+    if (router.config.nat_config != null) {
+        _ = router.nat_table.?.cleanup();
+    }
+
+    router.submitNatTimer();
+    return .disarm;
 }
 ```
 
@@ -347,47 +404,44 @@ fn onTunReadable(self: *libxev.IO, revents: u32) void {
 
 | Platform | TUN | Event Loop | Zero-Copy | Notes |
 |----------|-----|------------|-----------|-------|
-| Linux | Yes | epoll | Yes | Uses ringbuf mmap |
-| macOS | Yes | kqueue | Yes | Uses ringbuf mmap |
-| Windows | Yes | IOCP | Yes | Uses VirtualAlloc |
+| Linux | Yes | epoll | Yes | Uses /dev/net/tun |
+| macOS | Yes | kqueue | Yes | Uses utun sockets |
+| Windows | Yes | IOCP | Yes | Uses Wintun |
 | Android | Yes | epoll | Yes | Same as Linux |
 | iOS | Yes | kqueue | Yes | Same as macOS |
 
-## Routing Loop Prevention
+## tun2sock Application
 
-When all traffic is routed through TUN (0.0.0.0/0), packets from the router itself would loop:
+The `src/tun2sock.zig` is a standalone TUN to SOCKS5 forwarding application:
 
+```bash
+# Build
+zig build tun2sock
+
+# Run (requires root)
+sudo ./zig-out/bin/macos/tun2sock --tun-name tun0 --tun-ip 10.0.0.1 --proxy 127.0.0.1:1080
 ```
-App → TUN → Router → Routing Table → TUN → ... (infinite loop!)
-```
 
-**Solution**: Egress traffic uses raw socket with SO_BINDTODEVICE, NOT TUN write():
+### Command Line Options
 
-```zig
-fn forwardToEgress(packet: []const u8) !void {
-    const sock = try std.posix.socket(
-        std.posix.AF_INET,
-        std.posix.SOCK_RAW,
-        std.posix.IPPROTO_RAW,
-    );
-    defer std.posix.close(sock);
-
-    // Bind to egress interface
-    try std.posix.setsockopt(sock, std.posix.SOL_SOCKET, std.posix.SO_BINDTODEVICE, &egress_iface);
-
-    // Send directly (bypasses TUN)
-    _ = try std.posix.send(sock, packet, 0);
-}
-```
+| Option | Short | Default | Description |
+|--------|-------|---------|-------------|
+| --tun-name | -n | tun0 | TUN device name |
+| --tun-ip | -i | 10.0.0.1 | TUN interface IP |
+| --tun-mtu | -m | 1500 | TUN device MTU |
+| --prefix | -p | 24 | IPv4 prefix length |
+| --proxy | -x | 127.0.0.1:1080 | SOCKS5 proxy address |
+| --egress | -e | (auto) | Egress interface name |
+| --debug | -d | off | Enable debug logging |
 
 ## Performance Characteristics
 
 | Operation | Complexity | Notes |
 |-----------|------------|-------|
-| Route lookup | O(1) avg | 4-tuple hash table |
+| Route lookup | O(1) avg | Via application callback |
 | NAT session find | O(1) avg | Open addressing hash |
-| TCP connection find | O(1) | Direct 4-tuple lookup |
-| Packet forwarding | O(1) | Zero-copy when enabled |
+| Packet parsing | O(1) | Fixed offset extraction |
+| ICMP echo | O(1) | Immediate response |
 
 ## Default Capacities
 
@@ -395,8 +449,8 @@ fn forwardToEgress(packet: []const u8) !void {
 |----------|---------|-----|----------|
 | TCP connections | 4096 | 65536 | Web browsing |
 | UDP NAT sessions | 8192 | 65536 | DNS, gaming, VoIP |
-| Ring buffer | 4MB | 64MB | Batch packet processing |
-| NAT table size | 16384 | 131072 | Hash collision prevention |
+| Packet buffer | 64KB | 64KB | Single packet |
+| NAT table size | 8192 | 65536 | Hash slots |
 
 ## Build Commands
 
@@ -406,6 +460,9 @@ zig build
 
 # Build and run integration tests
 zig build test
+
+# Build tun2sock application
+zig build tun2sock
 
 # Build all platform static libraries
 zig build all
@@ -419,7 +476,7 @@ zig build -Dtarget=aarch64-macos
 
 ```zig
 // Create router with configuration
-var router = try ztun.router.Router.init(.{
+var router = try router.Router.init(allocator, .{
     .tun = .{
         .name = "tun0",
         .ifindex = if_nametoindex("tun0"),
@@ -446,6 +503,6 @@ var router = try ztun.router.Router.init(.{
 });
 defer router.deinit();
 
-// Start event loop (blocking)
+// Run event loop (blocking)
 router.run();
 ```

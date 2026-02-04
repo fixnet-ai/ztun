@@ -65,8 +65,8 @@ pub const NatTable = struct {
 
     /// Create a new NAT table
     pub fn init(allocator: std.mem.Allocator, config: NatConfig, table_size: usize) !*NatTable {
-        // Round up to power of 2 for better hash distribution
-        const size = std.math.shlExact usize(table_size, 0) catch table_size;
+        // Use table_size as-is for hash distribution
+        const size = table_size;
 
         const self = try allocator.create(NatTable);
         errdefer allocator.destroy(self);
@@ -176,8 +176,6 @@ pub const NatTable = struct {
         dst_ip: u32,
         dst_port: u16,
     ) ?*NatSession {
-        const mask = self.slots.len - 1;
-
         // Scan all slots (brute force for reverse lookup is acceptable for cleanup)
         for (self.slots) |*slot| {
             if (slot.session.flags.valid and
@@ -242,9 +240,7 @@ pub const NatTable = struct {
         }
 
         // Allocate port
-        const mapped_port = self.allocatePort() else {
-            return error.NoAvailablePort;
-        };
+        const mapped_port = self.allocatePort() orelse return error.NoAvailablePort;
 
         // Use empty slot or wrap around to found empty
         const use_index = empty_index orelse return error.NatTableFull;

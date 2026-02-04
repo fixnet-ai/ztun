@@ -167,7 +167,6 @@ const zig_modules = &[_]framework.ZigModule{
             "router_nat",
             "router_socks5",
             "ipstack",
-            "libxev",
         },
     },
 };
@@ -212,6 +211,48 @@ pub fn build(b: *std.Build) void {
 
     // Build test_runner executable to bin/{os}/
     framework.buildTestRunner(b, target, optimize, config);
+
+    // Build tun2sock executable to bin/{os}/
+    const tun2sock_step = b.step("tun2sock", "Build tun2sock application");
+    const tun2sock = b.addExecutable(.{
+        .name = "tun2sock",
+        .root_source_file = b.path("src/tun2sock.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tun2sock.linkLibC();
+    // Add Zig modules
+    const all_modules = framework.createModules(b, config);
+    var tun2sock_iter = all_modules.map.iterator();
+    while (tun2sock_iter.next()) |entry| {
+        tun2sock.root_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    }
+    // Add libxev dependency and add xev module to router module
+    const libxev = b.dependency("libxev", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    // Add xev module to router module's dependencies
+    if (all_modules.map.get("router")) |router_mod| {
+        router_mod.addImport("xev", libxev.module("xev"));
+    }
+    tun2sock.root_module.addImport("xev", libxev.module("xev"));
+    // Add zinternal dependency (exports "app", "platform", "logger", etc.)
+    const zinternal = b.dependency("zinternal", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    tun2sock.root_module.addImport("app", zinternal.module("app"));
+    tun2sock.root_module.addImport("platform", zinternal.module("platform"));
+    tun2sock.root_module.addImport("logger", zinternal.module("logger"));
+    tun2sock.root_module.addImport("signal", zinternal.module("signal"));
+    tun2sock.root_module.addImport("config", zinternal.module("config"));
+    tun2sock.root_module.addImport("storage", zinternal.module("storage"));
+    // Install to bin/macos/
+    const tun2sock_install = b.addInstallArtifact(tun2sock, .{
+        .dest_dir = .{ .override = .{ .custom = b.dupe("bin/macos") } },
+    });
+    tun2sock_step.dependOn(&tun2sock_install.step);
 
     // Build all static library targets (no tests)
     const all_targets_step = b.step("all", "Build static libraries for all supported targets");

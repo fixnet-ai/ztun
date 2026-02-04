@@ -59,7 +59,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 // Import libxev for async I/O
-const xev = @import("libxev");
+const xev = @import("xev");
 
 // Re-export config types
 pub const TunConfig = @import("route.zig").TunConfig;
@@ -70,6 +70,7 @@ pub const RouteDecision = @import("route.zig").RouteDecision;
 pub const ProxyType = @import("proxy/socks5.zig").ProxyType;
 pub const NatSession = @import("nat.zig").NatSession;
 pub const NatTable = @import("nat.zig").NatTable;
+pub const NatConfig = @import("nat.zig").NatConfig;
 
 /// Packet buffer for forwarding
 pub const Packet = struct {
@@ -128,21 +129,6 @@ pub const RouterConfig = struct {
     nat_config: ?NatConfig = null,
 };
 
-/// NAT configuration
-pub const NatConfig = struct {
-    /// NAT source IP (egress IP in network byte order)
-    egress_ip: u32,
-
-    /// Port range start
-    port_range_start: u16 = 10000,
-
-    /// Port range end
-    port_range_end: u16 = 60000,
-
-    /// Session timeout in seconds
-    timeout: u32 = 30,
-};
-
 /// Router state machine
 const RouterState = enum {
     init,
@@ -150,22 +136,31 @@ const RouterState = enum {
     stopped,
 };
 
+/// Userdata for callbacks
+const RouterContext = struct {
+    router: *Router,
+    completion: xev.Completion,
+};
+
 /// Router - Transparent proxy forwarding engine with libxev
 pub const Router = struct {
     /// libxev event loop
-    loop: *xev.Loop,
+    loop: xev.Loop,
 
-    /// libxev IO for TUN reading
-    tun_io: xev.IO,
+    /// libxev completion for TUN reading
+    tun_completion: xev.Completion,
+
+    /// libxev completion for TUN writing
+    tun_write_completion: xev.Completion,
 
     /// libxev timer for NAT cleanup
-    nat_timer: xev.Timer,
+    nat_timer: xev.Completion,
 
     /// Configuration
     config: RouterConfig,
 
     /// NAT session table (for UDP forwarding)
-    nat_table: NatTable,
+    nat_table: ?*NatTable,
 
     /// Current state
     state: RouterState,
@@ -173,48 +168,37 @@ pub const Router = struct {
     /// Packet buffer for TUN reads
     packet_buf: [65536]u8,
 
+    /// Write buffer for TUN writes
+    write_buf: [65536]u8,
+
     /// Statistics
-    stats: RouterStats,
+    _stats: RouterStats,
 
     /// Allocator for allocations
     allocator: std.mem.Allocator,
 
     /// Create a new Router instance
-    pub fn init(allocator: std.mem.Allocator, config: RouterConfig) !*Router {
-        const router = try allocator.create(Router);
-        errdefer allocator.destroy(router);
-
-        // Create libxev loop
-        const loop = xev.Loop.new(.{});
-        errdefer loop.deinit();
-
+    pub fn init(allocator: std.mem.Allocator, config: RouterConfig) !Router {
         // Initialize NAT table if configured
-        var nat_table = NatTable{};
+        var nat_table: ?*NatTable = null;
         if (config.nat_config) |nat_cfg| {
-            nat_table = try NatTable.init(allocator, nat_cfg);
+            nat_table = try NatTable.init(allocator, nat_cfg, config.udp_nat_size);
         }
 
-        router.* = .{
-            .loop = loop,
-            .tun_io = undefined,
-            .nat_timer = undefined,
+        // Create libxev loop
+        return .{
+            .loop = try xev.Loop.init(.{}),
+            .tun_completion = .{},
+            .tun_write_completion = .{},
+            .nat_timer = .{},
             .config = config,
             .nat_table = nat_table,
             .state = .init,
             .packet_buf = undefined,
-            .stats = .{},
+            .write_buf = undefined,
+            ._stats = .{},
             .allocator = allocator,
         };
-
-        // Submit TUN read to event loop
-        loop.io(&router.tun_io, config.tun.fd, .readable, onTunReadable, router);
-
-        // Submit NAT cleanup timer (every 30 seconds)
-        if (config.nat_config != null) {
-            loop.timer(&router.nat_timer, 30000, onNatTimer, router);
-        }
-
-        return router;
     }
 
     /// Destroy a Router instance
@@ -224,18 +208,27 @@ pub const Router = struct {
         }
 
         // Cleanup NAT table
-        if (router.config.nat_config != null) {
-            router.nat_table.deinit(router.allocator);
+        if (router.nat_table) |nat| {
+            nat.deinit();
         }
 
         router.loop.deinit();
-        router.allocator.destroy(router);
     }
 
     /// Run the router event loop (blocking)
     pub fn run(router: *Router) void {
         router.state = .running;
-        router.loop.run() catch {};
+
+        // Submit initial TUN read
+        router.submitTunRead();
+
+        // Submit NAT cleanup timer if configured
+        if (router.config.nat_config != null) {
+            router.submitNatTimer();
+        }
+
+        // Run event loop
+        router.loop.run(.until_done) catch {};
         router.state = .stopped;
     }
 
@@ -247,7 +240,27 @@ pub const Router = struct {
 
     /// Get router statistics
     pub fn stats(router: *Router) RouterStats {
-        return router.stats;
+        return router._stats;
+    }
+
+    /// Submit TUN read operation
+    fn submitTunRead(router: *Router) void {
+        router.tun_completion = .{
+            .op = .{
+                .read = .{
+                    .fd = router.config.tun.fd,
+                    .buffer = .{ .slice = &router.packet_buf },
+                },
+            },
+            .userdata = router,
+            .callback = onTunReadable,
+        };
+        router.loop.add(&router.tun_completion);
+    }
+
+    /// Submit NAT cleanup timer
+    fn submitNatTimer(router: *Router) void {
+        router.loop.timer(&router.nat_timer, 30000, router, onNatTimer);
     }
 
     /// Forward packet based on route decision
@@ -263,23 +276,24 @@ pub const Router = struct {
         switch (decision) {
             .Direct => {
                 try router.forwardToEgress(packet);
-                router.stats.packets_forwarded += 1;
+                router._stats.packets_forwarded += 1;
             },
             .Socks5 => {
                 try router.forwardToProxy(packet);
-                router.stats.packets_forwarded += 1;
+                router._stats.packets_forwarded += 1;
             },
             .Drop => {
-                router.stats.packets_dropped += 1;
+                router._stats.packets_dropped += 1;
             },
             .Local => {
                 try router.writeToTun(packet);
-                router.stats.packets_forwarded += 1;
+                router._stats.packets_forwarded += 1;
             },
             .Nat => {
                 try router.forwardWithNat(packet);
-                router.stats.packets_forwarded += 1;
+                router._stats.packets_forwarded += 1;
             },
+            else => {},
         }
     }
 
@@ -309,7 +323,57 @@ pub const Router = struct {
         const tun = router.config.tun.fd;
         const written = std.posix.write(tun, packet.data) catch return error.WriteFailed;
         if (written != packet.data.len) return error.PartialWrite;
-        router.stats.bytes_tx += written;
+        router._stats.bytes_tx += written;
+    }
+
+    /// Write raw buffer to TUN
+    fn writeToTunBuf(router: *Router, data: []const u8) !void {
+        const tun = router.config.tun.fd;
+        const written = std.posix.write(tun, data) catch return error.WriteFailed;
+        if (written != data.len) return error.PartialWrite;
+        router._stats.bytes_tx += written;
+    }
+
+    /// Handle ICMP echo request - send echo reply
+    fn handleIcmpEcho(router: *Router, icmp_offset: usize) !void {
+        // ICMP header is at icmp_offset in the packet
+        // ICMP Echo Request: Type = 8, Code = 0
+        // ICMP Echo Reply: Type = 0, Code = 0
+
+        const packet_len = router.packet_buf[2..4];
+        const total_len = std.mem.readInt(u16, packet_len, .big);
+
+        if (total_len < icmp_offset + 8) return; // Need at least 8 bytes for ICMP header + identifier + sequence
+
+        // Check if this is an echo request (type 8)
+        const icmp_type = router.packet_buf[icmp_offset];
+        if (icmp_type != 8) return; // Not an echo request
+
+        // Copy packet to write buffer
+        @memcpy(router.write_buf[0..total_len], router.packet_buf[0..total_len]);
+
+        // Get src/dst IPs from original packet
+        const src_ip = std.mem.readInt(u32, router.packet_buf[12..16], .big);
+        const dst_ip = std.mem.readInt(u32, router.packet_buf[16..20], .big);
+
+        // Swap IP addresses in IP header (offset 12-20)
+        std.mem.writeInt(u32, router.write_buf[12..16], src_ip, .big);
+        std.mem.writeInt(u32, router.write_buf[16..20], dst_ip, .big);
+
+        // Change ICMP type from 8 (Echo Request) to 0 (Echo Reply)
+        router.write_buf[icmp_offset] = 0;
+
+        // Recalculate ICMP checksum
+        const checksum_bytes = router.write_buf[icmp_offset + 2..icmp_offset + 4];
+        const old_sum = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(checksum_bytes.ptr)), .big);
+        var sum = ~old_sum & 0xFFFF; // one's complement
+        // Adding 8 to checksum (since we changed 8 to 0)
+        sum +%= 8;
+        sum = ~sum & 0xFFFF;
+        std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(checksum_bytes.ptr)), sum, .big);
+
+        // Write reply back to TUN
+        try router.writeToTunBuf(router.write_buf[0..total_len]);
     }
 
     /// Parse IP packet and extract 4-tuple
@@ -327,7 +391,6 @@ pub const Router = struct {
         const header_len = @as(usize, ihl) * 4;
         if (data.len < header_len) return error.PacketTooSmall;
 
-        const total_len = std.mem.readInt(u16, data[2..4], .big);
         const protocol = data[9];
 
         const src_ip = std.mem.readInt(u32, data[12..16], .big);
@@ -339,13 +402,17 @@ pub const Router = struct {
         // Parse transport layer header for TCP/UDP
         if (protocol == 6 or protocol == 17) {
             if (data.len < header_len + 4) return error.PacketTooSmall;
-            src_port = std.mem.readInt(u16, data[header_len..header_len + 2], .big);
-            dst_port = std.mem.readInt(u16, data[header_len + 2..header_len + 4], .big);
+            const src_port_bytes = data[header_len..header_len + 2];
+            const dst_port_bytes = data[header_len + 2..header_len + 4];
+            src_port = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(src_port_bytes.ptr)), .big);
+            dst_port = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(dst_port_bytes.ptr)), .big);
         }
 
+        // Copy packet data to our buffer
+        @memcpy(router.packet_buf[0..data.len], data);
+
         return Packet{
-            .data = router.packet_buf[0..@as(usize, total_len)],
-            .len = @as(usize, total_len),
+            .data = router.packet_buf[0..data.len],
             .src_ip = src_ip,
             .src_port = src_port,
             .dst_ip = dst_ip,
@@ -355,45 +422,82 @@ pub const Router = struct {
     }
 };
 
-/// TUN readable callback (libxev IO callback)
-fn onTunReadable(self: *xev.IO, revents: u32) callconv(.C) void {
-    const router = @as(*Router, @ptrCast(self.userdata orelse return));
+/// TUN readable callback (libxev callback)
+fn onTunReadable(
+    userdata: ?*anyopaque,
+    loop: *xev.Loop,
+    completion: *xev.Completion,
+    result: xev.Result,
+) xev.CallbackAction {
+    _ = loop;
+    _ = completion;
 
-    // Check for errors
-    if ((revents & .ERR) != 0 or (revents & .HUP) != 0) {
-        return;
+    const router = @as(*Router, @ptrCast(@alignCast(userdata orelse return .disarm)));
+
+    // Check for read result (result.read is error union !usize)
+    const n = result.read catch {
+        router.submitTunRead();
+        return .disarm;
+    };
+    if (n == 0) {
+        // EOF, resubmit read
+        router.submitTunRead();
+        return .disarm;
     }
 
-    const tun_fd = router.config.tun.fd;
-    const n = std.posix.read(tun_fd, &router.packet_buf) catch {
-        return;
-    };
+    router._stats.bytes_rx += n;
 
-    if (n == 0) return;
+    // Check if this is an ICMP packet - handle echo request immediately
+    const ver_ihl = router.packet_buf[0];
+    const ihl = ver_ihl & 0x0F;
+    const header_len = @as(usize, ihl) * 4;
+    const protocol = router.packet_buf[9];
 
-    router.stats.bytes_rx += n;
+    // ICMP protocol = 1
+    if (protocol == 1) {
+        // Handle ICMP echo request (ping)
+        router.handleIcmpEcho(header_len) catch {};
+        router.submitTunRead();
+        return .disarm;
+    }
 
     // Parse and forward packet
     const packet = router.parsePacket(router.packet_buf[0..n]) catch {
-        return;
+        router.submitTunRead();
+        return .disarm;
     };
 
     router.forwardPacket(&packet) catch {};
 
     // Resubmit read
-    router.loop.io(self, tun_fd, .readable, onTunReadable, router);
+    router.submitTunRead();
+    return .disarm;
 }
 
 /// NAT cleanup timer callback
-fn onNatTimer(self: *xev.Timer, revents: u32) callconv(.C) void {
-    const router = @as(*Router, @ptrCast(self.userdata orelse return));
+fn onNatTimer(
+    userdata: ?*anyopaque,
+    loop: *xev.Loop,
+    completion: *xev.Completion,
+    result: xev.Result,
+) xev.CallbackAction {
+    _ = loop;
+    _ = completion;
 
-    if ((revents & .TIMEOUT) == 0) return;
+    const router = @as(*Router, @ptrCast(@alignCast(userdata orelse return .disarm)));
 
-    // Cleanup expired NAT sessions
-    if (router.config.nat_config) |_| {
-        _ = router.nat_table.cleanup();
-        // Resubmit timer
-        router.loop.timer(self, 30000, onNatTimer, router);
+    // Handle timer result (result.timer is error union !TimerTrigger)
+    _ = result.timer catch {
+        router.submitNatTimer();
+        return .disarm;
+    };
+    // Timer fired, cleanup expired NAT sessions
+    if (router.config.nat_config != null) {
+        _ = router.nat_table.?.cleanup();
     }
+
+    // Resubmit timer
+    router.submitNatTimer();
+
+    return .disarm;
 }

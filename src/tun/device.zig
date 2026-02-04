@@ -159,6 +159,18 @@ pub const Device = struct {
             unreachable;
     }
 
+    /// Get the file descriptor
+    pub fn getFd(self: Device) std.posix.fd_t {
+        return if (is_android or builtin.os.tag == .linux)
+            linux_impl.getFd(self.ctx.ptr)
+        else if (is_ios or builtin.os.tag == .macos)
+            macos_impl.getFd(self.ctx.ptr)
+        else if (builtin.os.tag == .windows)
+            windows_impl.getFd(self.ctx.ptr)
+        else
+            unreachable;
+    }
+
     /// Set non-blocking mode
     pub fn setNonBlocking(self: Device, nonblocking: bool) TunError!void {
         return if (is_android or builtin.os.tag == .linux)

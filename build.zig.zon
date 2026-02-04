@@ -2,6 +2,9 @@
     .name = "ztun",
     .version = "0.1.0",
     .dependencies = .{
+        .zinternal = .{
+            .path = "../zinternal",
+        },
         .libxev = .{
             .path = "../vendor/libxev",
         },

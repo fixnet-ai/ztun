@@ -448,6 +448,12 @@ pub fn setNonBlocking(device_ptr: *anyopaque, nonblocking: bool) TunError!void {
     _ = std.posix.fcntl(state.fd, std.posix.F.SETFL, new_flags) catch return error.IoError;
 }
 
+/// Get the file descriptor
+pub fn getFd(device_ptr: *anyopaque) std.posix.fd_t {
+    const state = toState(device_ptr);
+    return state.fd;
+}
+
 /// Add an IPv4 address at runtime
 pub fn addIpv4(device_ptr: *anyopaque, address: Ipv4Address, prefix: u8) TunError!void {
     const state = toState(device_ptr);
