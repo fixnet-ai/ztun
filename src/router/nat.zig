@@ -167,6 +167,24 @@ pub const NatTable = struct {
         }
     }
 
+    /// Lookup session by mapped port and egress IP (for UDP response handling)
+    /// Returns session if found, null otherwise
+    pub fn lookupByMapped(
+        self: *NatTable,
+        egress_ip: u32,
+        mapped_port: u16,
+    ) ?*NatSession {
+        for (self.slots) |*slot| {
+            if (slot.session.flags.valid and
+                slot.session.mapped_port == mapped_port and
+                slot.session.egress_ip == egress_ip)
+            {
+                return &slot.session;
+            }
+        }
+        return null;
+    }
+
     /// Reverse lookup: find session by mapped port and original destination
     /// Used when receiving response packets
     pub fn reverseLookup(

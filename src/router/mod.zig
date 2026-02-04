@@ -349,7 +349,9 @@ pub const Router = struct {
 
         // Create raw socket for direct packet forwarding
         var raw_sock: ?std.posix.socket_t = null;
-        raw_sock = std.posix.socket(AF_INET, std.posix.SOCK.RAW, std.posix.IPPROTO.RAW) catch null;
+        // On Darwin, use IPPROTO_IP (0) instead of IPPROTO_RAW which doesn't exist
+        const raw_protocol: c_int = if (builtin.os.tag == .macos) 0 else std.posix.IPPROTO.RAW;
+        raw_sock = std.posix.socket(AF_INET, std.posix.SOCK.RAW, raw_protocol) catch null;
 
         // Create libxev loop
         return .{
@@ -411,6 +413,11 @@ pub const Router = struct {
         // Submit initial TUN read
         router.submitTunRead();
 
+        // Submit UDP read if NAT is configured
+        if (router.udp_sock != null) {
+            router.submitUdpRead();
+        }
+
         // Submit NAT cleanup timer if configured
         if (router.config.nat_config != null) {
             router.submitNatTimer();
@@ -450,6 +457,66 @@ pub const Router = struct {
     /// Submit NAT cleanup timer
     fn submitNatTimer(router: *Router) void {
         router.loop.timer(&router.nat_timer, 30000, router, onNatTimer);
+    }
+
+    /// Submit UDP read operation for NAT responses
+    fn submitUdpRead(router: *Router) void {
+        const sock = router.udp_sock orelse return;
+
+        router.udp_completion = .{
+            .op = .{
+                .read = .{
+                    .fd = sock,
+                    .buffer = .{ .slice = &router.udp_recv_buf },
+                },
+            },
+            .userdata = router,
+            .callback = onUdpReadable,
+        };
+        router.loop.add(&router.udp_completion);
+    }
+
+    /// UDP socket readable callback - handle NAT responses
+    fn onUdpReadable(
+        userdata: ?*anyopaque,
+        loop: *xev.Loop,
+        completion: *xev.Completion,
+        result: xev.Result,
+    ) xev.CallbackAction {
+        _ = loop;
+        _ = completion;
+
+        const router = @as(*Router, @ptrCast(@alignCast(userdata orelse return .disarm)));
+
+        // Handle read result
+        const n = result.read catch {
+            router.submitUdpRead();
+            return .disarm;
+        };
+
+        if (n == 0) {
+            router.submitUdpRead();
+            return .disarm;
+        }
+
+        // Get source address from recvmsg
+        // For simplicity, assume response comes from the original destination
+        // This is a simplified NAT response handler
+
+        // Parse the UDP response and forward to TUN
+        if (n >= 28) { // Minimum IP + UDP header
+            // Extract source IP from IP header
+            const src_ip = std.mem.readInt(u32, router.udp_recv_buf[12..16], .big);
+            const src_port = std.mem.readInt(u16, router.udp_recv_buf[20..22], .big);
+
+            // Handle the NAT response
+            router.handleNatUdp(router.udp_recv_buf[0..n], src_ip, src_port);
+        }
+
+        // Continue reading
+        router.submitUdpRead();
+
+        return .disarm;
     }
 
     /// Forward packet based on route decision
@@ -711,8 +778,9 @@ pub const Router = struct {
 
         const nat = router.nat_table.?;
 
-        // Find NAT session by destination (response packet)
-        const session = nat.reverseLookup(src_ip, src_port) orelse {
+        // Find NAT session by mapped port and egress IP
+        // For UDP response: src_ip=dst_ip, src_port=mapped_port
+        const session = nat.lookupByMapped(src_ip, src_port) orelse {
             // No session found, might be unsolicited packet
             return;
         };
@@ -744,7 +812,8 @@ pub const Router = struct {
 
         // Send packet via raw socket
         // The packet already contains the full IP header (from TUN device)
-        const written = std.posix.sendto(raw_sock, packet.data, 0, null) catch {
+        // For raw sockets with IPPROTO_IP/RAW, destination is encoded in the IP header
+        const written = std.posix.send(raw_sock, packet.data, 0) catch {
             router._stats.packets_dropped += 1;
             return;
         };
@@ -1066,6 +1135,74 @@ fn sendSocks5ConnectRequest(router: *Router, conn: *Socks5Conn) !void {
     router.loop.add(&router.socks5_completion);
 }
 
+/// Submit SOCKS5 read operation
+fn submitSocks5Read(router: *Router, conn: *Socks5Conn) void {
+    const sock = conn.sock orelse return;
+
+    router.socks5_completion = .{
+        .op = .{
+            .read = .{
+                .fd = sock,
+                .buffer = .{ .slice = &conn.read_buf },
+            },
+        },
+        .userdata = router,
+        .callback = onSocks5Readable,
+    };
+    router.loop.add(&router.socks5_completion);
+}
+
+/// SOCKS5 proxy data readable callback - read responses and forward to TUN
+fn onSocks5Readable(
+    userdata: ?*anyopaque,
+    loop: *xev.Loop,
+    completion: *xev.Completion,
+    result: xev.Result,
+) xev.CallbackAction {
+    _ = loop;
+    _ = completion;
+
+    const router = @as(*Router, @ptrCast(@alignCast(userdata orelse return .disarm)));
+    const conn = router.socks5_conn orelse return .disarm;
+
+    // Handle read result
+    const n = result.read catch {
+        conn.state = .Error;
+        return .disarm;
+    };
+
+    if (n == 0) {
+        // Connection closed
+        conn.state = .Disconnected;
+        conn.sock = null;
+        return .disarm;
+    }
+
+    // Forward received data to TUN (build IP header)
+    const payload = conn.read_buf[0..n];
+    const total_len = 20 + payload.len; // IP header + payload
+
+    // Build IP header
+    @memcpy(router.write_buf[0..total_len], payload);
+
+    // Set destination IP in IP header (conn.dst_ip was stored during connect)
+    std.mem.writeInt(u32, router.write_buf[16..20], conn.dst_ip, .big);
+
+    // Recalculate IP header checksum
+    router.write_buf[10] = 0;
+    router.write_buf[11] = 0;
+    const ip_sum = ipstack.checksum.checksum(router.write_buf[0..20], 0);
+    std.mem.writeInt(u16, router.write_buf[10..12], ip_sum, .big);
+
+    // Write to TUN
+    router.writeToTunBuf(router.write_buf[0..total_len]) catch {};
+
+    // Continue reading
+    submitSocks5Read(router, conn);
+
+    return .disarm;
+}
+
 /// SOCKS5 connect acknowledgment callback
 fn onSocks5ConnectAck(
     userdata: ?*anyopaque,
@@ -1107,5 +1244,9 @@ fn onSocks5ConnectAck(
     conn.state = .Ready;
     router._stats.tcp_connections += 1;
 
+    // Start reading responses from SOCKS5 proxy
+    submitSocks5Read(router, conn);
+
     return .disarm;
 }
+

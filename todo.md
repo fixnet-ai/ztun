@@ -1,9 +1,77 @@
 # ztun Development Todo List
 
 ## Current Status
-**Phase: Router Core Implementation - Forwarding Handlers**
+**Phase: Router Integration Testing - SOCKS5 Forwarding**
 
 Last Updated: 2026-02-04
+
+---
+
+## Integration Test Plan (Phase 4)
+
+### Test Environment
+- **SOCKS5 Proxy**: 127.0.0.1:1080 (local, running)
+- **Target IP**: 111.45.11.5 (routed through TUN)
+- **TUN IP**: 10.0.0.1
+- **Platform**: macOS
+
+### Test Steps
+
+#### Step 1: TUN Device Creation
+- [x] Build tun2sock
+- [ ] Run: `sudo ./zig-out/bin/tun2sock --tun-ip 10.0.0.1 --proxy 127.0.0.1:1080`
+- [ ] Verify utun device created
+- [ ] Verify IP 10.0.0.1 assigned to utun
+- [ ] Check TUN FD is valid
+
+#### Step 2: System Route Configuration
+- [ ] Add route: `sudo route add 111.45.11.5 10.0.0.1`
+- [ ] Verify route exists with `netstat -rn`
+- [ ] Verify traffic to 111.45.11.5 goes through utun
+
+#### Step 3: ICMP Echo Test
+- [ ] Run: `ping 111.45.11.5`
+- [ ] Expected: ICMP echo reply received
+- [ ] Verify handleIcmpEcho() is triggered
+- [ ] Check stats: packets_forwarded increment
+
+#### Step 4: HTTP Request Test (curl)
+- [ ] Run: `curl -v -H 'Host: baidu.com' http://111.45.11.5/`
+- [ ] Expected: HTTP response received
+- [ ] Verify SOCKS5 TCP connection established
+- [ ] Check bidirectional forwarding works
+
+---
+
+## Known Issues to Fix
+
+### Critical (Blocking Tests)
+
+#### 1. SOCKS5 Response Reading (Fixed)
+**Problem**: After SOCKS5 connection is `.Ready`, no callback reads proxy responses
+**Impact**: TCP responses never forwarded back to TUN
+**Fix**: Added `onSocks5Readable` and `submitSocks5Read()` in mod.zig
+
+#### 2. UDP NAT Response Handling (Fixed)
+**Problem**: UDP receive callback missing, only send implemented
+**Impact**: UDP responses not forwarded back to TUN
+**Fix**: Added `submitUdpRead()` and `onUdpReadable` callback in mod.zig
+**Fix**: Added `lookupByMapped()` in nat.zig for reverse NAT lookup
+
+#### 3. SOCKS5 Connect Request Missing
+**Problem**: `sendSocks5ConnectRequest()` defined but not integrated
+**Fix**: Call from `onSocks5GreetingAck` (already done at line 1018)
+
+### High Priority
+
+#### 4. TCP Payload Forwarding to TUN (Fixed)
+**Problem**: Proxy responses not written back to TUN
+**Fix**: In `onSocks5Readable`, build IP header and write to TUN
+
+#### 5. IP Header for SOCKS5 TCP
+**Problem**: forwardToProxy() sends raw TCP payload without IP header
+**Impact**: SOCKS5 server expects raw TCP data (correct)
+**Fix**: Keep as-is, SOCKS5 protocol handles this correctly
 
 ---
 

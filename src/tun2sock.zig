@@ -222,16 +222,19 @@ fn routeCallback(
 }
 
 // Detect default egress interface using sysroute API
-fn detectEgressInterface(allocator: std.mem.Allocator, iface_name: [:0]const u8) !struct { name: [:0]const u8, ip: u32, ifindex: u32 } {
+fn detectEgressInterface(allocator: std.mem.Allocator, iface_name: []const u8) !struct { name: [:0]const u8, ip: u32, ifindex: u32 } {
+    // Convert to null-terminated string for sysroute API
+    const iface_name_z = try allocator.dupeZ(u8, iface_name);
+
     // Get interface index from system
-    const ifindex = sysroute.getIfaceIndex(iface_name) catch {
+    const ifindex = sysroute.getIfaceIndex(iface_name_z) catch {
         std.debug.print("[tun2sock] Warning: Failed to get interface index for '{s}', using 1\n", .{iface_name});
-        return .{ .name = try allocator.dupeZ(u8, iface_name), .ip = 0, .ifindex = 1 };
+        return .{ .name = iface_name_z, .ip = 0, .ifindex = 1 };
     };
 
     std.debug.print("[tun2sock] Interface '{s}' has index {d}\n", .{iface_name, ifindex});
 
-    return .{ .name = try allocator.dupeZ(u8, iface_name), .ip = 0, .ifindex = ifindex };
+    return .{ .name = iface_name_z, .ip = 0, .ifindex = ifindex };
 }
 
 /// Main entry point
