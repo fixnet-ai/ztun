@@ -6,66 +6,29 @@
 //! - Packet send/receive operations
 //! - Platform-specific optimizations (Linux, macOS, Windows, Android, iOS)
 
-pub const DeviceBuilder = @import("builder.zig").DeviceBuilder;
-pub const Device = @import("device.zig").Device;
-pub const TunError = @import("device.zig").TunError;
-pub const Ipv4Address = @import("device.zig").Ipv4Address;
-pub const Ipv6Address = @import("device.zig").Ipv6Address;
-pub const NetworkAddress = @import("device.zig").NetworkAddress;
-pub const DeviceConfig = @import("device.zig").DeviceConfig;
-pub const DeviceOps = @import("device.zig").DeviceOps;
-pub const RingBuffer = @import("ringbuf.zig").RingBuffer;
+const std = @import("std");
+const device = @import("device");
+const builder = @import("builder");
+const ringbuf = @import("ringbuf");
 
-// Re-export platform module
-pub const platform = @import("platform.zig");
+pub const DeviceBuilder = builder.DeviceBuilder;
+pub const Device = device.Device;
+pub const TunError = device.TunError;
+pub const Ipv4Address = device.Ipv4Address;
+pub const Ipv6Address = device.Ipv6Address;
+pub const NetworkAddress = device.NetworkAddress;
+pub const DeviceConfig = device.DeviceConfig;
+pub const DeviceOps = device.DeviceOps;
+pub const RingBuffer = ringbuf.RingBuffer;
 
 // Re-export iOS-specific types (PacketFlow wrapper)
 pub const IosDevice = @import("device_ios.zig").IosDevice;
 pub const PacketReadFn = @import("device_ios.zig").PacketReadFn;
 pub const PacketWriteFn = @import("device_ios.zig").PacketWriteFn;
 
-// Re-export platform-specific types
-// Note: using inline blocks because switch on os.tag doesn't include .android/.ios
-const builtin = @import("builtin");
-const std = @import("std");
-
-// Detect Android by ABI (works during cross-compilation)
-const is_android = builtin.os.tag == .linux and builtin.abi == .android;
-// Detect iOS by ABI (simulator uses different ABI)
-const is_ios = builtin.os.tag == .ios or builtin.abi == .simulator;
-
-// Import platform-specific modules
-const linux_mod = if (is_android or builtin.os.tag == .linux) @import("device_linux.zig") else struct {};
-const macos_mod = if (is_ios or builtin.os.tag == .macos) @import("device_macos.zig") else struct {};
-const windows_mod = if (builtin.os.tag == .windows) @import("device_windows.zig") else struct {};
-
-// Re-export platform functions using usingnamespace
-pub usingnamespace if (is_android or builtin.os.tag == .linux)
-    @import("device_linux.zig")
-else if (is_ios or builtin.os.tag == .macos)
-    @import("device_macos.zig")
-else if (builtin.os.tag == .windows)
-    @import("device_windows.zig")
-else
-    struct {};
-
 /// Create DeviceOps for the current platform
 /// This factory function creates a DeviceOps that handles all platform-specific
 /// header processing internally. The router receives pure IP packets.
-///
-/// Parameters:
-///   - fd: Raw TUN file descriptor
-///
-/// Returns: DeviceOps configured for the current platform
 pub fn createDeviceOps(fd: std.posix.fd_t) DeviceOps {
-    if (is_ios or builtin.os.tag == .macos) {
-        // macOS/iOS: Use utun-specific DeviceOps with 4-byte header handling
-        return macos_mod.createDeviceOps(fd);
-    } else if (builtin.os.tag == .windows) {
-        // Windows: Use Windows-specific DeviceOps
-        return windows_mod.createDeviceOps(fd);
-    } else {
-        // Linux/Android: No additional header processing needed
-        return linux_mod.createDeviceOps(fd);
-    }
+    return device.createDeviceOps(fd);
 }

@@ -4,10 +4,10 @@
 
 const std = @import("std");
 
-// Import DeviceOps and TunError from the tun module (single source of truth)
-const tun = @import("../tun/device.zig");
-pub const TunError = tun.TunError;
-pub const DeviceOps = tun.DeviceOps;
+// Import DeviceOps and TunError from the device module (single source of truth)
+const device = @import("device");
+pub const TunError = device.TunError;
+pub const DeviceOps = device.DeviceOps;
 
 /// TUN device configuration provided by the application
 pub const TunConfig = struct {

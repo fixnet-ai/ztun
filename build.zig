@@ -50,38 +50,19 @@ const zig_modules = &[_]framework.ZigModule{
     .{
         .name = "tun",
         .file = "src/tun/mod.zig",
-        .deps = &[_][]const u8{ "builder", "device", "platform", "device_linux", "device_macos", "device_windows", "ringbuf" },
+        .deps = &[_][]const u8{ "builder", "device", "ringbuf" },
     },
     .{
         .name = "device",
         .file = "src/tun/device.zig",
-        .deps = &[_][]const u8{ "device_linux", "device_macos", "device_windows", "ringbuf" },
-    },
-    .{
-        .name = "device_linux",
-        .file = "src/tun/device_linux.zig",
-        .deps = &[_][]const u8{ "device", "ringbuf" },
-    },
-    .{
-        .name = "device_macos",
-        .file = "src/tun/device_macos.zig",
-        .deps = &[_][]const u8{ "device", "ringbuf" },
-    },
-    .{
-        .name = "device_windows",
-        .file = "src/tun/device_windows.zig",
-        .deps = &[_][]const u8{ "device", "ringbuf" },
+        .deps = &[_][]const u8{ "ringbuf" },
     },
     .{
         .name = "builder",
         .file = "src/tun/builder.zig",
         .deps = &[_][]const u8{ "device" },
     },
-    .{
-        .name = "platform",
-        .file = "src/tun/platform.zig",
-        .deps = &[_][]const u8{},
-    },
+    // Note: platform-specific device implementations are inline in device.zig
     .{
         .name = "ringbuf",
         .file = "src/tun/ringbuf.zig",
@@ -167,6 +148,7 @@ const zig_modules = &[_]framework.ZigModule{
             "router_nat",
             "router_socks5",
             "ipstack",
+            "device",
         },
     },
     // System modules (all in src/system/)

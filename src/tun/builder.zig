@@ -16,11 +16,12 @@
 //! ```
 
 const std = @import("std");
-const Device = @import("device.zig").Device;
-const DeviceConfig = @import("device.zig").DeviceConfig;
-const Ipv4Address = @import("device.zig").Ipv4Address;
-const Ipv6Address = @import("device.zig").Ipv6Address;
-const TunError = @import("device.zig").TunError;
+const device = @import("device");
+const Device = device.Device;
+const DeviceConfig = device.DeviceConfig;
+const Ipv4Address = device.Ipv4Address;
+const Ipv6Address = device.Ipv6Address;
+const TunError = device.TunError;
 
 /// Builder for creating TUN devices
 pub const DeviceBuilder = struct {

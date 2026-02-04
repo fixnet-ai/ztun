@@ -4,8 +4,9 @@
 //! This module provides a callback-based interface for packet I/O.
 
 const std = @import("std");
-const TunError = @import("device.zig").TunError;
-const DeviceContext = @import("device.zig").DeviceContext;
+const device = @import("device");
+const TunError = device.TunError;
+const DeviceContext = device.DeviceContext;
 
 /// iOS PacketFlow read callback
 pub const PacketReadFn = *const fn (*anyopaque, []u8) usize;
