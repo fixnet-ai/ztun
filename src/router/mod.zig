@@ -61,6 +61,23 @@ const builtin = @import("builtin");
 // Import libxev for async I/O
 const xev = @import("xev");
 
+// Socket constants
+const AF_INET = 2;   // IPv4
+const SOCK_STREAM = 1;
+const SOCK_DGRAM = 2;
+const SOL_SOCKET = 0xffff;
+const SO_REUSEADDR = 0x0004;
+const O_NONBLOCK = 0x4000; // Non-blocking socket
+
+/// sockaddr_in for IPv4 (macOS/Linux compatible)
+const sockaddr_in = extern struct {
+    sin_len: u8 = 0,
+    sin_family: u8,
+    sin_port: u16,
+    sin_addr: [4]u8,
+    sin_zero: [8]u8 = [_]u8{0} ** 8,
+};
+
 // Re-export config types
 pub const TunConfig = @import("route.zig").TunConfig;
 pub const EgressConfig = @import("route.zig").EgressConfig;
@@ -71,6 +88,56 @@ pub const ProxyType = @import("proxy/socks5.zig").ProxyType;
 pub const NatSession = @import("nat.zig").NatSession;
 pub const NatTable = @import("nat.zig").NatTable;
 pub const NatConfig = @import("nat.zig").NatConfig;
+
+// Import checksum from ipstack
+const ipstack = @import("ipstack");
+
+/// Parse proxy address (ip:port string)
+fn parseProxyAddr(addr: [:0]const u8) !struct { ip: u32, port: u16 } {
+    const colon_idx = std.mem.lastIndexOf(u8, addr, ":") orelse return error.InvalidProxyAddr;
+
+    const ip_str = addr[0..colon_idx];
+    const port_str = addr[colon_idx + 1 ..];
+
+    const ip = try parseIpv4(ip_str);
+    const port = try std.fmt.parseInt(u16, port_str, 10);
+
+    if (port == 0) return error.InvalidPort;
+
+    return .{ .ip = ip, .port = port };
+}
+
+/// Parse IPv4 address string to u32 (network byte order)
+fn parseIpv4(ip_str: []const u8) !u32 {
+    var parts: [4]u8 = undefined;
+    var part_idx: usize = 0;
+    var val: u32 = 0;
+    var dot_count: usize = 0;
+
+    for (ip_str) |c| {
+        if (c == '.') {
+            if (part_idx >= 4) return error.InvalidIp;
+            parts[part_idx] = @as(u8, @truncate(val));
+            val = 0;
+            part_idx += 1;
+            dot_count += 1;
+        } else if (c >= '0' and c <= '9') {
+            val = val * 10 + (c - '0');
+            if (val > 255) return error.InvalidIp;
+        } else {
+            return error.InvalidIp;
+        }
+    }
+
+    // Last part
+    if (part_idx >= 4) return error.InvalidIp;
+    parts[part_idx] = @as(u8, @truncate(val));
+
+    if (dot_count != 3) return error.InvalidIp;
+
+    // Combine to u32 (network byte order: parts[0] is most significant)
+    return @as(u32, parts[0]) << 24 | @as(u32, parts[1]) << 16 | @as(u32, parts[2]) << 8 | @as(u32, parts[3]);
+}
 
 /// Packet buffer for forwarding
 pub const Packet = struct {
@@ -142,6 +209,48 @@ const RouterContext = struct {
     completion: xev.Completion,
 };
 
+/// SOCKS5 connection state
+const Socks5ConnState = enum(u8) {
+    /// Initial state, need to connect
+    Disconnected = 0,
+    /// Connecting to proxy
+    Connecting = 1,
+    /// Sent greeting, waiting for ack
+    Greeting = 2,
+    /// Sent connect request, waiting for ack
+    ConnectRequest = 3,
+    /// Ready to forward data
+    Ready = 4,
+    /// Error state
+    Error = 5,
+};
+
+/// SOCKS5 proxy connection
+const Socks5Conn = struct {
+    state: Socks5ConnState = .Disconnected,
+    sock: ?std.posix.socket_t = null,
+    dst_ip: u32 = 0,
+    dst_port: u16 = 0,
+    allocator: std.mem.Allocator,
+    read_buf: [65536]u8 = undefined,
+    read_offset: usize = 0,
+    write_buf: [65536]u8 = undefined,
+    write_offset: usize = 0,
+    proxy_ip: u32 = 0,
+    proxy_port: u16 = 0,
+};
+
+/// UDP session for NAT forwarding
+const UdpSession = struct {
+    src_ip: u32,
+    src_port: u16,
+    dst_ip: u32,
+    dst_port: u16,
+    local_ip: u32,
+    local_port: u16,
+    last_active: i64,
+};
+
 /// Router - Transparent proxy forwarding engine with libxev
 pub const Router = struct {
     /// libxev event loop
@@ -156,11 +265,32 @@ pub const Router = struct {
     /// libxev timer for NAT cleanup
     nat_timer: xev.Completion,
 
+    /// libxev completion for SOCKS5 TCP
+    socks5_completion: xev.Completion,
+
+    /// libxev completion for UDP socket
+    udp_completion: xev.Completion,
+
     /// Configuration
     config: RouterConfig,
 
     /// NAT session table (for UDP forwarding)
     nat_table: ?*NatTable,
+
+    /// SOCKS5 proxy connection (shared for all TCP connections)
+    socks5_conn: ?*Socks5Conn,
+
+    /// UDP socket for NAT forwarding
+    udp_sock: ?std.posix.socket_t = null,
+
+    /// Raw socket for direct packet forwarding (Direct route decision)
+    raw_sock: ?std.posix.socket_t = null,
+
+    /// UDP send buffer
+    udp_send_buf: [65536]u8 = undefined,
+
+    /// UDP recv buffer
+    udp_recv_buf: [65536]u8 = undefined,
 
     /// Current state
     state: RouterState,
@@ -185,14 +315,55 @@ pub const Router = struct {
             nat_table = try NatTable.init(allocator, nat_cfg, config.udp_nat_size);
         }
 
+        // Create SOCKS5 connection if proxy is configured
+        var socks5_conn_ptr: ?*Socks5Conn = null;
+        if (config.proxy) |proxy| {
+            const conn = try allocator.create(Socks5Conn);
+            conn.* = .{
+                .allocator = allocator,
+                .state = .Disconnected,
+                .sock = null,
+            };
+            socks5_conn_ptr = conn;
+
+            // Parse proxy address
+            if (parseProxyAddr(proxy.addr)) |proxy_addr| {
+                conn.proxy_ip = proxy_addr.ip;
+                conn.proxy_port = proxy_addr.port;
+            } else |_| {
+                allocator.destroy(conn);
+                socks5_conn_ptr = null;
+            }
+        }
+
+        // Create UDP socket for NAT forwarding
+        var udp_sock: ?std.posix.socket_t = null;
+        if (config.nat_config != null) {
+            udp_sock = std.posix.socket(AF_INET, SOCK_DGRAM, 0) catch null;
+            if (udp_sock) |sock| {
+                // Allow address reuse for NAT - use C API to avoid EINVAL panic on macOS
+                const yes: c_int = 1;
+                _ = std.c.setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, @sizeOf(c_int));
+            }
+        }
+
+        // Create raw socket for direct packet forwarding
+        var raw_sock: ?std.posix.socket_t = null;
+        raw_sock = std.posix.socket(AF_INET, std.posix.SOCK.RAW, std.posix.IPPROTO.RAW) catch null;
+
         // Create libxev loop
         return .{
             .loop = try xev.Loop.init(.{}),
             .tun_completion = .{},
             .tun_write_completion = .{},
             .nat_timer = .{},
+            .socks5_completion = .{},
+            .udp_completion = .{},
             .config = config,
             .nat_table = nat_table,
+            .socks5_conn = socks5_conn_ptr,
+            .udp_sock = udp_sock,
+            .raw_sock = raw_sock,
             .state = .init,
             .packet_buf = undefined,
             .write_buf = undefined,
@@ -205,6 +376,24 @@ pub const Router = struct {
     pub fn deinit(router: *Router) void {
         if (router.state == .running) {
             router.loop.stop();
+        }
+
+        // Close SOCKS5 connection
+        if (router.socks5_conn) |conn| {
+            if (conn.sock) |sock| {
+                std.posix.close(sock);
+            }
+            conn.allocator.destroy(conn);
+        }
+
+        // Close UDP socket
+        if (router.udp_sock) |sock| {
+            std.posix.close(sock);
+        }
+
+        // Close raw socket
+        if (router.raw_sock) |sock| {
+            std.posix.close(sock);
         }
 
         // Cleanup NAT table
@@ -297,25 +486,276 @@ pub const Router = struct {
         }
     }
 
-    /// Forward packet to egress interface (raw socket)
-    fn forwardToEgress(router: *Router, packet: *const Packet) !void {
-        _ = router;
-        _ = packet;
-        // TODO: Implement raw socket forwarding with SO_BINDTODEVICE
+    /// Forward packet through SOCKS5 proxy (TCP)
+    fn forwardToProxy(router: *Router, packet: *const Packet) !void {
+        // TCP packets are handled via SOCKS5 proxy
+        // For now, we'll send the TCP payload through the proxy
+        // This is a simplified implementation
+
+        if (router.socks5_conn == null) {
+            router._stats.packets_dropped += 1;
+            return;
+        }
+
+        const conn = router.socks5_conn.?;
+
+        // Ensure we have a connected socket
+        if (conn.sock == null) {
+            try router.connectSocks5(conn, packet.dst_ip, packet.dst_port);
+            return;
+        }
+
+        if (conn.state != .Ready) {
+            // Still connecting, will forward when ready
+            return;
+        }
+
+        // Extract TCP payload (skip IP + TCP headers)
+        const ip_header_len = ((packet.data[0] & 0x0F) * 4);
+        const tcp_header_len = ((packet.data[ip_header_len + 12] >> 4) * 4);
+        const payload_offset = ip_header_len + tcp_header_len;
+
+        if (payload_offset >= packet.data.len) {
+            return; // No payload
+        }
+
+        const payload = packet.data[payload_offset..];
+
+        // Send payload through SOCKS5 connection
+        const sock = conn.sock.?;
+        _ = std.posix.send(sock, payload, 0) catch {
+            router._stats.packets_dropped += 1;
+            return;
+        };
+
+        router._stats.bytes_tx += payload.len;
     }
 
-    /// Forward packet through SOCKS5 proxy
-    fn forwardToProxy(router: *Router, packet: *const Packet) !void {
-        _ = router;
-        _ = packet;
-        // TODO: Implement SOCKS5 proxy forwarding
+    /// Connect to SOCKS5 proxy and establish tunnel
+    fn connectSocks5(router: *Router, conn: *Socks5Conn, dst_ip: u32, dst_port: u16) !void {
+        // Store destination for after connection
+        conn.dst_ip = dst_ip;
+        conn.dst_port = dst_port;
+
+        // Create socket
+        const sock = std.posix.socket(AF_INET, SOCK_STREAM, 0) catch {
+            conn.state = .Error;
+            return;
+        };
+        conn.sock = sock;
+
+        // Non-blocking connect - set socket to non-blocking mode
+        const flags = std.posix.fcntl(sock, std.posix.F.GETFL, 0) catch {
+            conn.state = .Error;
+            return;
+        };
+        _ = std.posix.fcntl(sock, std.posix.F.SETFL, flags | O_NONBLOCK) catch {};
+
+        // Connect to proxy
+        const proxy_addr = std.net.Address.initIp4(
+            .{ @as(u8, @truncate(conn.proxy_ip >> 24)), @as(u8, @truncate(conn.proxy_ip >> 16)), @as(u8, @truncate(conn.proxy_ip >> 8)), @as(u8, @truncate(conn.proxy_ip)) },
+            conn.proxy_port,
+        );
+
+        const result = std.posix.connect(sock, &proxy_addr.any, @sizeOf(std.posix.sockaddr.in));
+
+        if (result) {
+            // Connected immediately
+            conn.state = .Greeting;
+            try router.sendSocks5Greeting(conn);
+        } else |err| {
+            if (err != std.posix.ConnectError.WouldBlock) {
+                conn.state = .Error;
+                return;
+            }
+            // WouldBlock - wait for completion
+            conn.state = .Connecting;
+
+            // Setup async connect
+            router.socks5_completion = .{
+                .op = .{
+                    .connect = .{
+                        .socket = sock,
+                        .addr = proxy_addr,
+                    },
+                },
+                .userdata = router,
+                .callback = onSocks5Connect,
+            };
+            router.loop.add(&router.socks5_completion);
+        }
+    }
+
+    /// Send SOCKS5 greeting
+    fn sendSocks5Greeting(router: *Router, conn: *Socks5Conn) !void {
+        const sock = conn.sock orelse return error.NoSocket;
+
+        // Build greeting: VER=5, NMETHODS=1, METHODS=[NO AUTH]
+        var greeting: [3]u8 = undefined;
+        greeting[0] = 0x05; // SOCKS5 version
+        greeting[1] = 1;     // Number of auth methods
+        greeting[2] = 0x00;  // No authentication
+
+        const sent = std.posix.send(sock, &greeting, 0) catch {
+            conn.state = .Error;
+            return;
+        };
+        if (sent != 3) {
+            conn.state = .Error;
+            return;
+        }
+
+        conn.state = .Greeting;
+        conn.read_offset = 0;
+
+        // Wait for greeting ack
+        router.socks5_completion = .{
+            .op = .{
+                .read = .{
+                    .fd = sock,
+                    .buffer = .{ .slice = &conn.read_buf },
+                },
+            },
+            .userdata = router,
+            .callback = onSocks5GreetingAck,
+        };
+        router.loop.add(&router.socks5_completion);
     }
 
     /// Forward packet with NAT translation (UDP)
     fn forwardWithNat(router: *Router, packet: *const Packet) !void {
-        _ = router;
-        _ = packet;
-        // TODO: Implement NAT forwarding
+        // UDP NAT forwarding
+        // Create NAT session and forward packet
+
+        if (router.udp_sock == null or router.nat_table == null) {
+            router._stats.packets_dropped += 1;
+            return;
+        }
+
+        const nat = router.nat_table.?;
+
+        // Check if session exists
+        const session = nat.lookup(packet.src_ip, packet.src_port, packet.dst_ip, packet.dst_port);
+
+        if (session) |sess| {
+            // Session exists, rewrite and forward
+            try router.sendNatUdp(sess.egress_ip, sess.mapped_port, packet);
+        } else {
+            // Create new session - insert() internally allocates port
+            const new_session = nat.insert(packet.src_ip, packet.src_port, packet.dst_ip, packet.dst_port) catch {
+                router._stats.packets_dropped += 1;
+                return;
+            };
+
+            try router.sendNatUdp(new_session.egress_ip, new_session.mapped_port, packet);
+            router._stats.udp_sessions += 1;
+        }
+
+        router._stats.udp_sessions = nat.count();
+    }
+
+    /// Send UDP packet with NAT translation
+    fn sendNatUdp(router: *Router, mapped_ip: u32, mapped_port: u16, packet: *const Packet) !void {
+        _ = mapped_port;
+        const sock = router.udp_sock orelse return error.NoSocket;
+
+        // Parse IP header to get UDP payload
+        const ip_header_len = ((packet.data[0] & 0x0F) * 4);
+        if (packet.data.len < ip_header_len + 8) return; // Minimum UDP header is 8 bytes
+
+        // Build new IP packet with rewritten source
+        const new_ip_header_len = 20; // Standard IPv4 header
+
+        // Copy packet to send buffer
+        @memcpy(router.udp_send_buf[0..packet.data.len], packet.data);
+
+        // Rewrite source IP
+        std.mem.writeInt(u32, router.udp_send_buf[16..20], mapped_ip, .big);
+
+        // Recalculate IP header checksum
+        router.udp_send_buf[10] = 0;
+        router.udp_send_buf[11] = 0;
+
+        const ip_sum = ipstack.checksum.checksum(router.udp_send_buf[0..new_ip_header_len], 0);
+        std.mem.writeInt(u16, router.udp_send_buf[10..12], ip_sum, .big);
+
+        // Destination address
+        var dst_addr = sockaddr_in{
+            .sin_len = @sizeOf(sockaddr_in),
+            .sin_family = AF_INET,
+            .sin_port = std.mem.nativeToBig(u16, packet.dst_port),
+            .sin_addr = .{
+                @as(u8, @truncate(packet.dst_ip >> 24)),
+                @as(u8, @truncate(packet.dst_ip >> 16)),
+                @as(u8, @truncate(packet.dst_ip >> 8)),
+                @as(u8, @truncate(packet.dst_ip)),
+            },
+        };
+
+        const sent = std.posix.sendto(sock, router.udp_send_buf[0..packet.data.len], 0, @as(*const std.posix.sockaddr, @ptrCast(&dst_addr)), @sizeOf(sockaddr_in)) catch {
+            router._stats.packets_dropped += 1;
+            return;
+        };
+
+        if (sent != packet.data.len) {
+            router._stats.packets_dropped += 1;
+            return;
+        }
+
+        router._stats.bytes_tx += sent;
+    }
+
+    /// Handle UDP response from NAT
+    fn handleNatUdp(router: *Router, data: []const u8, src_ip: u32, src_port: u16) void {
+        if (router.nat_table == null) return;
+
+        const nat = router.nat_table.?;
+
+        // Find NAT session by destination (response packet)
+        const session = nat.reverseLookup(src_ip, src_port) orelse {
+            // No session found, might be unsolicited packet
+            return;
+        };
+
+        // Copy to write buffer
+        @memcpy(router.write_buf[0..data.len], data);
+
+        // Rewrite destination to original source
+        std.mem.writeInt(u32, router.write_buf[16..20], session.src_ip, .big);
+        std.mem.writeInt(u16, router.write_buf[22..24], session.src_port, .big);
+
+        // Recalculate checksum
+        router.write_buf[10] = 0;
+        router.write_buf[11] = 0;
+        const ip_sum = ipstack.checksum.checksum(router.write_buf[0..20], 0);
+        std.mem.writeInt(u16, router.write_buf[10..12], ip_sum, .big);
+
+        // Write back to TUN
+        router.writeToTunBuf(router.write_buf[0..data.len]) catch {};
+    }
+
+    /// Forward packet to egress interface using raw socket
+    fn forwardToEgress(router: *Router, packet: *const Packet) !void {
+        const raw_sock = router.raw_sock orelse {
+            // No raw socket available - drop packet
+            router._stats.packets_dropped += 1;
+            return;
+        };
+
+        // Send packet via raw socket
+        // The packet already contains the full IP header (from TUN device)
+        const written = std.posix.sendto(raw_sock, packet.data, 0, null) catch {
+            router._stats.packets_dropped += 1;
+            return;
+        };
+
+        if (written != packet.data.len) {
+            router._stats.packets_dropped += 1;
+            return;
+        }
+
+        router._stats.packets_forwarded += 1;
+        router._stats.bytes_tx += @as(u64, @intCast(written));
     }
 
     /// Write packet back to TUN (for local handling)
@@ -498,6 +938,174 @@ fn onNatTimer(
 
     // Resubmit timer
     router.submitNatTimer();
+
+    return .disarm;
+}
+
+/// SOCKS5 connect completion callback
+fn onSocks5Connect(
+    userdata: ?*anyopaque,
+    loop: *xev.Loop,
+    completion: *xev.Completion,
+    result: xev.Result,
+) xev.CallbackAction {
+    _ = loop;
+    _ = completion;
+
+    const router = @as(*Router, @ptrCast(@alignCast(userdata orelse return .disarm)));
+
+    // Handle connect result
+    _ = result.connect catch {
+        // Connection failed
+        if (router.socks5_conn) |conn| {
+            conn.state = .Error;
+        }
+        return .disarm;
+    };
+
+    // Connected, send greeting
+    if (router.socks5_conn) |conn| {
+        if (conn.sock) |_| {
+            conn.state = .Greeting;
+            router.sendSocks5Greeting(conn) catch {
+                conn.state = .Error;
+            };
+        }
+    }
+
+    return .disarm;
+}
+
+/// SOCKS5 greeting acknowledgment callback
+fn onSocks5GreetingAck(
+    userdata: ?*anyopaque,
+    loop: *xev.Loop,
+    completion: *xev.Completion,
+    result: xev.Result,
+) xev.CallbackAction {
+    _ = loop;
+    _ = completion;
+
+    const router = @as(*Router, @ptrCast(@alignCast(userdata orelse return .disarm)));
+
+    if (router.socks5_conn == null) return .disarm;
+    const conn = router.socks5_conn.?;
+
+    // Handle read result
+    const n = result.read catch {
+        conn.state = .Error;
+        return .disarm;
+    };
+
+    if (n == 0) {
+        conn.state = .Error;
+        return .disarm;
+    }
+
+    // Parse greeting acknowledgment
+    if (conn.read_buf[0] != 0x05) {
+        conn.state = .Error;
+        return .disarm;
+    }
+
+    if (conn.read_buf[1] != 0x00) {
+        conn.state = .Error;
+        return .disarm;
+    }
+
+    // Greeting accepted, send connect request
+    conn.state = .ConnectRequest;
+    sendSocks5ConnectRequest(router, conn) catch {
+        conn.state = .Error;
+    };
+
+    return .disarm;
+}
+
+/// Send SOCKS5 connect request
+fn sendSocks5ConnectRequest(router: *Router, conn: *Socks5Conn) !void {
+    const sock = conn.sock orelse return error.NoSocket;
+
+    // Build connect request: VER=5, CMD=CONNECT, RSV=0, ATYP=IPv4, DST.ADDR, DST.PORT
+    var request: [10]u8 = undefined;
+    request[0] = 0x05; // SOCKS5 version
+    request[1] = 0x01; // CONNECT command
+    request[2] = 0x00; // Reserved
+    request[3] = 0x01; // IPv4 address type
+
+    // Destination IP (network byte order)
+    std.mem.writeInt(u32, request[4..8], conn.dst_ip, .big);
+
+    // Destination port (network byte order)
+    const port_be = std.mem.nativeToBig(u16, conn.dst_port);
+    std.mem.writeInt(u16, request[8..10], port_be, .big);
+
+    const sent = std.posix.send(sock, &request, 0) catch {
+        conn.state = .Error;
+        return;
+    };
+    if (sent != 10) {
+        conn.state = .Error;
+        return;
+    }
+
+    conn.state = .ConnectRequest;
+    conn.read_offset = 0;
+
+    // Wait for connect ack
+    router.socks5_completion = .{
+        .op = .{
+            .read = .{
+                .fd = sock,
+                .buffer = .{ .slice = &conn.read_buf },
+            },
+        },
+        .userdata = router,
+        .callback = onSocks5ConnectAck,
+    };
+    router.loop.add(&router.socks5_completion);
+}
+
+/// SOCKS5 connect acknowledgment callback
+fn onSocks5ConnectAck(
+    userdata: ?*anyopaque,
+    loop: *xev.Loop,
+    completion: *xev.Completion,
+    result: xev.Result,
+) xev.CallbackAction {
+    _ = loop;
+    _ = completion;
+
+    const router = @as(*Router, @ptrCast(@alignCast(userdata orelse return .disarm)));
+
+    if (router.socks5_conn == null) return .disarm;
+    const conn = router.socks5_conn.?;
+
+    // Handle read result
+    const n = result.read catch {
+        conn.state = .Error;
+        return .disarm;
+    };
+
+    if (n == 0) {
+        conn.state = .Error;
+        return .disarm;
+    }
+
+    // Parse connect reply
+    if (conn.read_buf[0] != 0x05) {
+        conn.state = .Error;
+        return .disarm;
+    }
+
+    if (conn.read_buf[1] != 0x00) {
+        conn.state = .Error;
+        return .disarm;
+    }
+
+    // Connection successful
+    conn.state = .Ready;
+    router._stats.tcp_connections += 1;
 
     return .disarm;
 }

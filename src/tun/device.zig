@@ -48,7 +48,6 @@ pub const NetworkAddress = struct {
 
 /// TUN device configuration
 pub const DeviceConfig = struct {
-    name: ?[]const u8 = null,
     mtu: ?u16 = null,
     ipv4: ?NetworkAddress = null,
     ipv6: ?Ipv6Address = null,

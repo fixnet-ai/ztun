@@ -86,16 +86,9 @@ test "NetworkAddress: create without destination" {
 
 test "DeviceBuilder: init returns empty builder" {
     const builder = tun.DeviceBuilder.init();
-    try std.testing.expect(builder.name == null);
     try std.testing.expect(builder.mtu == null);
     try std.testing.expect(builder.ipv4_addr == null);
     try std.testing.expect(builder.ipv6_addr == null);
-}
-
-test "DeviceBuilder: setName" {
-    var builder = tun.DeviceBuilder.init();
-    _ = builder.setName("tun0");
-    try std.testing.expectEqualStrings("tun0", builder.name.?);
 }
 
 test "DeviceBuilder: setMtu" {
@@ -137,12 +130,10 @@ test "DeviceBuilder: fluent interface" {
     const addr4: Ipv4Address = .{ 10, 0, 0, 1 };
     const addr6: Ipv6Address = .{ 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
 
-    _ = builder.setName("tun0")
-        .setMtu(1500)
+    _ = builder.setMtu(1500)
         .setIpv4(addr4, 24, null)
         .setIpv6(addr6, 64);
 
-    try std.testing.expectEqualStrings("tun0", builder.name.?);
     try std.testing.expectEqual(@as(u16, 1500), builder.mtu.?);
 }
 
@@ -150,7 +141,6 @@ test "DeviceBuilder: fluent interface" {
 
 test "DeviceConfig: default values" {
     const config = DeviceConfig{};
-    try std.testing.expect(config.name == null);
     try std.testing.expect(config.mtu == null);
     try std.testing.expect(config.ipv4 == null);
     try std.testing.expect(config.ipv6 == null);
@@ -163,7 +153,6 @@ test "DeviceConfig: full configuration" {
     const ipv6_addr: Ipv6Address = .{ 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
 
     const config = DeviceConfig{
-        .name = "tun0",
         .mtu = 1500,
         .ipv4 = .{
             .address = addr,
@@ -174,7 +163,6 @@ test "DeviceConfig: full configuration" {
         .ipv6_prefix = 64,
     };
 
-    try std.testing.expectEqualStrings("tun0", config.name.?);
     try std.testing.expectEqual(@as(u16, 1500), config.mtu.?);
     try std.testing.expectEqual(addr, config.ipv4.?.address);
     try std.testing.expectEqual(@as(u8, 24), config.ipv4.?.prefix);

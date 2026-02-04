@@ -42,7 +42,7 @@ Last Updated: 2026-02-04
 - [x] Packet parsing (4-tuple extraction)
 
 #### Phase 3: Forwarding Handlers (In Progress)
-- [ ] forwardToEgress() - Raw socket forwarding with SO_BINDTODEVICE
+- [x] forwardToEgress() - Raw socket forwarding with SO_BINDTODEVICE
 - [ ] forwardToProxy() - SOCKS5 proxy forwarding (TCP)
 - [ ] forwardWithNat() - UDP NAT translation
 
@@ -58,10 +58,23 @@ Last Updated: 2026-02-04
 ### tun2sock.zig (✅ Implemented)
 - [x] Command line argument parsing
 - [x] TUN device creation via DeviceBuilder
-- [x] Egress interface detection
+- [x] Egress interface detection (using sysroute)
 - [x] Route callback implementation
 - [x] Router initialization and run loop
 - [x] Statistics reporting
+
+---
+
+### sysroute.zig (System Module - ✅ BSD Implemented)
+- [x] getIfaceIndex() - BSD/macOS implementation
+- [x] getIfaceIndex() - Linux stub
+- [x] getIfaceIndex() - Windows stub
+- [x] routeAdd() - BSD routing socket implementation
+- [x] routeDelete() - BSD routing socket implementation
+- [ ] routeAdd() - Linux Netlink (pending Linux VM test)
+- [ ] routeDelete() - Linux Netlink (pending Linux VM test)
+- [ ] routeAdd() - Windows IP Helper (pending Windows VM test)
+- [ ] routeDelete() - Windows IP Helper (pending Windows VM test)
 
 ---
 
@@ -89,6 +102,7 @@ Last Updated: 2026-02-04
 ### Integration Tests (tests/test_runner.zig)
 - [x] TUN device tests
 - [x] IP stack tests
+- [x] DeviceBuilder API test (fixed setName usage)
 - [ ] Router forwarding tests (pending)
 - [ ] SOCKS5 proxy tests (pending)
 
@@ -164,3 +178,34 @@ zig build all          # ⏳ (forwarding handlers pending)
 - Egress traffic bypasses TUN (raw socket)
 - ICMP echo handled immediately (ping response)
 - NAT cleanup runs every 30 seconds
+
+---
+
+## Recently Completed
+
+### 2026-02-04: Platform Privilege Check
+
+- Implemented cross-platform `isElevated()` function
+- Uses `geteuid()` for Unix systems
+- Uses `IsUserAnAdmin()` for Windows
+
+### sysroute.zig - BSD Routing Socket
+- Implemented `bsdRouteAdd()` with routing socket
+- Implemented `bsdRouteDelete()` with routing socket
+- Added BSD sockaddr structures (sockaddr_in, sockaddr_in6, rt_msghdr)
+- IPv4 route message building
+
+### router/mod.zig - Direct Forwarding
+- Added `raw_sock` field to Router struct
+- Implemented `forwardToEgress()` using raw socket
+- Raw socket created with `IPPROTO_RAW` for direct packet forwarding
+
+---
+
+## Build Verification
+
+```bash
+zig build              # ✅ Pass
+zig build test         # ✅ Pass
+zig build tun2sock     # ✅ Pass
+```

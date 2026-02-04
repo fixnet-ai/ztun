@@ -169,6 +169,12 @@ const zig_modules = &[_]framework.ZigModule{
             "ipstack",
         },
     },
+    // System modules (all in src/system/)
+    .{
+        .name = "sysroute",
+        .file = "src/system/sysroute.zig",
+        .deps = &[_][]const u8{},
+    },
 };
 
 const test_files = &[_]framework.TestSpec{

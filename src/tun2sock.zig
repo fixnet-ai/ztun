@@ -28,10 +28,24 @@ const std = @import("std");
 const builtin = @import("builtin");
 const tun = @import("tun");
 const router = @import("router");
+const sysroute = @import("sysroute");
+
+// POSIX geteuid for Unix systems
+extern "c" fn geteuid() callconv(.C) c_uint;
+
+// Windows IsUserAnAdmin check - returns BOOL (1 = admin, 0 = not admin)
+extern "c" fn IsUserAnAdmin() callconv(.Windows) c_uint;
+
+/// Check if running with administrator/root privileges
+fn isElevated() bool {
+    if (builtin.os.tag == .windows) {
+        return IsUserAnAdmin() != 0;
+    }
+    return geteuid() == 0;
+}
 
 // Command line arguments
 const Args = struct {
-    tun_name: []const u8 = "tun0",
     tun_ip: []const u8 = "10.0.0.1",
     tun_mtu: u16 = 1500,
     prefix_len: u8 = 24,
@@ -48,12 +62,7 @@ fn parseArgs(_: std.mem.Allocator) !Args {
     while (i < std.os.argv.len) : (i += 1) {
         const arg = std.mem.sliceTo(std.os.argv[i], 0);
 
-        if (std.mem.eql(u8, arg, "--tun-name") or std.mem.eql(u8, arg, "-n")) {
-            i += 1;
-            if (i < std.os.argv.len) {
-                args.tun_name = std.mem.sliceTo(std.os.argv[i], 0);
-            }
-        } else if (std.mem.eql(u8, arg, "--tun-ip") or std.mem.eql(u8, arg, "-i")) {
+        if (std.mem.eql(u8, arg, "--tun-ip") or std.mem.eql(u8, arg, "-i")) {
             i += 1;
             if (i < std.os.argv.len) {
                 args.tun_ip = std.mem.sliceTo(std.os.argv[i], 0);
@@ -94,7 +103,6 @@ fn printHelp() void {
         \\Usage: tun2sock [OPTIONS]
         \\
         \\Options:
-        \\  -n, --tun-name NAME   TUN device name (default: tun0)
         \\  -i, --tun-ip IP       TUN interface IP address (default: 10.0.0.1)
         \\  -m, --tun-mtu MTU     TUN device MTU (default: 1500)
         \\  -p, --prefix LEN      IPv4 prefix length (default: 24)
@@ -103,8 +111,11 @@ fn printHelp() void {
         \\  -d, --debug           Enable debug logging
         \\  -h, --help            Show this help message
         \\
+        \\Note:
+        \\  On macOS, TUN device name is auto-generated (utunX).
+        \\
         \\Example:
-        \\  sudo ./tun2sock --tun-name tun0 --tun-ip 10.0.0.1 --proxy 127.0.0.1:1080
+        \\  sudo ./tun2sock --tun-ip 10.0.0.1 --proxy 127.0.0.1:1080
         \\
     , .{});
 }
@@ -166,6 +177,11 @@ fn routeCallback(
 ) router.RouteDecision {
     _ = src_ip;
     _ = src_port;
+    _ = dst_port;
+
+    // Target IP to proxy (only route this specific IP)
+    const target_ip = (@as(u32, 111) << 24) | (@as(u32, 45) << 16) | (@as(u32, 11) << 8) | @as(u32, 5);
+    const is_target = dst_ip == target_ip;
 
     // Private IP ranges (RFC 1918)
     const private_10 = dst_ip & 0xFF000000 == 0x0A000000; // 10.0.0.0/8
@@ -187,25 +203,35 @@ fn routeCallback(
         return .Drop;
     }
 
-    // UDP traffic to port 53 (DNS) - forward directly for resolution
-    if (protocol == 17 and dst_port == 53) {
-        return .Direct;
+    // Only route target IP through SOCKS5 proxy
+    if (is_target) {
+        // TCP to target - SOCKS5 proxy
+        if (protocol == 6) {
+            return .Socks5;
+        }
+        // UDP to target - NAT
+        if (protocol == 17) {
+            return .Nat;
+        }
+        // Other protocols to target - drop
+        return .Drop;
     }
 
-    // UDP - use NAT for forwarding
-    if (protocol == 17) {
-        return .Nat;
-    }
-
-    // TCP - forward through SOCKS5 proxy
-    return .Socks5;
+    // All other traffic - handle locally (normal routing)
+    return .Local;
 }
 
-// Detect default egress interface
-fn detectEgressInterface(allocator: std.mem.Allocator) !struct { name: [:0]const u8, ip: u32, ifindex: u32 } {
-    // Return en0 as default - egress IP detection is optional
-    const name = try allocator.dupeZ(u8, "en0");
-    return .{ .name = name, .ip = 0, .ifindex = 1 };
+// Detect default egress interface using sysroute API
+fn detectEgressInterface(allocator: std.mem.Allocator, iface_name: [:0]const u8) !struct { name: [:0]const u8, ip: u32, ifindex: u32 } {
+    // Get interface index from system
+    const ifindex = sysroute.getIfaceIndex(iface_name) catch {
+        std.debug.print("[tun2sock] Warning: Failed to get interface index for '{s}', using 1\n", .{iface_name});
+        return .{ .name = try allocator.dupeZ(u8, iface_name), .ip = 0, .ifindex = 1 };
+    };
+
+    std.debug.print("[tun2sock] Interface '{s}' has index {d}\n", .{iface_name, ifindex});
+
+    return .{ .name = try allocator.dupeZ(u8, iface_name), .ip = 0, .ifindex = ifindex };
 }
 
 /// Main entry point
@@ -214,14 +240,16 @@ pub fn main() !u8 {
 
     std.debug.print("\n=== ztun tun2sock - Transparent Proxy Forwarder ===\n\n", .{});
 
-    // Check if running as root (required for TUN)
-    if (builtin.os.tag == .macos or builtin.os.tag == .linux) {
-        const euid = std.os.linux.geteuid();
-        if (euid != 0) {
+    // Check if running with elevated privileges (required for TUN)
+    if (!isElevated()) {
+        if (builtin.os.tag == .windows) {
+            std.debug.print("Warning: This program requires administrator privileges.\n", .{});
+            std.debug.print("Please run as administrator.\n\n", .{});
+        } else {
             std.debug.print("Warning: This program requires root privileges.\n", .{});
             std.debug.print("Please run with sudo.\n\n", .{});
-            return 1;
         }
+        return 1;
     }
 
     // Parse command line arguments
@@ -231,7 +259,6 @@ pub fn main() !u8 {
     };
 
     std.debug.print("Configuration:\n", .{});
-    std.debug.print("  TUN name:     {s}\n", .{args.tun_name});
     std.debug.print("  TUN IP:       {s}/{d}\n", .{args.tun_ip, args.prefix_len});
     std.debug.print("  TUN MTU:      {d}\n", .{args.tun_mtu});
     std.debug.print("  Proxy:        {s}\n", .{args.proxy_addr});
@@ -246,12 +273,9 @@ pub fn main() !u8 {
     std.debug.print("  Proxy IP:     0x{X}\n", .{proxy.ip});
     std.debug.print("  Proxy Port:   {d}\n\n", .{proxy.port});
 
-    // Detect egress interface - use default for now
-    const egress = .{
-        .name = allocator.dupeZ(u8, "en0") catch "en0",
-        .ip = 0,
-        .ifindex = 1,
-    };
+    // Detect egress interface using sysroute API
+    const egress_iface_name = if (args.egress_iface.len > 0) args.egress_iface else "en0";
+    const egress = try detectEgressInterface(allocator, egress_iface_name);
 
     std.debug.print("Egress interface: {s} (index={d}, ip=0x{X})\n\n", .{
         egress.name,
@@ -259,11 +283,10 @@ pub fn main() !u8 {
         egress.ip,
     });
 
-    // Create TUN device
+    // Create TUN device (name is auto-generated on macOS)
     std.debug.print("Creating TUN device...\n", .{});
 
     var builder = tun.DeviceBuilder{};
-    _ = builder.setName(args.tun_name);
     _ = builder.setMtu(args.tun_mtu);
 
     // Parse gateway IP from TUN IP (use first address as gateway)
@@ -271,23 +294,24 @@ pub fn main() !u8 {
     _ = builder.setIpv4(.{ @as(u8, @truncate(gateway_ip >> 24)), @as(u8, @truncate(gateway_ip >> 16)), @as(u8, @truncate(gateway_ip >> 8)), @as(u8, @truncate(gateway_ip)) }, args.prefix_len, null);
 
     const device = builder.build() catch {
-        std.debug.print("Error: Failed to create TUN device '{s}'\n", .{args.tun_name});
-        std.debug.print("Make sure the device doesn't already exist.\n", .{});
+        std.debug.print("Error: Failed to create TUN device\n", .{});
         return 1;
     };
     defer device.destroy();
 
-    std.debug.print("TUN device '{s}' created successfully.\n", .{args.tun_name});
+    // Get auto-generated device name
+    const tun_name = try device.name();
+    std.debug.print("TUN device '{s}' created successfully.\n", .{tun_name});
     std.debug.print("  FD: {}\n", .{device.getFd()});
     const mtu_val = device.mtu() catch 1500;
     std.debug.print("  MTU: {d}\n\n", .{mtu_val});
 
     // Get TUN interface index
-    const tun_ifindex = 0;
+    const tun_ifindex = device.ifIndex() catch 0;
 
     // Create TUN configuration for router
     const tun_config = router.TunConfig{
-        .name = try allocator.dupeZ(u8, args.tun_name),
+        .name = try allocator.dupeZ(u8, tun_name),
         .ifindex = tun_ifindex,
         .ip = tun_ip,
         .prefix_len = args.prefix_len,

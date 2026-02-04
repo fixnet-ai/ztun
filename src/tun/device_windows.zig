@@ -222,8 +222,8 @@ pub fn create(config: DeviceConfig) TunError!*DeviceContext {
     _ = WintunAllocateSendPacket;
     _ = WintunSendPacket;
 
-    // Use default adapter name or custom
-    const name_str = config.name orelse "ztun0";
+    // Use auto-generated adapter name
+    const name_str = "ztun%d";
     const adapter_name_wide = toWideString(allocator, name_str) catch {
         return error.IoError;
     };
