@@ -34,13 +34,18 @@ pub fn parseHeader(data: [*]const u8, total_len: usize) ?PacketInfo {
     if (total_len < HDR_SIZE) return null;
 
     const header = @as(*const UdpHeader, @ptrCast(data));
-    const length = @as(u16, header.length);
+    // Read length in network byte order (big-endian)
+    const length = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(&header.length)), .big);
 
     if (length < HDR_SIZE or @as(usize, length) > total_len) return null;
 
+    // Read ports in network byte order
+    const src_port = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(&header.src_port)), .big);
+    const dst_port = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(&header.dst_port)), .big);
+
     return PacketInfo{
-        .src_port = header.src_port,
-        .dst_port = header.dst_port,
+        .src_port = src_port,
+        .dst_port = dst_port,
         .length = @as(usize, length),
         .payload_len = @as(usize, length) - HDR_SIZE,
     };
@@ -60,9 +65,14 @@ pub fn buildHeader(
 ) usize {
     const header = @as(*UdpHeader, @ptrCast(buf));
 
-    header.src_port = src_port;
-    header.dst_port = dst_port;
-    header.length = @as(u16, HDR_SIZE) + @as(u16, payload_len);
+    // Write ports in network byte order
+    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(&header.src_port)), src_port, .big);
+    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(&header.dst_port)), dst_port, .big);
+
+    // Write length in network byte order
+    const total_len = HDR_SIZE + payload_len;
+    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(&header.length)), @as(u16, total_len), .big);
+
     header.checksum = 0;
 
     return HDR_SIZE;
@@ -92,9 +102,9 @@ pub fn buildHeaderWithChecksum(
     // Compute full checksum
     const header_u16 = @as([*]const u16, @ptrCast(buf));
     var sum: u32 = pseudo_sum;
-    sum += header_u16[0];  // src_port + dst_port
-    sum += header_u16[1];  // length
-    sum += header_u16[2];  // checksum (0) + padding
+    sum += header_u16[0]; // src_port + dst_port
+    sum += header_u16[1]; // length
+    sum += header_u16[2]; // checksum (0) + padding
 
     // Add payload
     var i: usize = 0;
@@ -112,7 +122,8 @@ pub fn buildHeaderWithChecksum(
     }
 
     const cs = @as(u16, @bitCast(sum));
-    @as(*UdpHeader, @ptrCast(buf)).checksum = ~cs;
+    // Write checksum in network byte order
+    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(&buf[6])), ~cs, .big);
 
     return header_len;
 }
@@ -139,15 +150,15 @@ pub fn buildHeaderWithChecksumIPv6(
     var sum: u32 = checksum.checksumPseudoHeader(
         src_addr,
         dst_addr,
-        17,  // Next Header = UDP
+        17, // Next Header = UDP
         @as(u32, header_len) + @as(u32, payload.len),
     );
 
     // Add UDP header fields (length and checksum)
     const header_u16 = @as([*]const u16, @ptrCast(buf));
-    sum += header_u16[0];  // src_port + dst_port
-    sum += header_u16[1];  // length
-    sum += header_u16[2];  // checksum (0) + padding
+    sum += header_u16[0]; // src_port + dst_port
+    sum += header_u16[1]; // length
+    sum += header_u16[2]; // checksum (0) + padding
 
     // Add payload
     var i: usize = 0;
@@ -165,7 +176,8 @@ pub fn buildHeaderWithChecksumIPv6(
     }
 
     const cs = @as(u16, @bitCast(sum));
-    @as(*UdpHeader, @ptrCast(buf)).checksum = ~cs;
+    // Write checksum in network byte order
+    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(&buf[6])), ~cs, .big);
 
     return header_len;
 }
@@ -184,12 +196,11 @@ pub fn verifyChecksum(
 ) bool {
     if (len < HDR_SIZE) return false;
 
-    const header = @as(*const UdpHeader, @ptrCast(data));
-    const saved_checksum = header.checksum;
+    // Read checksum in network byte order
+    const saved_checksum = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(&data[6])), .big);
 
-    // Zero checksum field
-    var buf = @as(*UdpHeader, @ptrCast(@constCast(data.ptr)));
-    buf.checksum = 0;
+    // Zero checksum field (must write in network byte order)
+    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(&data[6])), 0, .big);
 
     // Compute checksum
     const pseudo_sum = checksum.checksumPseudoIPv4(src_ip, dst_ip, 17, @as(u16, len));
@@ -211,8 +222,8 @@ pub fn verifyChecksum(
 
     const computed = ~@as(u16, @bitCast(sum));
 
-    // Restore checksum
-    buf.checksum = saved_checksum;
+    // Restore checksum (in network byte order)
+    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(&data[6])), saved_checksum, .big);
 
     return computed == saved_checksum;
 }
@@ -268,10 +279,10 @@ test "UDP parse invalid" {
     // Too short
     try std.testing.expect(parseHeader(buf[0..].ptr, 4) == null);
 
-    // Invalid length
+    // Invalid length - write in network byte order
     _ = buildHeader(buf[0..].ptr, 12345, 80, 100);
-    const header = @as(*UdpHeader, @ptrCast(buf[0..].ptr));
-    header.length = 4;  // Less than header size
+    // Write invalid length (4) in network byte order
+    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(&buf[4])), 4, .big);
     try std.testing.expect(parseHeader(buf[0..].ptr, 108) == null);
 }
 

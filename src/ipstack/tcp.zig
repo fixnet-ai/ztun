@@ -53,7 +53,7 @@ pub const TcpHeader = extern struct {
     dst_port: u16,
     seq_num: u32,
     ack_num: u32,
-    flags_len: u16,  // Lower 4 bits = data offset, upper bits = flags
+    flags_len: u16, // Lower 4 bits = data offset, upper bits = flags
     window: u16,
     checksum: u16,
     urgent_ptr: u16,
@@ -148,10 +148,14 @@ pub fn parseHeader(data: [*]const u8, len: usize) ?PacketInfo {
     const hdr_len = headerSize(header);
     if (len < hdr_len) return null;
 
+    // Read ports in network byte order
+    const src_port = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(&header.src_port)), .big);
+    const dst_port = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(&header.dst_port)), .big);
+
     return PacketInfo{
-        .src_port = header.src_port,
-        .dst_port = header.dst_port,
-        .seq_num = header.seq_num,
+        .src_port = src_port,
+        .dst_port = dst_port,
+        .seq_num = header.seq_num, // u32, already in network order when reading from packet
         .ack_num = header.ack_num,
         .flags = getFlags(header),
         .header_len = hdr_len,
@@ -183,8 +187,10 @@ pub fn buildHeader(
 ) usize {
     const header = @as(*TcpHeader, @ptrCast(buf));
 
-    header.src_port = src_port;
-    header.dst_port = dst_port;
+    // Write ports in network byte order
+    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(&header.src_port)), src_port, .big);
+    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(&header.dst_port)), dst_port, .big);
+
     header.seq_num = seq_num;
     header.ack_num = ack_num;
 
@@ -253,7 +259,8 @@ pub fn buildHeaderWithChecksum(
     }
 
     const cs = @as(u16, @bitCast(sum));
-    @as(*TcpHeader, @ptrCast(buf)).checksum = ~cs;
+    // Write checksum in network byte order
+    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(&@as(*TcpHeader, @ptrCast(buf)).checksum)), ~cs, .big);
 
     return header_len;
 }
@@ -265,7 +272,8 @@ pub fn validateFlags(flags: u8) bool {
     // FIN, SYN, RST are mutually exclusive for new connections
     const control_bits = flags & (FLAG_FIN | FLAG_SYN | FLAG_RST);
     if (control_bits != 0 and control_bits != FLAG_FIN and
-        control_bits != FLAG_SYN and control_bits != FLAG_RST) {
+        control_bits != FLAG_SYN and control_bits != FLAG_RST)
+    {
         return false;
     }
     return true;
@@ -424,7 +432,7 @@ test "TCP get/set data offset" {
 
     setDataOffset(&header, 6);
     try std.testing.expectEqual(@as(u4, 6), getDataOffset(&header));
-    try std.testing.expectEqual(@as(u16, 0x6018), header.flags_len);  // 0x6000 + 0x18
+    try std.testing.expectEqual(@as(u16, 0x6018), header.flags_len); // 0x6000 + 0x18
 }
 
 test "TCP flag checks" {
@@ -439,7 +447,7 @@ test "TCP flag checks" {
 test "TCP validate flags" {
     try std.testing.expect(validateFlags(FLAG_SYN));
     try std.testing.expect(validateFlags(FLAG_ACK));
-    try std.testing.expect(!validateFlags(FLAG_SYN | FLAG_FIN));  // Invalid
+    try std.testing.expect(!validateFlags(FLAG_SYN | FLAG_FIN)); // Invalid
 }
 
 test "TCP seq in window" {

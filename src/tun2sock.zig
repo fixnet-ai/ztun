@@ -292,8 +292,8 @@ pub fn main() !u8 {
     var builder = tun.DeviceBuilder{};
     _ = builder.setMtu(args.tun_mtu);
 
-    // Parse gateway IP from TUN IP (use first address as gateway)
-    const gateway_ip = tun_ip | 0x01000000; // x.x.x.1
+    // Set TUN IP address (gateway is same as tun_ip for point-to-point)
+    const gateway_ip = tun_ip; // For point-to-point, gateway = tun_ip
     _ = builder.setIpv4(.{ @as(u8, @truncate(gateway_ip >> 24)), @as(u8, @truncate(gateway_ip >> 16)), @as(u8, @truncate(gateway_ip >> 8)), @as(u8, @truncate(gateway_ip)) }, args.prefix_len, null);
 
     const device = builder.build() catch {
@@ -301,6 +301,11 @@ pub fn main() !u8 {
         return 1;
     };
     defer device.destroy();
+
+    // Set TUN to non-blocking mode for libxev async I/O
+    device.setNonBlocking(true) catch {
+        std.debug.print("Warning: Failed to set TUN to non-blocking mode\n", .{});
+    };
 
     // Get auto-generated device name
     const tun_name = try device.name();
