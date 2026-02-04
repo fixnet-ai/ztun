@@ -167,6 +167,7 @@ const zig_modules = &[_]framework.ZigModule{
             "router_nat",
             "router_socks5",
             "ipstack",
+            "libxev",
         },
     },
 };

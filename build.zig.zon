@@ -1,6 +1,11 @@
 .{
     .name = "ztun",
     .version = "0.1.0",
+    .dependencies = .{
+        .libxev = .{
+            .path = "../vendor/libxev",
+        },
+    },
     .paths = .{
         "src",
         "tests",
