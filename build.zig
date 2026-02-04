@@ -143,6 +143,32 @@ const zig_modules = &[_]framework.ZigModule{
             "tun",
         },
     },
+    // Router submodules (all in src/router/)
+    .{
+        .name = "router_route",
+        .file = "src/router/route.zig",
+        .deps = &[_][]const u8{},
+    },
+    .{
+        .name = "router_nat",
+        .file = "src/router/nat.zig",
+        .deps = &[_][]const u8{},
+    },
+    .{
+        .name = "router_socks5",
+        .file = "src/router/proxy/socks5.zig",
+        .deps = &[_][]const u8{ "router_route" },
+    },
+    .{
+        .name = "router",
+        .file = "src/router/mod.zig",
+        .deps = &[_][]const u8{
+            "router_route",
+            "router_nat",
+            "router_socks5",
+            "ipstack",
+        },
+    },
 };
 
 const test_files = &[_]framework.TestSpec{
