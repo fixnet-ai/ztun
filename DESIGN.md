@@ -7,7 +7,7 @@ ztun is a pure Zig TUN device library with transparent proxy forwarding capabili
 - **ztun.tun** - Cross-platform TUN device operations
 - **ztun.ipstack** - Static IP protocol stack (TCP/UDP/ICMP)
 - **ztun.router** - Transparent proxy forwarding engine with libxev async I/O
-- **ztun.sysroute** - Cross-platform routing table management
+- **ztun.sysroute** - Cross-platform routing table management (route commands)
 
 ## Architecture
 
@@ -18,7 +18,7 @@ ztun is a pure Zig TUN device library with transparent proxy forwarding capabili
 +---------------------------------------------------------------------+
 |                                                                     |
 |  - Parses command line arguments                                    |
-|  - Creates TUN device with DeviceBuilder                             |
+|  - Creates TUN device with TunDevice interface                      |
 |  - Detects egress interface using sysroute module                   |
 |  - Implements route callback for routing decisions                  |
 |  - Implements isElevated() privilege check                          |
@@ -61,17 +61,34 @@ ztun is a pure Zig TUN device library with transparent proxy forwarding capabili
 |  - ICMP echo handling                                             |
 +---------------------------------------------------------------------+
 |                     ztun.tun Layer                                  |
-|  - Cross-platform TUN device (Linux/macOS/Windows/Android/iOS)      |
-|  - DeviceBuilder for fluent API                                    |
-|  - Device.createFromFd() for Android VpnService                    |
-|  - Packet send/recv                                               |
-|  - MTU handling                                                   |
+|  +-----------------------------------------------------------+     |
+|  |  TunDevice Interface (platform-agnostic)                 |     |
+|  |  - read(buf) - Read packet from TUN                      |     |
+|  |  - write(buf) - Write packet to TUN                      |     |
+|  |  - name() - Get device name                              |     |
+|  |  - ifIndex() - Get interface index                       |     |
+|  |  - setNonBlocking() - Set non-blocking mode              |     |
+|  |  - close() - Close device                                |     |
+|  +-----------------------------------------------------------+     |
+|  +-----------------------------------------------------------+     |
+|  |  Platform Implementations                                |     |
+|  |  - device_linux.zig  (Linux/Android: /dev/net/tun)       |     |
+|  |  - device_darwin.zig (macOS/iOS: utun socket)            |     |
+|  |  - device_windows.zig (Windows: Wintun DLL)              |     |
+|  +-----------------------------------------------------------+     |
+|  +-----------------------------------------------------------+     |
+|  |  Supporting Modules                                      |     |
+|  |  - options.zig  - TUN configuration options              |     |
+|  |  - stack.zig    - Protocol stack interface               |     |
+|  |  - handler.zig  - Packet handler interface               |     |
+|  +-----------------------------------------------------------+     |
 +---------------------------------------------------------------------+
 |                     ztun.sysroute Layer                             |
 |  - Cross-platform routing table management                         |
-|  - BSD routing socket (macOS/FreeBSD)                             |
-|  - getIfaceIndex() for all platforms                              |
-|  - Route add/delete operations                                     |
+|  - Linux: "ip route" command                                       |
+|  - BSD (macOS/iOS): "route" command                                |
+|  - Windows: "route" command (stub)                                 |
+|  - getIfaceIndex() using if_nametoindex()                          |
 +---------------------------------------------------------------------+
 ```
 
@@ -82,6 +99,50 @@ ztun is a pure Zig TUN device library with transparent proxy forwarding capabili
 3. **Router doesn't create TUN or set system routes** - Application handles these
 4. **Uses libxev for async I/O** - Zig 0.13.0 removed async/await syntax
 5. **Egress traffic bypasses TUN** - Uses raw socket with SO_BINDTODEVICE
+6. **TunDevice interface for platform abstraction** - Function pointer-based design
+
+## TunDevice Interface
+
+```zig
+/// TUN device operations interface
+pub const TunDevice = interface {
+    /// Read a packet from the TUN device
+    fn read(ctx: *anyopaque, buf: []u8) TunError!usize;
+
+    /// Write a packet to the TUN device
+    fn write(ctx: *anyopaque, buf: []const u8) TunError!usize;
+
+    /// Get the device name
+    fn name(ctx: *anyopaque) TunError![]const u8;
+
+    /// Get the interface index
+    fn ifIndex(ctx: *anyopaque) TunError!u32;
+
+    /// Set non-blocking mode
+    fn setNonBlocking(ctx: *anyopaque, enabled: bool) TunError!void;
+
+    /// Add an IPv4 address at runtime
+    fn addIpv4(ctx: *anyopaque, addr: [4]u8, prefix_len: u8) TunError!void;
+
+    /// Add an IPv6 address at runtime
+    fn addIpv6(ctx: *anyopaque, addr: [16]u8, prefix_len: u8) TunError!void;
+
+    /// Close the device
+    fn close(ctx: *anyopaque) void;
+};
+
+/// Opaque device context used with TunDevice functions
+pub const DeviceContext = opaque {
+    /// Create a TUN device with options
+    pub fn create(allocator: std.mem.Allocator, options: Options) TunError!*DeviceContext;
+
+    /// Get device operations
+    pub fn device(ctx: *DeviceContext) *const TunDevice;
+
+    /// Get the internal context pointer
+    pub fn context(ctx: *DeviceContext) *anyopaque;
+};
+```
 
 ## File Structure
 
@@ -91,15 +152,15 @@ ztun/
 │   ├── main.zig              # Library entry point (exports tun module)
 │   ├── tun2sock.zig          # Standalone TUN to SOCKS5 forwarding app
 │   ├── tun/                  # TUN device module
-│   │   ├── mod.zig           # Main TUN interface
-│   │   ├── builder.zig       # TUN device builder
-│   │   ├── device.zig        # TUN device traits
-│   │   ├── device_linux.zig  # Linux implementation
-│   │   ├── device_macos.zig  # macOS implementation
-│   │   ├── device_windows.zig # Windows implementation
-│   │   ├── platform.zig      # Platform detection
-│   │   └── ringbuf.zig       # Ring buffer for batch I/O
-│   ├── ipstack/              # IP protocol stack (for checksum only)
+│   │   ├── mod.zig           # Main TUN interface (platform dispatch)
+│   │   ├── options.zig       # TUN configuration options
+│   │   ├── device.zig        # TunDevice interface & DeviceContext
+│   │   ├── stack.zig         # TunStack interface
+│   │   ├── handler.zig       # PacketHandler interface
+│   │   ├── device_linux.zig  # Linux/Android implementation
+│   │   ├── device_darwin.zig # macOS/iOS implementation
+│   │   └── device_windows.zig # Windows implementation
+│   ├── ipstack/              # IP protocol stack
 │   │   ├── mod.zig           # IP stack entry
 │   │   ├── checksum.zig      # Internet checksum
 │   │   ├── ipv4.zig          # IPv4 parsing/generation
@@ -116,11 +177,12 @@ ztun/
 │   │   └── proxy/
 │   │       └── socks5.zig    # SOCKS5 protocol helpers
 │   └── system/               # System utilities
-│       └── sysroute.zig      # Routing table management
+│       └── sysroute.zig      # Routing table management (route commands)
 ├── tests/
 │   ├── test_framework.zig    # Shared test framework
 │   ├── test_unit.zig         # Unit tests
-│   └── test_runner.zig       # Integration tests
+│   ├── test_runner.zig       # Integration tests
+│   └── test_tun.zig          # Ping echo test
 ├── build.zig                 # Zig build script
 ├── build.zig.zon             # Build dependencies
 └── DESIGN.md                 # This document
@@ -469,7 +531,7 @@ fn onNatTimer(
     }
 
     router.submitNatTimer();
-    return .disarm;
+    return .rearm;
 }
 ```
 
@@ -517,38 +579,73 @@ const Socks5Conn = struct {
 
 ## Platform Support
 
-| Platform | TUN | Event Loop | Zero-Copy | Notes |
-|----------|-----|------------|-----------|-------|
-| Linux | Yes | epoll | Yes | Uses /dev/net/tun |
-| macOS | Yes | kqueue | Yes | Uses utun sockets |
-| Windows | Yes | IOCP | Yes | Uses Wintun |
-| Android | Yes | epoll | Yes | Same as Linux + createFromFd |
-| iOS | Yes | kqueue | Yes | Same as macOS + createFromFd |
+| Platform | TUN Type | Event Loop | Zero-Copy | Notes |
+|----------|----------|------------|-----------|-------|
+| Linux | /dev/net/tun | epoll | Yes | Standard TUN/TAP |
+| macOS | utun socket | kqueue | Yes | 4-byte AF header |
+| Windows | Wintun DLL | IOCP | Yes | Ring buffer I/O |
+| Android | /dev/net/tun | epoll | Yes | Same as Linux |
+| iOS | utun socket | kqueue | Yes | Same as macOS |
 
 ## sysroute Module
 
-Cross-platform routing table management:
+Cross-platform routing table management using route commands:
 
 ```zig
-// Platform-specific implementations:
-pub fn getIfaceIndex(ifname: [*:0]const u8) RouteError!u32 {
-    // BSD: if_nametoindex()
-    // Linux: -1 (stub, use ioctl SIOCGIFINDEX)
-    // Windows: -1 (stub, use GetAdapterIndex)
-}
+pub const RouteError = error{
+    InvalidArgument,
+    IoError,
+    NotFound,
+    PermissionDenied,
+    NotSupported,
+    Unknown,
+};
 
-pub fn routeAdd(route: *const RouteEntry) RouteError!void {
-    // BSD: Routing socket (RTM_ADD)
-    // Linux: Netlink (pending)
-    // Windows: IP Helper (pending)
-}
+/// Create IPv4 route entry
+pub fn createIpv4Route(dst_ip: u32, prefix: u6, gateway_ip: u32, iface_idx: u32, _: u32) RouteEntry;
 
-pub fn routeDelete(route: *const RouteEntry) RouteError!void {
-    // BSD: Routing socket (RTM_DELETE)
-    // Linux: Netlink (pending)
-    // Windows: IP Helper (pending)
-}
+/// Add a route to the system routing table
+pub fn routeAdd(route: ?*const RouteEntry) RouteError!void;
+
+/// Delete a route from the system routing table
+pub fn routeDelete(route: ?*const RouteEntry) RouteError!void;
+
+/// Get interface index from interface name
+pub fn getIfaceIndex(ifname: [*:0]const u8) RouteError!u32;
 ```
+
+**Platform-specific commands:**
+
+| Platform | Add Command | Delete Command |
+|----------|-------------|----------------|
+| Linux | `ip route add <dst> via <gw>` | `ip route del <dst>` |
+| BSD | `route add -net <dst> -netmask <mask> <gw>` | `route delete -net <dst> -netmask <mask>` |
+| Windows | (stub) | (stub) |
+
+## Platform Implementation Details
+
+### Linux (device_linux.zig)
+
+- Opens `/dev/net/tun`
+- Uses `TUNSETIFF` ioctl to configure interface
+- Reads/writes raw IP packets directly
+- MTU configuration via `SIOCSIFMTU` ioctl
+- IPv4/IPv6 address configuration via `SIOCSIFADDR`/`SIOCSIFNETMASK` ioctls
+
+### macOS (device_darwin.zig)
+
+- Creates `AF_SYSTEM, SOCK_DGRAM` socket
+- Connects to `com.apple.net.utun_control`
+- 4-byte AF_INET/AF_INET6 header on read/write
+- MTU configuration via `SIOCSIFMTU` ioctl
+- Address configuration via `SIOCAIFADDR`/`SIOCAIFADDR_IN6` ioctls
+
+### Windows (device_windows.zig)
+
+- Loads Wintun.dll dynamically
+- Creates adapter via `WintunCreateAdapter()`
+- Uses ring buffer sessions for batch I/O
+- `ReceivePacket()`/`SendPacket()` APIs
 
 ## tun2sock Application
 
@@ -584,6 +681,23 @@ fn isElevated() bool {
 }
 ```
 
+## test_tun Application
+
+The `tests/test_tun.zig` is a ping echo test for TUN device verification:
+
+```bash
+# Build
+zig build test-tun
+
+# Run (requires root)
+sudo ./zig-out/bin/macos/test_tun
+```
+
+Tests:
+- TUN device creation and configuration
+- ICMP echo request/response
+- Packet read/write throughput
+
 ## Performance Characteristics
 
 | Operation | Complexity | Notes |
@@ -614,6 +728,9 @@ zig build test
 
 # Build tun2sock application
 zig build tun2sock
+
+# Build ping echo test
+zig build test-tun
 
 # Build all platform static libraries
 zig build all

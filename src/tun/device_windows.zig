@@ -2,7 +2,6 @@
 //!
 //! Provides TUN device operations on Windows using the wintun driver.
 //! Requires wintun.dll to be in the application directory.
-//! Uses RingBuffer internally for efficient batch packet handling.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -11,7 +10,6 @@ const DeviceConfig = @import("device.zig").DeviceConfig;
 const Ipv4Address = @import("device.zig").Ipv4Address;
 const Ipv6Address = @import("device.zig").Ipv6Address;
 const DeviceContext = @import("device.zig").DeviceContext;
-const RingBuffer = @import("ringbuf.zig").RingBuffer;
 
 // ==================== Windows Types ====================
 
@@ -44,8 +42,6 @@ const WindowsDeviceState = struct {
     name_ptr: [*]u8,  // Full allocation for proper deallocation
     mtu: u16,
     index: u32,
-    ringbuf: RingBuffer,
-    read_offset: usize,
 };
 
 // ==================== FFI Declarations ====================
@@ -289,14 +285,6 @@ pub fn create(config: DeviceConfig) TunError!*DeviceContext {
         return error.IoError;
     };
 
-    // Initialize RingBuffer (large buffer for batch packet handling)
-    const ringbuf_capacity = @as(usize, mtu) * 256; // 256 packets worth of buffer
-    const ringbuf = RingBuffer.init(ringbuf_capacity) catch RingBuffer{
-        .ptr = undefined,
-        .capacity = 0,
-        .owned = false,
-    };
-
     state.* = .{
         .wintun_dll = dll,
         .adapter_handle = adapter,
@@ -304,8 +292,6 @@ pub fn create(config: DeviceConfig) TunError!*DeviceContext {
         .name_ptr = name_copy.ptr,
         .mtu = mtu,
         .index = 0,
-        .ringbuf = ringbuf,
-        .read_offset = 0,
     };
 
     ctx.* = .{ .ptr = state };
@@ -531,9 +517,6 @@ pub fn destroy(device_ptr: *anyopaque) void {
         _ = FreeLibrary(state.wintun_dll);
     }
 
-    // Free RingBuffer
-    state.ringbuf.deinit();
-
     // Free name copy - find null terminator
     var name_len: usize = 0;
     while (state.name_ptr[name_len] != 0) : (name_len += 1) {}
@@ -542,4 +525,18 @@ pub fn destroy(device_ptr: *anyopaque) void {
     // Note: We don't free state and ctx allocations because page_allocator
     // is a simple allocator that doesn't track individual allocations.
     // These small allocations will be reclaimed when the process exits.
+}
+
+/// Add an IPv4 route (stub - Windows routing via IP Helper API not implemented)
+pub fn addRoute(
+    device_ptr: *anyopaque,
+    destination: Ipv4Address,
+    gateway: Ipv4Address,
+    prefix_len: u8,
+) TunError!void {
+    _ = device_ptr;
+    _ = destination;
+    _ = gateway;
+    _ = prefix_len;
+    return error.NotSupported;
 }

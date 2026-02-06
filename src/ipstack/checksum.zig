@@ -69,7 +69,9 @@ pub fn checksumPseudo(
 
     // Sum protocol and length (24 bits total, expand to 32)
     sum += protocol;
-    sum += @as(u16, data_len) | (@as(u16, data_len >> 8) << 8);
+    // Convert usize to u32 first, then truncate to u16 for checksum
+    const len_u32 = @as(u32, @intCast(data_len));
+    sum += @as(u16, @truncate(len_u32)) | (@as(u16, @truncate(len_u32 >> 8)) << 8);
 
     // Sum protocol data
     i = 0;

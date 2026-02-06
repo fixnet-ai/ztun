@@ -6,7 +6,6 @@
 //! - Packet send/receive operations
 //! - Platform-specific optimizations (Linux, macOS, Windows, Android, iOS)
 
-pub const DeviceBuilder = @import("builder.zig").DeviceBuilder;
 pub const Device = @import("device.zig").Device;
 pub const TunError = @import("device.zig").TunError;
 pub const Ipv4Address = @import("device.zig").Ipv4Address;
@@ -14,10 +13,13 @@ pub const Ipv6Address = @import("device.zig").Ipv6Address;
 pub const NetworkAddress = @import("device.zig").NetworkAddress;
 pub const DeviceConfig = @import("device.zig").DeviceConfig;
 pub const DeviceOps = @import("device.zig").DeviceOps;
-pub const RingBuffer = @import("ringbuf.zig").RingBuffer;
 
-// Re-export platform module
-pub const platform = @import("platform.zig");
+// New interfaces (sing-tun inspired)
+pub const TunDevice = @import("device.zig").TunDevice;
+pub const Options = @import("options.zig").Options;
+pub const TunStack = @import("stack.zig").TunStack;
+pub const PacketHandler = @import("handler.zig").PacketHandler;
+pub const PacketResult = @import("handler.zig").PacketResult;
 
 // Re-export iOS-specific types (PacketFlow wrapper)
 pub const IosDevice = @import("device_ios.zig").IosDevice;
@@ -37,7 +39,7 @@ const is_ios = builtin.os.tag == .ios or builtin.abi == .simulator;
 pub usingnamespace if (is_android or builtin.os.tag == .linux)
     @import("device_linux.zig")
 else if (is_ios or builtin.os.tag == .macos)
-    @import("device_macos.zig")
+    @import("device_darwin.zig")
 else if (builtin.os.tag == .windows)
     @import("device_windows.zig")
 else

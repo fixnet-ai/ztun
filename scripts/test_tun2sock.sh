@@ -44,9 +44,9 @@ echo "[4/6] Verifying route..."
 netstat -rn | grep "$TARGET_IP" || echo "    Route not found in routing table"
 echo ""
 
-# Step 5: Test ICMP - This will NOT work because 111.45.11.5 doesn't exist
-echo "[5/6] Testing ICMP (ping - expected to timeout)..."
-timeout 3 ping -c 1 "$TARGET_IP" 2>&1 || echo "    ICMP timeout (expected - IP doesn't exist)"
+# Step 5: Test ICMP - 111.45.11.5 is baidu.com IP, should get echo reply via TUN
+echo "[5/6] Testing ICMP (ping - expecting echo reply)..."
+timeout 3 ping -c 1 "$TARGET_IP" 2>&1 && echo "    ICMP successful - echo reply received" || echo "    ICMP failed"
 echo ""
 
 # Step 6: Test HTTP - traffic goes through TUN, NOT directly via SOCKS5 proxy

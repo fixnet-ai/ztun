@@ -1,7 +1,6 @@
 //! device_linux.zig - Linux TUN device implementation
 //!
 //! Uses /dev/net/tun for TUN device operations with ioctl for IP configuration.
-//! Uses RingBuffer internally for efficient batch packet handling.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -10,20 +9,14 @@ const DeviceConfig = @import("device.zig").DeviceConfig;
 const Ipv4Address = @import("device.zig").Ipv4Address;
 const Ipv6Address = @import("device.zig").Ipv6Address;
 const DeviceContext = @import("device.zig").DeviceContext;
-const RingBuffer = @import("ringbuf.zig").RingBuffer;
 
 // ==================== Type Definitions ====================
-
-/// Opaque Linux device handle
-pub const LinuxDevice = opaque {};
 
 /// Linux device internal state
 const LinuxDeviceState = struct {
     fd: std.posix.fd_t,
     name: []const u8,
     mtu: u16,
-    ringbuf: RingBuffer,
-    read_offset: usize,
 };
 
 /// Tunnel flags for /dev/net/tun
@@ -128,22 +121,12 @@ pub fn createFromFd(fd: std.posix.fd_t, name: ?[:0]const u8, mtu: u16) TunError!
     @memcpy(@as([*]u8, @ptrCast(name_copy))[0..dev_name.len], dev_name);
     @as([*]u8, @ptrCast(name_copy))[dev_name.len] = 0;
 
-    // Initialize RingBuffer (large buffer for batch packet handling)
-    const ringbuf_capacity = @as(usize, mtu) * 256;
-    const ringbuf = RingBuffer.init(ringbuf_capacity) catch RingBuffer{
-        .ptr = undefined,
-        .capacity = 0,
-        .owned = false,
-    };
-
     // Initialize state with external fd flag
     const s = @as(*LinuxDeviceState, @alignCast(@ptrCast(state)));
     s.* = .{
         .fd = fd,
         .name = @as([*]u8, @ptrCast(name_copy))[0..dev_name.len],
         .mtu = mtu,
-        .ringbuf = ringbuf,
-        .read_offset = 0,
     };
 
     // Initialize context
@@ -236,22 +219,12 @@ pub fn create(config: DeviceConfig) TunError!*DeviceContext {
     @memcpy(@as([*]u8, @ptrCast(name_copy))[0..dev_name.len], dev_name);
     @as([*]u8, @ptrCast(name_copy))[dev_name.len] = 0;
 
-    // Initialize RingBuffer (large buffer for batch packet handling)
-    const ringbuf_capacity = @as(usize, mtu) * 256; // 256 packets worth of buffer
-    const ringbuf = RingBuffer.init(ringbuf_capacity) catch RingBuffer{
-        .ptr = undefined,
-        .capacity = 0,
-        .owned = false,
-    };
-
     // Initialize state
     const s = @as(*LinuxDeviceState, @alignCast(@ptrCast(state)));
     s.* = .{
         .fd = tun_fd,
         .name = @as([*]u8, @ptrCast(name_copy))[0..dev_name.len],
         .mtu = mtu,
-        .ringbuf = ringbuf,
-        .read_offset = 0,
     };
 
     // Initialize context
@@ -285,10 +258,13 @@ fn configureIpv4(_: std.posix.fd_t, ifname: []const u8, address: Ipv4Address, pr
     @memcpy(req.ifr_name[0..ifname.len], ifname);
 
     // Set IP address using SIOCSIFADDR
+    // Note: Linux ioctl SIOCSIFADDR expects sin_addr in network byte order
     const addr = @as(*sockaddr_in, @alignCast(@ptrCast(&req.ifr_ifru.addr)));
     addr.sin_family = AF_INET;
-    const ip_bytes = ipv4ToBytes(address);
-    addr.sin_addr = ip_bytes;
+    // Convert IP from host byte order to network byte order
+    const ip_host_order = @as(u32, address[0]) << 24 | @as(u32, address[1]) << 16 | @as(u32, address[2]) << 8 | @as(u32, address[3]);
+    const ip_network_order = @byteSwap(ip_host_order);
+    addr.sin_addr = @as(*const [4]u8, @ptrCast(&ip_network_order)).*;
 
     const SIOCSIFADDR = 0x8916;
     if (ioctl(sock, SIOCSIFADDR, &req) < 0) {
@@ -448,7 +424,20 @@ pub fn addIpv6(device_ptr: *anyopaque, address: Ipv6Address, prefix: u8) TunErro
 pub fn destroy(device_ptr: *anyopaque) void {
     const state = toState(device_ptr);
     std.posix.close(state.fd);
-    state.ringbuf.deinit();
     free(@constCast(state.name.ptr));
     free(state);
+}
+
+/// Add an IPv4 route (stub - Linux routing via Netlink not implemented)
+pub fn addRoute(
+    device_ptr: *anyopaque,
+    destination: Ipv4Address,
+    gateway: Ipv4Address,
+    prefix_len: u8,
+) TunError!void {
+    _ = device_ptr;
+    _ = destination;
+    _ = gateway;
+    _ = prefix_len;
+    return error.NotSupported;
 }

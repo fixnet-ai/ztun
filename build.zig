@@ -50,42 +50,27 @@ const zig_modules = &[_]framework.ZigModule{
     .{
         .name = "tun",
         .file = "src/tun/mod.zig",
-        .deps = &[_][]const u8{ "builder", "device", "platform", "device_linux", "device_macos", "device_windows", "ringbuf" },
+        .deps = &[_][]const u8{ "device", "device_linux", "device_darwin", "device_windows" },
     },
     .{
         .name = "device",
         .file = "src/tun/device.zig",
-        .deps = &[_][]const u8{ "device_linux", "device_macos", "device_windows", "ringbuf" },
+        .deps = &[_][]const u8{ "device_linux", "device_darwin", "device_windows" },
     },
     .{
         .name = "device_linux",
         .file = "src/tun/device_linux.zig",
-        .deps = &[_][]const u8{ "device", "ringbuf" },
+        .deps = &[_][]const u8{ "device" },
     },
     .{
-        .name = "device_macos",
-        .file = "src/tun/device_macos.zig",
-        .deps = &[_][]const u8{ "device", "ringbuf" },
+        .name = "device_darwin",
+        .file = "src/tun/device_darwin.zig",
+        .deps = &[_][]const u8{ "device" },
     },
     .{
         .name = "device_windows",
         .file = "src/tun/device_windows.zig",
-        .deps = &[_][]const u8{ "device", "ringbuf" },
-    },
-    .{
-        .name = "builder",
-        .file = "src/tun/builder.zig",
         .deps = &[_][]const u8{ "device" },
-    },
-    .{
-        .name = "platform",
-        .file = "src/tun/platform.zig",
-        .deps = &[_][]const u8{},
-    },
-    .{
-        .name = "ringbuf",
-        .file = "src/tun/ringbuf.zig",
-        .deps = &[_][]const u8{},
     },
     // IP stack submodules (all in src/ipstack/)
     .{
@@ -259,6 +244,28 @@ pub fn build(b: *std.Build) void {
         .dest_dir = .{ .override = .{ .custom = b.dupe("bin/macos") } },
     });
     tun2sock_step.dependOn(&tun2sock_install.step);
+
+    // Build test_tun executable to bin/{os}/
+    const test_tun_step = b.step("test-tun", "Build ping echo test application");
+    const test_tun = b.addExecutable(.{
+        .name = "test_tun",
+        .root_source_file = b.path("tests/test_tun.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_tun.linkLibC();
+    // Add Zig modules
+    var test_tun_iter = all_modules.map.iterator();
+    while (test_tun_iter.next()) |entry| {
+        test_tun.root_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    }
+    // Add libxev dependency
+    test_tun.root_module.addImport("xev", libxev.module("xev"));
+    // Install to bin/macos/
+    const test_tun_install = b.addInstallArtifact(test_tun, .{
+        .dest_dir = .{ .override = .{ .custom = b.dupe("bin/macos") } },
+    });
+    test_tun_step.dependOn(&test_tun_install.step);
 
     // Build all static library targets (no tests)
     const all_targets_step = b.step("all", "Build static libraries for all supported targets");

@@ -1,279 +1,437 @@
 # ztun Development Todo List
 
 ## Current Status
-**Phase: Router Integration Testing - SOCKS5 Forwarding**
+**Phase: Full Refactoring - TUN Module Re-architecture**
 
-Last Updated: 2026-02-04
+Reference: sing-tun + sing-box cross-platform TUN implementation
 
----
-
-## Integration Test Plan (Phase 4)
-
-### Test Environment
-- **SOCKS5 Proxy**: 127.0.0.1:1080 (local, running)
-- **Target IP**: 111.45.11.5 (routed through TUN)
-- **TUN IP**: 10.0.0.1
-- **Platform**: macOS
-
-### Test Steps
-
-#### Step 1: TUN Device Creation
-- [x] Build tun2sock
-- [ ] Run: `sudo ./zig-out/bin/tun2sock --tun-ip 10.0.0.1 --proxy 127.0.0.1:1080`
-- [ ] Verify utun device created
-- [ ] Verify IP 10.0.0.1 assigned to utun
-- [ ] Check TUN FD is valid
-
-#### Step 2: System Route Configuration
-- [ ] Add route: `sudo route add 111.45.11.5 10.0.0.1`
-- [ ] Verify route exists with `netstat -rn`
-- [ ] Verify traffic to 111.45.11.5 goes through utun
-
-#### Step 3: ICMP Echo Test
-- [ ] Run: `ping 111.45.11.5`
-- [ ] Expected: ICMP echo reply received
-- [ ] Verify handleIcmpEcho() is triggered
-- [ ] Check stats: packets_forwarded increment
-
-#### Step 4: HTTP Request Test (curl)
-- [ ] Run: `curl -v -H 'Host: baidu.com' http://111.45.11.5/`
-- [ ] Expected: HTTP response received
-- [ ] Verify SOCKS5 TCP connection established
-- [ ] Check bidirectional forwarding works
+Last Updated: 2026-02-06
 
 ---
 
-## Known Issues to Fix
+## Refactoring Overview
 
-### Critical (Blocking Tests)
+Based on sing-tun and sing-box architecture, completely reimplement `./src/tun/` and `./src/system/sysroute.zig` using libxev for event-driven I/O.
 
-#### 1. SOCKS5 Response Reading (Fixed)
-**Problem**: After SOCKS5 connection is `.Ready`, no callback reads proxy responses
-**Impact**: TCP responses never forwarded back to TUN
-**Fix**: Added `onSocks5Readable` and `submitSocks5Read()` in mod.zig
+### Target Architecture
 
-#### 2. UDP NAT Response Handling (Fixed)
-**Problem**: UDP receive callback missing, only send implemented
-**Impact**: UDP responses not forwarded back to TUN
-**Fix**: Added `submitUdpRead()` and `onUdpReadable` callback in mod.zig
-**Fix**: Added `lookupByMapped()` in nat.zig for reverse NAT lookup
-
-#### 3. SOCKS5 Connect Request Missing
-**Problem**: `sendSocks5ConnectRequest()` defined but not integrated
-**Fix**: Call from `onSocks5GreetingAck` (already done at line 1018)
-
-### High Priority
-
-#### 4. TCP Payload Forwarding to TUN (Fixed)
-**Problem**: Proxy responses not written back to TUN
-**Fix**: In `onSocks5Readable`, build IP header and write to TUN
-
-#### 5. IP Header for SOCKS5 TCP
-**Problem**: forwardToProxy() sends raw TCP payload without IP header
-**Impact**: SOCKS5 server expects raw TCP data (correct)
-**Fix**: Keep as-is, SOCKS5 protocol handles this correctly
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        Application Layer                      │
+│                    (Router, tun2sock, etc.)                 │
+├─────────────────────────────────────────────────────────────┤
+│                     PacketHandler Interface                   │
+│  handleTcp() / handleUdp() / handleIcmp()                   │
+├─────────────────────────────────────────────────────────────┤
+│                      TunStack Interface                       │
+│  System Stack (TCP NAT, UDP NAT, ICMP)                      │
+├─────────────────────────────────────────────────────────────┤
+│                      TunDevice Interface                      │
+│  read() / write() / name() / fd() / close()                │
+├───────────────┬───────────────┬───────────────┬─────────────┤
+│   Darwin      │    Linux      │   Windows     │   Android   │
+│  (utun)       │ (/dev/net/tun)│   (Wintun)   │  (/dev/tun)│
+└───────────────┴───────────────┴───────────────┴─────────────┘
+```
 
 ---
 
-## Completed Modules
+## Implementation Phases
 
-### tun Module (✅ Complete)
-- [x] device_linux.zig - Linux TUN operations
-- [x] device_macos.zig - macOS TUN operations
-- [x] device_windows.zig - Windows TUN operations
-- [x] ringbuf.zig - Ring buffer for batch I/O
+### Phase 1: Core Interface Definitions
 
-### ipstack Module (✅ Complete)
-- [x] checksum.zig - Internet checksum
-- [x] ipv4.zig - IPv4 parsing/generation
-- [x] ipv6.zig - IPv6 parsing/generation
-- [x] tcp.zig - TCP protocol
-- [x] udp.zig - UDP protocol
-- [x] icmp.zig - ICMP protocol
-- [x] connection.zig - TCP connection tracking
-- [x] callbacks.zig - Protocol callbacks
+**Goal**: Define clean abstractions for TUN device, protocol stack, and packet handler.
 
-### router Module (In Progress)
+#### Created Files
 
-#### Phase 1: Foundation (✅ Complete)
-- [x] route.zig - Route types and config structures
-- [x] mod.zig - Router module entry
-- [x] nat.zig - UDP NAT session table
-- [x] proxy/socks5.zig - SOCKS5 protocol helpers
+| File | Description | Status |
+|------|-------------|--------|
+| `src/tun/options.zig` | TUN configuration options | ⏳ |
+| `src/tun/device.zig` | TunDevice interface | ⏳ |
+| `src/tun/stack.zig` | TunStack interface | ⏳ |
+| `src/tun/handler.zig` | PacketHandler interface | ⏳ |
 
-#### Phase 2: libxev Integration (✅ Complete)
-- [x] libxev loop integration in mod.zig
-- [x] TUN async read (libxev.IO)
-- [x] TUN async write (libxev.IO)
-- [x] NAT cleanup timer (30s interval)
-- [x] ICMP echo handler
-- [x] Packet parsing (4-tuple extraction)
+#### TunDevice Interface
 
-#### Phase 3: Forwarding Handlers (In Progress)
-- [x] forwardToEgress() - Raw socket forwarding with SO_BINDTODEVICE
-- [ ] forwardToProxy() - SOCKS5 proxy forwarding (TCP)
-- [ ] forwardWithNat() - UDP NAT translation
+```zig
+const TunDevice = interface {
+    fn read(buf: []u8) error!usize;
+    fn write(buf: []const u8) error!usize;
+    fn name() error![]const u8;
+    fn ifIndex() error!u32;
+    fn fd() std.posix.fd_t;
+    fn setNonBlocking(enabled: bool) error!void;
+    fn close() void;
+};
+```
 
-#### Phase 4: TCP Connection Pool (Pending)
-- [ ] tcp.zig - TCP connection pool
-- [ ] Async TCP connect to proxy
-- [ ] TCP data forwarding
+#### TunStack Interface
 
----
+```zig
+const TunStack = interface {
+    fn start(handler: *PacketHandler) error!void;
+    fn stop() void;
+    fn fd() std.posix.fd_t;
+};
+```
 
-## Application Layer
+#### PacketHandler Interface
 
-### tun2sock.zig (✅ Implemented)
-- [x] Command line argument parsing
-- [x] TUN device creation via DeviceBuilder
-- [x] Egress interface detection (using sysroute)
-- [x] Route callback implementation
-- [x] Router initialization and run loop
-- [x] Statistics reporting
+```zig
+const PacketHandler = interface {
+    fn handleTcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: []const u8) error!void;
+    fn handleUdp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: []const u8) error!void;
+    fn handleIcmp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: []const u8) error!void;
+};
+```
 
 ---
 
-### sysroute.zig (System Module - ✅ BSD Implemented)
-- [x] getIfaceIndex() - BSD/macOS implementation
-- [x] getIfaceIndex() - Linux stub
-- [x] getIfaceIndex() - Windows stub
-- [x] routeAdd() - BSD routing socket implementation
-- [x] routeDelete() - BSD routing socket implementation
-- [ ] routeAdd() - Linux Netlink (pending Linux VM test)
-- [ ] routeDelete() - Linux Netlink (pending Linux VM test)
-- [ ] routeAdd() - Windows IP Helper (pending Windows VM test)
-- [ ] routeDelete() - Windows IP Helper (pending Windows VM test)
+### Phase 2: Darwin/macOS/iOS Implementation
+
+**Goal**: Implement TUN device using utun sockets with BSD routing sockets for routing.
+
+#### Created Files
+
+| File | Description | Status |
+|------|-------------|--------|
+| `src/tun/device_darwin.zig` | Darwin TUN device | ⏳ |
+
+#### Implementation Details
+
+1. **Device Creation**
+   - Socket: `AF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL`
+   - Connect to: `com.apple.net.utun_control`
+   - Get interface name and index via `SIOCGIFCONF` or `getsockopt(UTUN_OPT_IFNAME)`
+
+2. **Packet I/O**
+   - Read: `recv()` + strip 4-byte AF_INET header
+   - Write: `send()` + prepend 4-byte `[0x02, 0x00, 0x00, 0x00]`
+
+3. **Routing (via BSD Routing Sockets)**
+   - Socket: `AF_ROUTE, SOCK_RAW, 0`
+   - Messages: `RTM_ADD`, `RTM_DELETE`
+   - Structures: `rt_msghdr`, `sockaddr_in`, `sockaddr_dl`
+
+#### Code Structure
+
+```zig
+const DarwinTun = struct {
+    fd: std.posix.fd_t,
+    name: []const u8,
+    ifindex: u32,
+
+    pub fn create(options: Options) !*DarwinTun;
+    pub fn read(self: *DarwinTun, buf: []u8) error!usize;
+    pub fn write(self: *DarwinTun, buf: []const u8) error!usize;
+    pub fn addRoute(self: *DarwinTun, route: *RouteEntry) error!void;
+    pub fn deleteRoute(self: *DarwinTun, route: *RouteEntry) error!void;
+};
+```
 
 ---
 
-## File Reference
+### Phase 3: Linux Implementation
 
-### Modified Files
-- [src/router/mod.zig](src/router/mod.zig) - Router module (libxev integration complete)
-- [src/router/route.zig](src/router/route.zig) - Route types
-- [src/router/nat.zig](src/router/nat.zig) - NAT table (complete)
-- [src/tun2sock.zig](src/tun2sock.zig) - TUN to SOCKS5 forwarding app
+**Goal**: Implement TUN device using `/dev/net/tun` with netlink for routing.
 
-### New Files Created
-- [src/router/tcp.zig](src/router/tcp.zig) - TCP connection pool (pending)
+#### Created Files
+
+| File | Description | Status |
+|------|-------------|--------|
+| `src/tun/device_linux.zig` | Linux TUN device | ⏳ |
+
+#### Implementation Details
+
+1. **Device Creation**
+   - Open: `/dev/net/tun` (or `/dev/tun` on Android)
+   - ioctl: `TUNSETIFF` with `IFF_TUN`
+   - Flags: `IFF_NO_PI` (no packet info)
+
+2. **Packet I/O**
+   - Read: direct `read()` of raw IP packets
+   - Write: direct `write()` of raw IP packets
+   - Optional: GSO support with `virtio_net_hdr`
+
+3. **Routing (via Netlink)**
+   - Socket: `AF_NETLINK, SOCK_RAW, NETLINK_ROUTE`
+   - Messages: `RTM_NEWROUTE`, `RTM_DELROUTE`
+   - Use `github.com/sagernet/netlink` or raw netlink
+
+#### Code Structure
+
+```zig
+const LinuxTun = struct {
+    fd: std.posix.fd_t,
+    name: []const u8,
+    ifindex: u32,
+    nl_socket: std.posix.fd_t,
+
+    pub fn create(options: Options) !*LinuxTun;
+    pub fn read(self: *LinuxTun, buf: []u8) error!usize;
+    pub fn write(self: *LinuxTun, buf: []const u8) error!usize;
+    pub fn addRoute(self: *LinuxTun, route: *RouteEntry) error!void;
+    pub fn deleteRoute(self: *LinuxTun, route: *RouteEntry) error!void;
+};
+```
 
 ---
 
-## Testing Strategy
+### Phase 4: Windows Implementation
 
-### Unit Tests (tests/test_unit.zig)
-- [x] NAT table operations
-- [x] SOCKS5 protocol parsing
-- [ ] TCP pool operations (pending)
-- [ ] Route decision logic
+**Goal**: Implement TUN device using Wintun DLL with winipcfg API for routing.
 
-### Integration Tests (tests/test_runner.zig)
-- [x] TUN device tests
-- [x] IP stack tests
-- [x] DeviceBuilder API test (fixed setName usage)
-- [ ] Router forwarding tests (pending)
-- [ ] SOCKS5 proxy tests (pending)
+#### Created Files
 
-### Manual Tests
-- [ ] macOS TUN forwarding
-- [ ] Linux TUN forwarding
-- [ ] Android TUN forwarding
-- [ ] iOS TUN forwarding
+| File | Description | Status |
+|------|-------------|--------|
+| `src/tun/device_windows.zig` | Windows TUN device | ⏳ |
+
+#### Implementation Details
+
+1. **Device Creation**
+   - Load: `wintun.dll` from application directory
+   - API: `WintunCreateAdapter()`
+   - Session: `WintunStartSession()`
+
+2. **Packet I/O**
+   - Read: `WintunReceivePacket()` from ring buffer
+   - Write: `WintunSendPacket()` to ring buffer
+   - Zero-copy design with aligned ring buffers
+
+3. **Routing (via winipcfg)**
+   - API: `GetAdaptersInfo()`, `GetIpForwardTable()`
+   - Modify: `MibIPforwardRow2` + `SetIpForwardEntry2()`
+
+#### Code Structure
+
+```zig
+const WindowsTun = struct {
+    adapter: *wintun.WINTUN_ADAPTER_HANDLE,
+    session: *wintun.WINTUN_SESSION_HANDLE,
+    name: [:0]u8,
+
+    pub fn create(options: Options) !*WindowsTun;
+    pub fn read(self: *WindowsTun, buf: []u8) error!usize;
+    pub fn write(self: *WindowsTun, buf: []const u8) error!usize;
+    pub fn addRoute(self: *WindowsTun, route: *RouteEntry) error!void;
+    pub fn deleteRoute(self: *WindowsTun, route: *RouteEntry) error!void;
+};
+```
+
+---
+
+### Phase 5: System Protocol Stack
+
+**Goal**: Implement lightweight NAT-based protocol stack using system network stack.
+
+#### Created Files
+
+| File | Description | Status |
+|------|-------------|--------|
+| `src/tun/stack_system.zig` | System protocol stack | ⏳ |
+
+#### Implementation Details
+
+1. **TCP Handling**
+   - Listen on TUN IP addresses
+   - NAT table for connection tracking
+   - Forward to SOCKS5 proxy or direct
+
+2. **UDP Handling**
+   - NAT mapping for UDP sessions
+   - Timeout-based session expiration
+   - Bidirectional forwarding
+
+3. **ICMP Handling**
+   - Echo request/response
+   - Destination unreachable passthrough
+
+#### Code Structure
+
+```zig
+const SystemStack = struct {
+    device: *TunDevice,
+    tcp_listener: std.posix.socket_t,
+    nat_table: *NatTable,
+
+    pub fn create(device: *TunDevice) !*SystemStack;
+    pub fn start(self: *SystemStack, handler: *PacketHandler) error!void;
+    pub fn stop(self: *SystemStack) void;
+};
+```
+
+---
+
+### Phase 6: libxev Integration
+
+**Goal**: Integrate all components with libxev event loop.
+
+#### Implementation Pattern
+
+```zig
+const TunServer = struct {
+    loop: *xev.Loop,
+    device: *TunDevice,
+    stack: *TunStack,
+    completion: xev.Completion,
+    handler: *PacketHandler,
+
+    pub fn init(loop: *xev.Loop, device: *TunDevice, handler: *PacketHandler) !void {
+        // Submit initial TUN read
+        loop.read(&completion, device.fd(), this, onTunReadable);
+    }
+
+    fn onTunReadable(
+        userdata: ?*anyopaque,
+        loop: *xev.Loop,
+        completion: *xev.Completion,
+        result: xev.Result,
+    ) xev.CallbackAction {
+        const n = result.read catch return .disarm;
+
+        // Process packet through stack
+        stack.processPacket(buf[0..n]) catch return .disarm;
+
+        // Re-submit read
+        loop.read(completion, device.fd(), userdata, onTunReadable);
+        return .rearm;
+    }
+};
+```
+
+---
+
+### Phase 7: Router Module Re-architecture
+
+**Goal**: Refactor router module to use new TUN interfaces.
+
+#### New Structure
+
+| File | Description | Status |
+|------|-------------|--------|
+| `src/system/router.zig` | Unified router interface | ⏳ |
+| `src/system/router_darwin.zig` | BSD routing | ⏳ |
+| `src/system/router_linux.zig` | Linux netlink routing | ⏳ |
+| `src/system/router_windows.zig` | Windows winipcfg routing | ⏳ |
+
+#### Router Interface
+
+```zig
+const Router = interface {
+    fn addIpv4Route(destination: Ipv4Cidr, gateway: ?Ipv4Address, iface: []const u8) error!void;
+    fn deleteIpv4Route(destination: Ipv4Cidr, iface: []const u8) error!void;
+    fn addIpv6Route(destination: Ipv6Cidr, gateway: ?Ipv6Address, iface: []const u8) error!void;
+    fn getInterfaceIndex(name: []const u8) error!u32;
+};
+```
+
+---
+
+## Files Summary
+
+### New Files to Create
+
+| File | Phase | Description |
+|------|-------|-------------|
+| `src/tun/options.zig` | 1 | TUN configuration options |
+| `src/tun/device.zig` | 1 | TunDevice interface |
+| `src/tun/stack.zig` | 1 | TunStack interface |
+| `src/tun/handler.zig` | 1 | PacketHandler interface |
+| `src/tun/device_darwin.zig` | 2 | Darwin TUN implementation |
+| `src/tun/device_linux.zig` | 3 | Linux TUN implementation |
+| `src/tun/device_windows.zig` | 4 | Windows TUN implementation |
+| `src/tun/stack_system.zig` | 5 | System protocol stack |
+| `src/system/router.zig` | 7 | Unified router interface |
+| `src/system/router_darwin.zig` | 7 | BSD routing implementation |
+| `src/system/router_linux.zig` | 7 | Linux routing implementation |
+| `src/system/router_windows.zig` | 7 | Windows routing implementation |
+
+### Files to Delete
+
+| File | Reason |
+|------|--------|
+| `src/tun/builder.zig` | Superseded by options.zig |
+| `src/tun/ringbuf.zig` | Superseded by platform-specific implementations |
+| `src/tun/platform.zig` | Superseded by device_*.zig |
+| `src/system/sysroute.zig` | Superseded by router_*.zig |
+
+### Files to Modify
+
+| File | Changes |
+|------|---------|
+| `src/tun/mod.zig` | Re-export new interfaces |
+| `src/tun/device_macos.zig` | Merge into device_darwin.zig |
+| `src/tun/device_linux.zig` | Rewrite |
+| `src/tun/device_windows.zig` | Rewrite |
+
+---
+
+## Verification Plan
+
+### Build Verification
+
+```bash
+# Default build
+zig build              # ⏳
+
+# Build test_tun
+zig build test-tun     # ⏳
+
+# Cross-compile
+zig build all          # ⏳
+```
+
+### Unit Tests
+
+- [ ] Options parsing
+- [ ] Address conversion
+- [ ] Checksum calculation
+
+### Integration Tests
+
+- [ ] macOS: Ping echo test
+- [ ] Linux: Ping echo test (Lima VM)
+- [ ] Windows: Ping echo test (Windows VM)
+
+### tcpdump Verification
+
+```bash
+# Capture TUN traffic
+sudo tcpdump -i any -w /tmp/tun_capture.pcap host 10.0.0.2
+
+# macOS: Verify 4-byte header
+tcpdump -r /tmp/tun_capture.pcap -XX -vv
+
+# Linux/Windows: Verify raw IP packets
+tcpdump -r /tmp/tun_capture.pcap -XX
+```
 
 ---
 
 ## Dependencies
 
-### External
-- libxev - Event loop (integrated)
-- zinternal - App framework modules (app, platform, logger, signal, config, storage)
-
-### Internal
-- ztun.tun - TUN device operations
-- ztun.ipstack - Packet parsing
-
----
-
-## Build Verification
-
-```bash
-# Build native library
-zig build              # ✅ Pass
-
-# Build and run integration tests
-zig build test         # ✅ Pass
-
-# Build tun2sock application
-zig build tun2sock     # ✅ Pass
-
-# Build all platform static libraries
-zig build all          # ⏳ (forwarding handlers pending)
-```
-
----
-
-## Next Steps
-
-1. **Implement forwardToEgress()** - Raw socket with SO_BINDTODEVICE
-   - Create raw socket
-   - Bind to egress interface
-   - Forward packet
-
-2. **Implement forwardToProxy()** - SOCKS5 TCP forwarding
-   - Connect to SOCKS5 proxy
-   - Send connect request
-   - Forward data bidirectionally
-
-3. **Implement forwardWithNat()** - UDP NAT translation
-   - Insert NAT session
-   - Rewrite source IP/port
-   - Forward to destination
-
-4. **Implement tcp.zig** - TCP connection pool
-   - Async TCP connection to proxy
-   - Connection state machine
-   - Data forwarding
-
-5. **Test forwarding** - macOS TUN forwarding tests
+- **libxev**: Event loop (already integrated)
+- **zinternal**: App framework (app, logger, platform)
+- **sing-tun**: Reference implementation
+- **sing-box**: Reference implementation
 
 ---
 
 ## Notes
 
-- Router is a FIXED forwarding engine - no plugin logic
-- All config from application layer
-- Uses libxev callbacks (not async/await)
-- Egress traffic bypasses TUN (raw socket)
-- ICMP echo handled immediately (ping response)
-- NAT cleanup runs every 30 seconds
+1. **Memory Management**: Use arena allocator for NAT tables
+2. **Error Handling**: Distinguish recoverable vs fatal errors
+3. **Thread Safety**: libxev is single-threaded, no locks needed
+4. **Resource Cleanup**: Properly close all FDs and handles
+5. **Endianness**: Always use network byte order for packets
 
 ---
 
-## Recently Completed
+## Reference Documentation
 
-### 2026-02-04: Platform Privilege Check
-
-- Implemented cross-platform `isElevated()` function
-- Uses `geteuid()` for Unix systems
-- Uses `IsUserAnAdmin()` for Windows
-
-### sysroute.zig - BSD Routing Socket
-- Implemented `bsdRouteAdd()` with routing socket
-- Implemented `bsdRouteDelete()` with routing socket
-- Added BSD sockaddr structures (sockaddr_in, sockaddr_in6, rt_msghdr)
-- IPv4 route message building
-
-### router/mod.zig - Direct Forwarding
-- Added `raw_sock` field to Router struct
-- Implemented `forwardToEgress()` using raw socket
-- Raw socket created with `IPPROTO_RAW` for direct packet forwarding
-
----
-
-## Build Verification
-
-```bash
-zig build              # ✅ Pass
-zig build test         # ✅ Pass
-zig build tun2sock     # ✅ Pass
-```
+- [sing-tun GitHub](https://github.com/SagerNet/sing-tun)
+- [sing-box TUN Inbound](../vendor/sing-box/protocol/tun/inbound.go)
+- [BSD Routing Sockets](https://www.freebsd.org/cgi/man.cgi?query=route)
+- [Linux netlink](https://man7.org/linux/man-pages/man7/netlink.7.html)
+- [Windows Wintun](https://www.wintun.net/)

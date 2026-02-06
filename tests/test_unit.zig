@@ -1,7 +1,6 @@
 //! test_unit.zig - Unit Tests for ztun
 //!
 //! Tests individual functions with no external dependencies.
-//! RingBuffer tests are included here since they have internal tests.
 
 const std = @import("std");
 const tun = @import("tun");
@@ -82,61 +81,6 @@ test "NetworkAddress: create without destination" {
     try std.testing.expect(network.destination == null);
 }
 
-// ==================== DeviceBuilder Tests ====================
-
-test "DeviceBuilder: init returns empty builder" {
-    const builder = tun.DeviceBuilder.init();
-    try std.testing.expect(builder.mtu == null);
-    try std.testing.expect(builder.ipv4_addr == null);
-    try std.testing.expect(builder.ipv6_addr == null);
-}
-
-test "DeviceBuilder: setMtu" {
-    var builder = tun.DeviceBuilder.init();
-    _ = builder.setMtu(1500);
-    try std.testing.expectEqual(@as(u16, 1500), builder.mtu.?);
-    _ = builder.setMtu(9000);
-    try std.testing.expectEqual(@as(u16, 9000), builder.mtu.?);
-}
-
-test "DeviceBuilder: setIpv4" {
-    var builder = tun.DeviceBuilder.init();
-    const addr: Ipv4Address = .{ 10, 0, 0, 1 };
-    _ = builder.setIpv4(addr, 24, null);
-    try std.testing.expectEqual(addr, builder.ipv4_addr.?);
-    try std.testing.expectEqual(@as(u8, 24), builder.ipv4_prefix.?);
-    try std.testing.expect(builder.ipv4_destination == null);
-}
-
-test "DeviceBuilder: setIpv4 with destination" {
-    var builder = tun.DeviceBuilder.init();
-    const addr: Ipv4Address = .{ 10, 0, 0, 1 };
-    const dest: Ipv4Address = .{ 10, 0, 0, 254 };
-    _ = builder.setIpv4(addr, 24, dest);
-    try std.testing.expect(builder.ipv4_destination != null);
-    try std.testing.expectEqual(dest, builder.ipv4_destination.?);
-}
-
-test "DeviceBuilder: setIpv6" {
-    var builder = tun.DeviceBuilder.init();
-    const addr: Ipv6Address = .{ 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
-    _ = builder.setIpv6(addr, 64);
-    try std.testing.expectEqual(addr, builder.ipv6_addr.?);
-    try std.testing.expectEqual(@as(u8, 64), builder.ipv6_prefix.?);
-}
-
-test "DeviceBuilder: fluent interface" {
-    var builder = tun.DeviceBuilder.init();
-    const addr4: Ipv4Address = .{ 10, 0, 0, 1 };
-    const addr6: Ipv6Address = .{ 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
-
-    _ = builder.setMtu(1500)
-        .setIpv4(addr4, 24, null)
-        .setIpv6(addr6, 64);
-
-    try std.testing.expectEqual(@as(u16, 1500), builder.mtu.?);
-}
-
 // ==================== DeviceConfig Tests ====================
 
 test "DeviceConfig: default values" {
@@ -193,99 +137,6 @@ test "TunError: error set conversion" {
 
     const result = test_fn();
     try std.testing.expect(result == error.IoError);
-}
-
-// ==================== RingBuffer Tests ====================
-
-test "RingBuffer: init and deinit" {
-    const capacity = 4096;
-    var rb = try tun.RingBuffer.init(capacity);
-    defer rb.deinit();
-
-    try std.testing.expectEqual(capacity, rb.capacity);
-    try std.testing.expect(rb.capacity > 0);
-}
-
-test "RingBuffer: write and read" {
-    const capacity = 4096;
-    var rb = try tun.RingBuffer.init(capacity);
-    defer rb.deinit();
-
-    const test_data = "Hello, Ring Buffer!";
-    rb.write(0, test_data);
-
-    var read_buf: [100]u8 = undefined;
-    rb.read(0, read_buf[0..test_data.len]);
-    try std.testing.expectEqualStrings(test_data, read_buf[0..test_data.len]);
-}
-
-test "RingBuffer: wrap-around write" {
-    const page_size = std.mem.page_size;
-    var rb = try tun.RingBuffer.init(page_size * 4);
-    defer rb.deinit();
-
-    const test_data = "Wrap-around test data";
-    rb.write(rb.capacity - 10, test_data);
-
-    var read_buf: [100]u8 = undefined;
-    rb.read(rb.capacity - 10, read_buf[0..test_data.len]);
-    try std.testing.expectEqualStrings(test_data, read_buf[0..test_data.len]);
-}
-
-test "RingBuffer: wrap-around read" {
-    const page_size = std.mem.page_size;
-    var rb = try tun.RingBuffer.init(page_size * 4);
-    defer rb.deinit();
-
-    var test_data: [100]u8 = undefined;
-    @memset(&test_data, 'X');
-    rb.write(rb.capacity - 50, &test_data);
-
-    var read_buf: [100]u8 = undefined;
-    rb.read(rb.capacity - 50, read_buf[0..test_data.len]);
-
-    // Verify all 'X' characters
-    for (read_buf[0..test_data.len]) |c| {
-        try std.testing.expectEqual(@as(u8, 'X'), c);
-    }
-}
-
-test "RingBuffer: getWriteSlices single" {
-    var rb = try tun.RingBuffer.init(4096);
-    defer rb.deinit();
-
-    const slices = rb.getWriteSlices(0, 100);
-    try std.testing.expectEqual(@as(usize, 1), slices.len);
-    try std.testing.expectEqual(@as(usize, 100), slices.slices[0].len);
-}
-
-test "RingBuffer: getWriteSlices double" {
-    var rb = try tun.RingBuffer.init(4096);
-    defer rb.deinit();
-
-    const slices = rb.getWriteSlices(4090, 100);
-    try std.testing.expectEqual(@as(usize, 2), slices.len);
-    try std.testing.expectEqual(@as(usize, 6), slices.slices[0].len);
-    try std.testing.expectEqual(@as(usize, 94), slices.slices[1].len);
-}
-
-test "RingBuffer: availableBeforeWrap" {
-    var rb = try tun.RingBuffer.init(4096);
-    defer rb.deinit();
-
-    try std.testing.expectEqual(@as(usize, 4096), rb.availableBeforeWrap(0));
-    try std.testing.expectEqual(@as(usize, 100), rb.availableBeforeWrap(3996));
-    try std.testing.expectEqual(@as(usize, 1), rb.availableBeforeWrap(4095));
-}
-
-test "RingBuffer: empty buffer read" {
-    const capacity = 4096;
-    var rb = try tun.RingBuffer.init(capacity);
-    defer rb.deinit();
-
-    var buf: [100]u8 = undefined;
-    rb.read(0, &buf);
-    // Should not panic, just read zeros/undefined
 }
 
 // ==================== IP Stack Tests ====================
