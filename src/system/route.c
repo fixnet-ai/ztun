@@ -397,7 +397,10 @@ static int bsd_route_add(const route_entry_t* route) {
 
     int is_ipv6 = (route->family == ROUTE_AF_INET6);
     char* ptr = (char*)(rtm + 1);
+
+#ifdef DEBUG
     char ip_str[64];
+#endif
 
     if (is_ipv6) {
         // IPv6 路由
@@ -529,7 +532,10 @@ static int bsd_route_delete(const route_entry_t* route) {
 
     int is_ipv6 = (route->family == ROUTE_AF_INET6);
     char* ptr = (char*)(rtm + 1);
+
+#ifdef DEBUG
     char ip_str[64];
+#endif
 
     if (is_ipv6) {
         // IPv6 路由
@@ -580,9 +586,20 @@ static int bsd_route_delete(const route_entry_t* route) {
     }
 
     ssize_t ret = write(sock, msg, rtm->rtm_msglen);
+
+    // macOS 路由操作是异步的，需要读取响应确认结果
+    // 读取响应以检查删除是否成功
+    char recv_buf[256];
+    (void)read(sock, recv_buf, sizeof(recv_buf));  // 忽略响应内容
+
     close(sock);
 
     if (ret < 0 || (size_t)ret != rtm->rtm_msglen) {
+        // ESRCH = No such process = 路由不存在（常见情况，不打印错误）
+        if (errno == ESRCH) {
+            ROUTE_DEBUG("[ROUTE] Route not found (OK to delete non-existent)");
+            return 0;  // 返回成功，因为路由不存在
+        }
         ROUTE_ERROR("[ROUTE] Failed to send RTM_DELETE: ret=%zd, errno=%d", ret, errno);
         return -1;
     }
@@ -710,12 +727,14 @@ static int bsd_route_list(route_entry_t* routes, int max_count) {
                 routes[count].iface_idx = iface_idx;
                 routes[count].metric = 0;
 
+#ifdef DEBUG
                 char dst_str[32], mask_str[32];
                 ROUTE_DEBUG("[ROUTE] Route: dst=%s mask=%s gateway=%s iface=%d",
                            inet_ntop(AF_INET, &dst->sin_addr, dst_str, sizeof(dst_str)),
                            mask ? inet_ntop(AF_INET, &mask->sin_addr, mask_str, sizeof(mask_str)) : "255.255.255.255",
                            gateway ? inet_ntoa(gateway->sin_addr) : "0.0.0.0",
                            iface_idx);
+#endif
             }
             count++;
         }

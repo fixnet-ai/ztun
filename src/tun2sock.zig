@@ -167,7 +167,15 @@ fn parseProxyAddr(addr: []const u8) !struct { ip: u32, port: u16 } {
     return .{ .ip = ip, .port = port };
 }
 
-// Route callback - application defines routing policy
+// Route callback - application defines routing policy for transparent proxy
+//
+// Routing rules:
+//   1. ICMP (protocol=1) -> Local (auto-reply echo)
+//   2. Private IPs (RFC 1918) -> Local (normal routing)
+//   3. UDP (protocol=17) -> Nat (NAT and forward)
+//   4. TCP to 111.45.11.5 -> Socks5 (proxy)
+//   5. Multicast -> Drop (silently)
+//   6. Default -> Local (normal routing)
 fn routeCallback(
     src_ip: u32,
     src_port: u16,
@@ -179,45 +187,42 @@ fn routeCallback(
     _ = src_port;
     _ = dst_port;
 
-    // Target IP to proxy (only route this specific IP)
+    // Target IP: 111.45.11.5 (network byte order: 0x6F2D0B05)
     const target_ip = (@as(u32, 111) << 24) | (@as(u32, 45) << 16) | (@as(u32, 11) << 8) | @as(u32, 5);
-    const is_target = dst_ip == target_ip;
 
-    // Private IP ranges (RFC 1918)
-    const private_10 = dst_ip & 0xFF000000 == 0x0A000000; // 10.0.0.0/8
-    const private_172 = dst_ip & 0xFFF00000 == 0xAC100000; // 172.16.0.0/12
-    const private_192 = dst_ip & 0xFFFF0000 == 0xC0A80000; // 192.168.0.0/16
-    const loopback = dst_ip & 0xFF000000 == 0x7F000000; // 127.0.0.0/8
-    const linklocal = dst_ip & 0xFFFF0000 == 0xA9FE0000; // 169.254.0.0/16
-
-    // Drop multicast
-    const multicast = dst_ip & 0xF0000000 == 0xE0000000; // 224.0.0.0/4
-
-    // Local/private traffic - handle locally
-    if (private_10 or private_172 or private_192 or loopback or linklocal) {
+    // Rule 1: ICMP protocol -> Local (auto-reply echo request)
+    if (protocol == 1) {
         return .Local;
     }
 
-    // Multicast - drop
-    if (multicast) {
+    // Rule 2: Private IP ranges -> Local (normal routing)
+    // 10.0.0.0/8
+    if ((dst_ip & 0xFF000000) == 0x0A000000) return .Local;
+    // 172.16.0.0/12
+    if ((dst_ip & 0xFFF00000) == 0xAC100000) return .Local;
+    // 192.168.0.0/16
+    if ((dst_ip & 0xFFFF0000) == 0xC0A80000) return .Local;
+    // 127.0.0.0/8 (loopback)
+    if ((dst_ip & 0xFF000000) == 0x7F000000) return .Local;
+    // 169.254.0.0/16 (link-local)
+    if ((dst_ip & 0xFFFF0000) == 0xA9FE0000) return .Local;
+
+    // Rule 3: UDP protocol -> Nat (NAT and forward all UDP)
+    if (protocol == 17) {
+        return .Nat;
+    }
+
+    // Rule 4: TCP to target IP -> Socks5 (proxy)
+    if (dst_ip == target_ip and protocol == 6) {
+        return .Socks5;
+    }
+
+    // Rule 5: Multicast (224.0.0.0/4) -> Drop
+    if ((dst_ip & 0xF0000000) == 0xE0000000) {
         return .Drop;
     }
 
-    // Only route target IP through SOCKS5 proxy
-    if (is_target) {
-        // TCP to target - SOCKS5 proxy
-        if (protocol == 6) {
-            return .Socks5;
-        }
-        // UDP to target - NAT
-        if (protocol == 17) {
-            return .Nat;
-        }
-        // Other protocols to target - drop
-        return .Drop;
-    }
-
-    // All other traffic - handle locally (normal routing)
+    // Rule 6: Default -> Local (normal routing through system)
     return .Local;
 }
 
@@ -235,6 +240,56 @@ fn detectEgressInterface(allocator: std.mem.Allocator, iface_name: []const u8) !
     std.debug.print("[tun2sock] Interface '{s}' has index {d}\n", .{iface_name, ifindex});
 
     return .{ .name = iface_name_z, .ip = 0, .ifindex = ifindex };
+}
+
+/// Configure system route to redirect traffic through TUN device
+///
+/// For transparent proxy:
+///   - Route target IP (111.45.11.5) to TUN device so packets arrive via TUN
+///   - This allows the router to intercept and process the traffic
+fn configureTunRoute(
+    target_ip: u32,
+    tun_ip: u32,
+    tun_ifindex: u32,
+) !void {
+    // Create route: target_ip/32 -> via tun_ip
+    // netmask 255.255.255.255 = 0xFFFFFFFF (single host route)
+    const netmask: u32 = 0xFFFFFFFF;
+
+    const route = network.ipv4Route(target_ip, netmask, tun_ip, tun_ifindex, 100);
+
+    std.debug.print("[tun2sock] Configuring route: target_ip -> TUN\n", .{});
+    std.debug.print("  Route: {d}.{d}.{d}.{d}/32 -> {d}.{d}.{d}.{d}\n", .{
+        (target_ip >> 24) & 0xFF, (target_ip >> 16) & 0xFF, (target_ip >> 8) & 0xFF, target_ip & 0xFF,
+        (tun_ip >> 24) & 0xFF, (tun_ip >> 16) & 0xFF, (tun_ip >> 8) & 0xFF, tun_ip & 0xFF,
+    });
+
+    // Delete existing route first (ignore errors)
+    network.deleteRoute(&route) catch {};
+
+    // Add new route
+    network.addRoute(&route) catch |err| {
+        std.debug.print("[tun2sock] Warning: Failed to add route: {}\n", .{err});
+        std.debug.print("[tun2sock] Manual route command:\n", .{});
+        const target_str = formatIpStr(target_ip);
+        const tun_str = formatIpStr(tun_ip);
+        std.debug.print("  sudo route -n delete {s} && sudo route -n add -net {s} -netmask 255.255.255.255 -gateway {s}\n", .{ target_str, target_str, tun_str });
+        return err;
+    };
+
+    std.debug.print("[tun2sock] Route configured successfully\n", .{});
+}
+
+/// Format IP address (network byte order) to string
+fn formatIpStr(ip: u32) [16]u8 {
+    var buf: [16]u8 = undefined;
+    _ = std.fmt.bufPrint(&buf, "{d}.{d}.{d}.{d}", .{
+        (ip >> 24) & 0xFF,
+        (ip >> 16) & 0xFF,
+        (ip >> 8) & 0xFF,
+        ip & 0xFF,
+    }) catch unreachable;
+    return buf;
 }
 
 /// Main entry point
@@ -326,6 +381,14 @@ pub fn main() !u8 {
 
     // Get TUN interface index
     const tun_ifindex = device.ifIndex() catch 0;
+    std.debug.print("TUN interface index: {d}\n", .{tun_ifindex});
+
+    // Configure system route: 111.45.11.5 -> TUN
+    // This makes packets to 111.45.11.5 arrive via the TUN device
+    const target_ip = (@as(u32, 111) << 24) | (@as(u32, 45) << 16) | (@as(u32, 11) << 8) | @as(u32, 5);
+    configureTunRoute(target_ip, tun_ip, tun_ifindex) catch {
+        std.debug.print("[tun2sock] Warning: Route configuration failed, continuing...\n", .{});
+    };
 
     // Create TUN configuration for router
     // Note: device_ops is not used - router uses raw fd for TUN operations
