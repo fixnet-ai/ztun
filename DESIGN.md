@@ -7,7 +7,7 @@ ztun is a pure Zig TUN device library with transparent proxy forwarding capabili
 - **ztun.tun** - Cross-platform TUN device operations
 - **ztun.ipstack** - Static IP protocol stack (TCP/UDP/ICMP)
 - **ztun.router** - Transparent proxy forwarding engine with libxev async I/O
-- **ztun.sysroute** - Cross-platform routing table management
+- **ztun.network** - Cross-platform routing and network interface management
 
 ## Architecture
 
@@ -19,7 +19,7 @@ ztun is a pure Zig TUN device library with transparent proxy forwarding capabili
 |                                                                     |
 |  - Parses command line arguments                                    |
 |  - Creates TUN device with DeviceBuilder                             |
-|  - Detects egress interface using sysroute module                   |
+|  - Detects egress interface using network module                   |
 |  - Implements route callback for routing decisions                  |
 |  - Implements isElevated() privilege check                          |
 |  - Passes all configuration to Router.init()                       |
@@ -67,11 +67,12 @@ ztun is a pure Zig TUN device library with transparent proxy forwarding capabili
 |  - Packet send/recv                                               |
 |  - MTU handling                                                   |
 +---------------------------------------------------------------------+
-|                     ztun.sysroute Layer                             |
-|  - Cross-platform routing table management                         |
-|  - BSD routing socket (macOS/FreeBSD)                             |
-|  - getIfaceIndex() for all platforms                              |
-|  - Route add/delete operations                                     |
+|                     ztun.network Layer                             |
+|  - Cross-platform routing and network interface management           |
+|  - Native system APIs (netlink/RoutingSockets/IP Helper)           |
+|  - getLocalIps() for all platforms                                  |
+|  - getPrimaryIp() to probe egress IP                                |
+|  - Route add/delete operations                                      |
 +---------------------------------------------------------------------+
 ```
 
@@ -116,7 +117,7 @@ ztun/
 │   │   └── proxy/
 │   │       └── socks5.zig    # SOCKS5 protocol helpers
 │   └── system/               # System utilities
-│       └── sysroute.zig      # Routing table management
+│       └── network.zig      # Routing and network interface management
 ├── tests/
 │   ├── test_framework.zig    # Shared test framework
 │   ├── test_unit.zig         # Unit tests
@@ -525,29 +526,66 @@ const Socks5Conn = struct {
 | Android | Yes | epoll | Yes | Same as Linux + createFromFd |
 | iOS | Yes | kqueue | Yes | Same as macOS + createFromFd |
 
-## sysroute Module
+## network Module
 
-Cross-platform routing table management:
+Cross-platform routing and network interface management using native system APIs (C implementation):
+
+**Architecture:**
+
+```
+src/system/
+├── network.c      # C implementation (platform detection, getifaddrs, netlink, routing sockets)
+├── network.h     # C header with route_entry_t struct and public API
+└── network.zig   # Zig FFI wrapper with RouteEntry, utility functions
+```
+
+**C API (network.c):**
+
+| Function | Platform | Description |
+|----------|----------|-------------|
+| `get_local_ips()` | All | Get all local IP addresses using getifaddrs/GetAdaptersAddresses |
+| `get_primary_ip()` | All | Probe primary egress IP via UDP socket |
+| `select_egress_ip_for_target()` | All | Find best egress IP for specific target |
+| `route_add()` | All | Add route via netlink/RoutingSockets/IPHelper |
+| `route_delete()` | All | Delete route via netlink/RoutingSockets/IPHelper |
+| `route_list()` | All | Query routing table |
+| `route_get_iface_index()` | All | Get interface index by name |
+
+**Platform-specific implementations:**
+
+| Platform | Routing API | Network Interface API |
+|----------|-------------|----------------------|
+| Linux | netlink (NETLINK_ROUTE) | getifaddrs() |
+| macOS/iOS | BSD routing sockets (PF_ROUTE) | getifaddrs() |
+| Windows | IP Helper API (iphlpapi.dll) | GetAdaptersAddresses() |
+
+**Zig wrapper (network.zig):**
 
 ```zig
-// Platform-specific implementations:
-pub fn getIfaceIndex(ifname: [*:0]const u8) RouteError!u32 {
-    // BSD: if_nametoindex()
-    // Linux: -1 (stub, use ioctl SIOCGIFINDEX)
-    // Windows: -1 (stub, use GetAdapterIndex)
-}
+pub const RouteEntry = extern struct {
+    family: RouteAddressFamily,
+    un: extern union {
+        ipv4: RouteIpv4,
+        ipv6: RouteIpv6,
+    },
+    iface_idx: u32,
+    metric: c_int,
+};
 
-pub fn routeAdd(route: *const RouteEntry) RouteError!void {
-    // BSD: Routing socket (RTM_ADD)
-    // Linux: Netlink (pending)
-    // Windows: IP Helper (pending)
-}
+/// Add single route
+pub fn addRoute(route: *const RouteEntry) !void;
 
-pub fn routeDelete(route: *const RouteEntry) RouteError!void {
-    // BSD: Routing socket (RTM_DELETE)
-    // Linux: Netlink (pending)
-    // Windows: IP Helper (pending)
-}
+/// Delete single route
+pub fn deleteRoute(route: *const RouteEntry) !void;
+
+/// Query routing table
+pub fn listRoutes(alloc: std.mem.Allocator) ![]RouteEntry;
+
+/// Get all local IP addresses
+pub fn getLocalIps(alloc: std.mem.Allocator) ![]IpInfo;
+
+/// Get primary egress IP
+pub fn getPrimaryIp(alloc: std.mem.Allocator) ![]u8;
 ```
 
 ## tun2sock Application
