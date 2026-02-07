@@ -345,7 +345,7 @@ fn configureIpv4(_: std.posix.fd_t, ifname: []const u8, address: Ipv4Address, pr
     _ = mtu;
 }
 
-fn configureIpv6(_: std.posix.fd_t, ifname: []const u8, address: Ipv6Address, _: u32) TunError!void {
+fn configureIpv6(_: std.posix.fd_t, ifname: []const u8, address: Ipv6Address, prefix: u32) TunError!void {
     const sock = std.posix.socket(AF_INET6, std.posix.SOCK.DGRAM, 0) catch {
         return error.IoError;
     };
@@ -363,6 +363,30 @@ fn configureIpv6(_: std.posix.fd_t, ifname: []const u8, address: Ipv6Address, _:
     const SIOCSIFADDR: c_ulong = 0x8020690c;
     if (ioctl(sock, SIOCSIFADDR, &req) < 0) {
         return error.IoError;
+    }
+
+    // For IPv6 /128 prefix (point-to-point), we need to set the peer/destination address
+    // macOS requires SIOCSIFDSTADDR for /128 to properly route traffic
+    if (prefix == 128) {
+        // Calculate peer address = address + 1 (network byte order)
+        var peer_addr = address;
+        peer_addr[15] +%= 1;
+
+        // macOS uses SIOCSIFDSTADDR for IPv6 via ifreq structure
+        var req6: ifreq = undefined;
+        @memset(@as([*]u8, @ptrCast(&req6))[0..@sizeOf(ifreq)], 0);
+        @memcpy(req6.ifr_name[0..ifname.len], ifname);
+
+        const dstaddr = @as(*sockaddr_in6, @alignCast(@ptrCast(&req6.ifr_ifru.addr)));
+        dstaddr.sin6_len = @sizeOf(sockaddr_in6);
+        dstaddr.sin6_family = AF_INET6;
+        // Copy peer address bytes
+        for (0..16) |i| {
+            dstaddr.sin6_addr[i] = peer_addr[i];
+        }
+
+        const SIOCSIFDSTADDR: c_ulong = 0x8020690e;
+        _ = ioctl(sock, SIOCSIFDSTADDR, &req6);
     }
 }
 

@@ -18,6 +18,13 @@ pub const Ipv4Network = struct {
     /// CIDR prefix length (0-32)
     prefix: u8,
     /// Optional peer/destination address for point-to-point interfaces
+    ///
+    /// NOTE: This field is primarily used for:
+    /// - macOS/iOS IPv6 /128 prefix: automatically set to address + 1
+    /// - IPv4 on all platforms: ignored (peer determined by routing table)
+    /// - Linux/Windows: ignored
+    ///
+    /// Most users can omit this field and rely on automatic handling.
     destination: ?Ipv4Address = null,
 };
 
