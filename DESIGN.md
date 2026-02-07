@@ -5,9 +5,9 @@
 ztun is a pure Zig TUN device library with transparent proxy forwarding capabilities. It provides four core components:
 
 - **ztun.tun** - Cross-platform TUN device operations
-- **ztun.ipstack** - Static IP protocol stack (TCP/UDP/ICMP)
+- **ztun.ipstack** - IP protocol utilities (IPv4/IPv6/TCP/UDP/ICMP parsing, checksum, etc.)
 - **ztun.router** - Transparent proxy forwarding engine with libxev async I/O
-- **ztun.sysroute** - Cross-platform routing table management (route commands)
+- **ztun.system** - System utilities (routing table, network interfaces via C)
 
 ## Architecture
 
@@ -19,7 +19,7 @@ ztun is a pure Zig TUN device library with transparent proxy forwarding capabili
 |                                                                     |
 |  - Parses command line arguments                                    |
 |  - Creates TUN device with TunDevice interface                      |
-|  - Detects egress interface using sysroute module                   |
+|  - Detects egress interface using system module                   |
 |  - Implements route callback for routing decisions                  |
 |  - Implements isElevated() privilege check                          |
 |  - Passes all configuration to Router.init()                       |
@@ -37,7 +37,7 @@ ztun is a pure Zig TUN device library with transparent proxy forwarding capabili
 |  +-----------------------------------------------------------+     |
 |  +-----------------------------------------------------------+     |
 |  |  Router Core Components                                  |     |
-|  |  - Route callback interface (from application)           |     |
+|  |  - Route callback interface (from application)            |     |
 |  |  - NAT session table (UDP forwarding)                   |     |
 |  |  - SOCKS5 proxy connection manager                      |     |
 |  |  - Raw socket for direct forwarding                     |     |
@@ -83,14 +83,31 @@ ztun is a pure Zig TUN device library with transparent proxy forwarding capabili
 |  |  - handler.zig  - Packet handler interface               |     |
 |  +-----------------------------------------------------------+     |
 +---------------------------------------------------------------------+
-|                     ztun.sysroute Layer                             |
-|  - Cross-platform routing table management                         |
-|  - Linux: "ip route" command                                       |
-|  - BSD (macOS/iOS): "route" command                                |
-|  - Windows: "route" command (stub)                                 |
-|  - getIfaceIndex() using if_nametoindex()                          |
+|                     ztun.system Layer                                |
+|  - Cross-platform routing table management (C implementation)     |
+|  - Network interface utilities                                      |
+|  - route.c/route.h - Route table management                        |
+|  - network.c/network.zig - Interface utilities                     |
 +---------------------------------------------------------------------+
 ```
+
+## Platform Support
+
+| Platform | TUN Type     | Event Loop | Zero-Copy | Header  | Notes            |
+|----------|--------------|------------|-----------|---------|------------------|
+| Linux    | /dev/net/tun | epoll      | Yes       | 0 bytes | Standard TUN/TAP |
+| macOS    | utun socket  | kqueue     | Yes       | 4 bytes | AF_INET header   |
+| Windows  | Wintun DLL   | IOCP       | Yes       | 0 bytes | Ring buffer I/O  |
+| Android  | /dev/net/tun | epoll      | Yes       | 0 bytes | Same as Linux    |
+| iOS      | utun socket  | kqueue     | Yes       | 4 bytes | Same as macOS    |
+
+### Zero-Copy Implementation
+
+All platforms use zero-copy I/O via pre-allocated static buffers:
+
+- **Read**: Direct read into `packet_buf` (no malloc/free per packet)
+- **Write**: Direct write from `write_buf` (no temporary allocations)
+- **libxev**: Async I/O with completion callbacks
 
 ## Key Design Principles
 
@@ -157,14 +174,14 @@ ztun/
 │   ├── tun2sock.zig          # Standalone TUN to SOCKS5 forwarding app
 │   ├── tun/                  # TUN device module
 │   │   ├── mod.zig           # Main TUN interface (platform dispatch)
-│   │   ├── options.zig       # TUN configuration options
-│   │   ├── device.zig        # TunDevice/DeviceOps interfaces & Device type
+│   │   ├── options.zig        # TUN configuration options
+│   │   ├── device.zig         # TunDevice/DeviceOps interfaces & Device type
 │   │   ├── device_linux.zig  # Linux/Android implementation
 │   │   ├── device_darwin.zig # macOS/iOS implementation
 │   │   ├── device_windows.zig # Windows implementation
 │   │   ├── device_ios.zig    # iOS PacketFlow wrapper
-│   │   ├── tun_stack.zig         # TunStack interface
-│   │   └── handler.zig       # PacketHandler interface
+│   │   ├── tun_stack.zig     # TunStack interface
+│   │   └── handler.zig        # PacketHandler interface
 │   ├── ipstack/              # IP protocol stack
 │   │   ├── mod.zig           # IP stack entry
 │   │   ├── checksum.zig      # Internet checksum
@@ -173,21 +190,31 @@ ztun/
 │   │   ├── tcp.zig           # TCP protocol
 │   │   ├── udp.zig           # UDP protocol
 │   │   ├── icmp.zig          # ICMP protocol
-│   │   ├── connection.zig    # TCP connection tracking
-│   │   └── callbacks.zig     # Protocol callbacks
+│   │   ├── connection.zig     # TCP connection tracking
+│   │   ├── callbacks.zig     # Protocol callbacks
+│   │   └── stack_core.zig    # SystemStack protocol test
 │   ├── router/               # Forwarding engine
 │   │   ├── mod.zig           # Router main module (libxev integration)
 │   │   ├── route.zig         # Route types and config
 │   │   ├── nat.zig           # UDP NAT session table
 │   │   └── proxy/
 │   │       └── socks5.zig    # SOCKS5 protocol helpers
-│   └── system/               # System utilities
-│       └── sysroute.zig      # Routing table management (route commands)
+│   └── system/               # System utilities (C implementation)
+│       ├── network.zig        # Network interface utilities
+│       ├── network.c          # Network interface C implementation
+│       ├── route.h            # Route API header
+│       └── route.c            # Route table management (cross-platform)
 ├── tests/
-│   ├── test_framework.zig    # Shared test framework
-│   ├── test_unit.zig         # Unit tests
-│   ├── test_runner.zig       # Integration tests
-│   └── test_tun.zig          # Ping echo test
+│   ├── test_unit.zig         # Unit tests (Zig test {} blocks)
+│   ├── test_runner.zig       # Integration tests (executable)
+│   ├── test_tun.zig          # Ping echo test
+│   ├── test_forwarding.zig    # TCP/UDP/SOCKS5 forwarding test
+│   ├── test_integration.zig   # Full integration test
+│   ├── test_stack_core.zig   # SystemStack protocol test
+│   ├── test_android.zig      # Android platform test
+│   ├── test_ios.zig          # iOS platform test
+│   ├── endianness_test.zig   # Endianness utilities test
+│   └── tun_read_test.zig     # TUN read performance test
 ├── build.zig                 # Zig build script
 ├── build.zig.zon             # Build dependencies
 └── DESIGN.md                 # This document
@@ -588,58 +615,37 @@ const Socks5Conn = struct {
 };
 ```
 
-## Platform Support
-
-| Platform | TUN Type | Event Loop | Zero-Copy | Header | Notes |
-|----------|----------|------------|-----------|--------|-------|
-| Linux | /dev/net/tun | epoll | Yes | 0 bytes | Standard TUN/TAP |
-| macOS | utun socket | kqueue | Yes | 4 bytes | AF_INET header |
-| Windows | Wintun DLL | IOCP | Yes | 0 bytes | Ring buffer I/O |
-| Android | /dev/net/tun | epoll | Yes | 0 bytes | Same as Linux |
-| iOS | utun socket | kqueue | Yes | 4 bytes | Same as macOS |
-
-### Zero-Copy Implementation
-
-All platforms use zero-copy I/O via pre-allocated static buffers:
-
-- **Read**: Direct read into `packet_buf` (no malloc/free per packet)
-- **Write**: Direct write from `write_buf` (no temporary allocations)
-- **libxev**: Async I/O with completion callbacks
-
 ## sysroute Module
 
-Cross-platform routing table management using route commands:
+Cross-platform routing table management using C implementation with command execution:
 
-```zig
-pub const RouteError = error{
-    InvalidArgument,
-    IoError,
-    NotFound,
-    PermissionDenied,
-    NotSupported,
-    Unknown,
-};
+**Files:**
+- `src/system/route.h` - Route API header
+- `src/system/route.c` - Route table management implementation
+- `src/system/network.h` - Network interface utilities (C)
+- `src/system/network.zig` - Network interface utilities (Zig wrapper)
 
-/// Create IPv4 route entry
-pub fn createIpv4Route(dst_ip: u32, prefix: u6, gateway_ip: u32, iface_idx: u32, _: u32) RouteEntry;
+```c
+// route.h - Route entry structure
+typedef struct {
+    uint32_t dst_ip;
+    uint8_t prefix;
+    uint32_t gateway_ip;
+    uint32_t iface_idx;
+    uint32_t metric;
+} RouteEntry;
 
-/// Add a route to the system routing table
-pub fn routeAdd(route: ?*const RouteEntry) RouteError!void;
+// Platform-specific commands:
+typedef enum {
+    ROUTE_PLATFORM_LINUX,
+    ROUTE_PLATFORM_BSD,    // macOS/iOS
+    ROUTE_PLATFORM_WINDOWS,
+} RoutePlatform;
 
-/// Delete a route from the system routing table
-pub fn routeDelete(route: ?*const RouteEntry) RouteError!void;
-
-/// Get interface index from interface name
-pub fn getIfaceIndex(ifname: [*:0]const u8) RouteError!u32;
+int route_add(RouteEntry *entry, RoutePlatform platform);
+int route_delete(RouteEntry *entry, RoutePlatform platform);
+uint32_t get_iface_index(const char *ifname);
 ```
-
-**Platform-specific commands:**
-
-| Platform | Add Command | Delete Command |
-|----------|-------------|----------------|
-| Linux | `ip route add <dst> via <gw>` | `ip route del <dst>` |
-| BSD | `route add -net <dst> -netmask <mask> <gw>` | `route delete -net <dst> -netmask <mask>` |
-| Windows | (stub) | (stub) |
 
 ## Platform Implementation Details
 
