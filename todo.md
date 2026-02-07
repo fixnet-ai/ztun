@@ -1,182 +1,124 @@
 # ztun Development Todo List
 
-## Current Status
-
-**Last Updated**: 2026-02-07
-
-**Build Status**: All components compiling
-- `zig build` - PASSED
-- `zig build test-stack` - PASSED
-- `zig build test-integration` - PASSED
+**Version**: 0.1.4
+**Last Updated**: 2026-02-08
 
 ---
 
-## Linux TUN Testing Plan
+## Release v0.1.4 - Cross-Platform Testing
 
-### Test Strategy
-**Approach**: Cross-compile on macOS → Run in Lima Linux VM
+**Date**: 2026-02-08
 
-### Build Commands (macOS)
+### Changes
+- Fixed cross-compilation output paths for Linux/Windows targets
+- Fixed Windows deployment script to recognize `windows/` directory
+- Updated Lima VM and Windows VM testing workflows
+- All tests passing on Linux x86_64 (Lima VM) and Windows x86_64
 
-```bash
-# Build SystemStack test for Linux x86_64
-zig build test-stack -Dtarget=x86_64-linux-gnu
+### Test Results
 
-# Build integration test for Linux x86_64
-zig build test -Dtarget=x86_64-linux-gnu
-
-# Build test_runner for Linux x86_64
-zig build test -Dtarget=x86_64-linux-gnu
-
-# Build tun2sock for Linux x86_64
-zig build tun2sock -Dtarget=x86_64-linux-gnu
-```
-
-### Lima VM Commands
-
-```bash
-# Start Lima VM
-.lima/lima-start.sh
-
-# Run tests directly (macOS directory is auto-mounted to Lima VM)
-# Note: Lima auto-mounts macOS home directory to /Users/<username> in VM
-.lima/lima-exec.sh sudo /Users/modasi/works/2025/fixnet/ztun/zig-out/bin/x86_64-linux-gnu/test_stack_core
-.lima/lima-exec.sh sudo /Users/modasi/works/2025/fixnet/ztun/zig-out/bin/x86_64-linux-gnu/test_runner
-
-# Or enter shell and run
-.lima/lima-shell.sh
-cd /Users/modasi/works/2025/fixnet/ztun
-sudo ./zig-out/bin/x86_64-linux-gnu/test_stack_core
-sudo ./zig-out/bin/x86_64-linux-gnu/test_runner
-```
-
-### Test Scenarios
-
-| # | Test | Description | Expected Result |
-|---|------|-------------|-----------------|
-| 1 | TUN Device Creation | Create `/dev/net/tun` interface | Device created successfully |
-| 2 | IPv4 Configuration | Set local IP 10.0.0.1/24 | IP configured correctly |
-| 3 | Packet Send | Send ICMP/UDP/TCP packets | Packets sent without error |
-| 4 | Packet Receive | Receive packets from TUN | Packets received correctly |
-| 5 | SystemStack Process | Process packets through stack | Protocol callbacks invoked |
-| 6 | Statistics | Verify packet counters | Counters increment correctly |
-
-### Key Differences (Linux vs macOS)
-
-| Aspect | macOS | Linux |
-|--------|-------|-------|
-| Device | `utunX` (BSD) | `/dev/net/tun` |
-| Header | 4-byte AF_INET header | No header (raw IP) |
-| API | `ioctl()` with `SIOC*` | `ioctl()` with `TUNSET*` |
-| Permissions | `com.apple.net.utun` entitlement | `CAP_NET_ADMIN` capability |
-
-### Debug Commands (Lima VM)
-
-```bash
-# Check TUN device
-ls -la /dev/net/tun
-
-# View interface
-ip addr show tun0
-ip link show tun0
-
-# Capture traffic
-tcpdump -i tun0 -w /tmp/tun_capture.pcap
-
-# Trace system calls
-strace -f -e trace=openat,ioctl ./test_stack_core
-```
-
-### Verification Checklist
-
-- [ ] `/dev/net/tun` exists and is readable
-- [ ] TUN device created without error
-- [ ] IPv4 address configured (10.0.0.1)
-- [ ] Packet send succeeds (ICMP/UDP/TCP)
-- [ ] Packet receive succeeds (if loopback works)
-- [ ] SystemStack processes packets
-- [ ] No memory leaks detected
-- [ ] All tests pass
-
----
-
-## Active Tasks
-
-| Task | Priority | Status | Notes |
-|------|----------|--------|-------|
-| Linux TUN testing | High | Pending | Lima VM testing |
-| Windows TUN testing | High | Pending | Windows VM testing |
-
----
-
-## Completed Tasks
-
-| Task | Status | Date |
-|------|--------|------|
-| stack_core.zig (renamed from stack_system.zig) | ✅ Complete | 2026-02-07 |
-| tun_stack.zig (renamed from stack.zig) | ✅ Complete | 2026-02-07 |
-| Zig 0.13.0 compatibility fixes | ✅ Complete | 2026-02-07 |
-| test_stack_system.zig | ✅ Complete | 2026-02-07 |
-| TCP forwarding tests | ✅ Complete | 2026-02-07 |
-| UDP NAT tests | ✅ Complete | 2026-02-07 |
-| SOCKS5 proxy tests | ✅ Complete | 2026-02-07 |
-| test_integration.zig | ✅ Complete | 2026-02-07 |
-| IPv6 /128 peer handling | ✅ Complete | 2026-02-07 |
-| IP address configuration | ✅ Complete | 2026-02-07 |
-
----
-
-## Test Coverage
-
-| Category | Tests | Status |
-|----------|-------|--------|
-| TCP Forwarding | 5 | ✅ Pass |
-| UDP NAT | 4 | ✅ Pass |
-| SOCKS5 Proxy | 7 | ✅ Pass |
-| Route Decision | 2 | ✅ Pass |
-| SystemStack | 1 | ✅ Pass |
-| **Total** | **19** | ✅ All Pass |
+| Platform | Target | Test | Result |
+|----------|--------|------|--------|
+| macOS | Native | ztun_test_runner | 16/16 PASSED |
+| Linux x86_64 | Lima VM | test_stack_core | PASSED |
+| Linux x86_64 | Lima VM | ztun_test_runner | 16/16 PASSED |
+| Windows x86_64 | VM | ztun_test_runner | 16/16 PASSED |
 
 ---
 
 ## Build Commands
 
 ```bash
-# Default build
-zig build
+# Native (macOS)
+zig build              # Build + run unit tests
+zig build test         # Build test_runner to bin/macos/
 
-# Run integration tests
-zig build test-integration
-sudo ./zig-out/bin/macos/test_integration
+# Cross-compile to Linux
+zig build test -Dtarget=x86_64-linux-gnu
 
-# Build forwarding test
-zig build test-forwarding
-sudo ./zig-out/bin/macos/test_forwarding
+# Cross-compile to Windows
+zig build test -Dtarget=x86_64-windows-gnu
 
-# Build TUN test
-zig build test-tun
-sudo ./zig-out/bin/macos/test_tun
+# Other test binaries
+zig build test-stack       # test_stack_core
+zig build test-tun         # test_tun
+zig build test-forwarding  # test_forwarding
+zig build test-integration # test_integration
+```
 
-# Build SystemStack test
-zig build test-stack
-sudo ./zig-out/bin/macos/test_stack_system
+## VM Testing
+
+### Linux (Lima VM)
+
+```bash
+# Start VM
+.lima/lima-start.sh
+
+# Run tests (macOS dir auto-mounted)
+.lima/lima-exec.sh sudo /Users/modasi/works/2025/fixnet/ztun/zig-out/bin/linux-gnu/ztun_test_runner
+.lima/lima-exec.sh sudo /Users/modasi/works/2025/fixnet/ztun/zig-out/bin/linux-gnu/test_stack_core
+```
+
+### Windows VM
+
+```bash
+# Deploy
+.windows/windows-deploy.sh
+
+# Run
+.windows/windows-exec.sh ztun_test_runner
 ```
 
 ---
 
-## Reference Documentation
+## Project Structure
 
-| Document | Purpose |
-|----------|---------|
-| `DESIGN.md` | System architecture |
-| `zig.codegen.md` | Zig code generation & debugging |
-| `build_tools/README.md` | Build system |
-| `docs/test-framework.md` | Testing standards |
-
----
-
-## Notes
-
-- All development experience documented in `zig.codegen.md`
-- Testing and debugging guide in `zig.codegen.md`
-- BSD routing issues resolved with workaround (see `zig.codegen.md`)
+```
+ztun/
+├── src/
+│   ├── main.zig              # Library entry point
+│   ├── tun2sock.zig          # TUN to SOCKS5 forwarding app
+│   ├── tun/                  # TUN device module
+│   │   ├── mod.zig          # Main module
+│   │   ├── device.zig       # TunDevice/DeviceOps interfaces
+│   │   ├── device_linux.zig # Linux implementation
+│   │   ├── device_darwin.zig # macOS/iOS implementation
+│   │   ├── device_windows.zig # Windows implementation
+│   │   ├── device_ios.zig   # iOS PacketFlow wrapper
+│   │   ├── options.zig     # TUN configuration
+│   │   ├── tun_stack.zig    # TunStack interface
+│   │   └── handler.zig      # PacketHandler interface
+│   ├── router/               # Forwarding engine
+│   │   ├── mod.zig          # Router with libxev
+│   │   ├── route.zig        # Route types
+│   │   ├── nat.zig          # UDP NAT table
+│   │   └── proxy/socks5.zig # SOCKS5 protocol
+│   ├── ipstack/              # IP protocol stack
+│   │   ├── mod.zig          # IP stack entry
+│   │   ├── checksum.zig     # Internet checksum
+│   │   ├── ipv4.zig         # IPv4 parsing/building
+│   │   ├── ipv6.zig         # IPv6 parsing/building
+│   │   ├── tcp.zig          # TCP protocol
+│   │   ├── udp.zig          # UDP protocol
+│   │   ├── icmp.zig         # ICMP protocol
+│   │   ├── connection.zig   # TCP connection state
+│   │   ├── callbacks.zig     # Protocol callbacks
+│   │   └── stack_core.zig   # SystemStack test
+│   └── system/              # System utilities
+│       ├── sysroute.zig     # Routing table
+│       └── network.zig      # Network interfaces
+├── tests/
+│   ├── test_framework.zig    # Shared test framework
+│   ├── test_unit.zig         # Unit tests
+│   ├── test_runner.zig       # Integration tests
+│   ├── test_tun.zig          # Ping echo test
+│   ├── test_stack_core.zig   # SystemStack test
+│   ├── test_forwarding.zig    # TCP/UDP/SOCKS5 test
+│   └── test_integration.zig   # Full integration test
+├── build.zig                 # Build script
+├── build.zig.zon            # Build dependencies
+├── CLAUDE.md                # Project rules
+├── README.md                # Quick start guide
+├── DESIGN.md                # Architecture docs
+└── todo.md                  # This file
+```

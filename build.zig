@@ -257,9 +257,10 @@ pub fn build(b: *std.Build) void {
     tun2sock.root_module.addImport("signal", zinternal.module("signal"));
     tun2sock.root_module.addImport("config", zinternal.module("config"));
     tun2sock.root_module.addImport("storage", zinternal.module("storage"));
-    // Install to bin/macos/
+    // Install to bin/linux-gnu/ for cross-compiled targets
+    const bin_dir = if (target.result.os.tag == .linux) "bin/linux-gnu" else "bin/macos";
     const tun2sock_install = b.addInstallArtifact(tun2sock, .{
-        .dest_dir = .{ .override = .{ .custom = b.dupe("bin/macos") } },
+        .dest_dir = .{ .override = .{ .custom = bin_dir } },
     });
     tun2sock_step.dependOn(&tun2sock_install.step);
 
@@ -285,9 +286,10 @@ pub fn build(b: *std.Build) void {
     }
     // Add libxev dependency
     test_tun.root_module.addImport("xev", libxev.module("xev"));
-    // Install to bin/macos/
+    // Install to bin/linux-gnu/ for cross-compiled targets
+    const test_tun_bin_dir = if (target.result.os.tag == .linux) "bin/linux-gnu" else "bin/macos";
     const test_tun_install = b.addInstallArtifact(test_tun, .{
-        .dest_dir = .{ .override = .{ .custom = b.dupe("bin/macos") } },
+        .dest_dir = .{ .override = .{ .custom = test_tun_bin_dir } },
     });
     test_tun_step.dependOn(&test_tun_install.step);
 
@@ -311,7 +313,7 @@ pub fn build(b: *std.Build) void {
     }
     test_forwarding.root_module.addImport("xev", libxev.module("xev"));
     const test_forwarding_install = b.addInstallArtifact(test_forwarding, .{
-        .dest_dir = .{ .override = .{ .custom = b.dupe("bin/macos") } },
+        .dest_dir = .{ .override = .{ .custom = b.dupe(if (target.result.os.tag == .linux) "bin/linux-gnu" else "bin/macos") } },
     });
     test_forwarding_step.dependOn(&test_forwarding_install.step);
 
@@ -335,7 +337,7 @@ pub fn build(b: *std.Build) void {
     }
     test_integration.root_module.addImport("xev", libxev.module("xev"));
     const test_integration_install = b.addInstallArtifact(test_integration, .{
-        .dest_dir = .{ .override = .{ .custom = b.dupe("bin/macos") } },
+        .dest_dir = .{ .override = .{ .custom = b.dupe(if (target.result.os.tag == .linux) "bin/linux-gnu" else "bin/macos") } },
     });
     test_integration_step.dependOn(&test_integration_install.step);
 
@@ -359,7 +361,7 @@ pub fn build(b: *std.Build) void {
     }
     test_stack.root_module.addImport("xev", libxev.module("xev"));
     const test_stack_install = b.addInstallArtifact(test_stack, .{
-        .dest_dir = .{ .override = .{ .custom = b.dupe("bin/macos") } },
+        .dest_dir = .{ .override = .{ .custom = b.dupe(if (target.result.os.tag == .linux) "bin/linux-gnu" else "bin/macos") } },
     });
     test_stack_step.dependOn(&test_stack_install.step);
 

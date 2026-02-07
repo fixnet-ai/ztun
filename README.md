@@ -88,8 +88,21 @@ rt.run();
 ```bash
 zig build              # Build native library + run unit tests
 zig build test         # Build test_runner to bin/macos/ (requires sudo)
+zig build test-stack   # Build test_stack_core to bin/macos/
 zig build all          # Build static libraries for all targets to lib/{target}/
 zig build all-tests    # Build test_runner for all targets to bin/{target}/
+zig build tun2sock     # Build tun2sock application
+zig build test-tun     # Build ping echo test
+```
+
+### Cross-Compile
+
+```bash
+# Linux x86_64
+zig build test -Dtarget=x86_64-linux-gnu
+
+# Windows x86_64
+zig build test -Dtarget=x86_64-windows-gnu
 ```
 
 ### Output Structure
@@ -102,9 +115,10 @@ zig-out/
 │   ├── aarch64-macos/libztun.a
 │   └── ...
 └── bin/                    # Test executables by platform
-    ├── x86_64-linux-gnu/ztun_test_runner
-    ├── x86_64-windows-gnu/ztun_test_runner.exe
-    ├── x86_64-macos/ztun_test_runner
+    ├── linux-gnu/ztun_test_runner
+    ├── linux-gnu/test_stack_core
+    ├── windows/ztun_test_runner.exe
+    ├── macos/ztun_test_runner
     └── ...
 ```
 
@@ -120,10 +134,10 @@ sudo ./zig-out/bin/macos/ztun_test_runner
 
 ```bash
 # Build for Linux
-zig build -Dtarget=x86_64-linux-gnu
+zig build test -Dtarget=x86_64-linux-gnu
 
 # Run on Lima VM (via shared directory)
-.lima/lima-exec.sh sudo /Users/modasi/works/2025/fixnet/ztun/zig-out/bin/x86_64-linux-gnu/ztun_test_runner
+.lima/lima-exec.sh sudo /Users/modasi/works/2025/fixnet/ztun/zig-out/bin/linux-gnu/ztun_test_runner
 ```
 
 ### Windows VM
@@ -133,7 +147,7 @@ zig build -Dtarget=x86_64-linux-gnu
 .windows/windows-deploy.sh
 
 # Run on Windows VM
-.windows/windows-exec.sh
+.windows/windows-exec.sh ztun_test_runner
 ```
 
 ## macOS Notes
@@ -165,16 +179,14 @@ ztun/
 │   │   ├── device_darwin.zig # macOS/iOS implementation
 │   │   ├── device_windows.zig # Windows implementation
 │   │   ├── device_ios.zig    # iOS PacketFlow wrapper
-│   │   ├── tun_stack.zig         # TunStack interface
+│   │   ├── tun_stack.zig     # TunStack interface
 │   │   └── handler.zig       # PacketHandler interface
-│   │
 │   ├── router/               # Forwarding engine
 │   │   ├── mod.zig           # Router with libxev async I/O
 │   │   ├── route.zig         # Route types and configuration
 │   │   ├── nat.zig           # UDP NAT session table
 │   │   └── proxy/
 │   │       └── socks5.zig    # SOCKS5 protocol helpers
-│   │
 │   ├── ipstack/              # Pure Zig IP stack
 │   │   ├── mod.zig           # IP stack entry
 │   │   ├── checksum.zig      # Internet checksum
@@ -184,21 +196,24 @@ ztun/
 │   │   ├── udp.zig           # UDP protocol utilities
 │   │   ├── icmp.zig          # ICMP protocol utilities
 │   │   ├── connection.zig    # TCP connection state machine
-│   │   └── callbacks.zig     # Callback interface definitions
-│   │
+│   │   ├── callbacks.zig      # Callback interface definitions
+│   │   └── stack_core.zig    # SystemStack protocol test
 │   └── system/               # System utilities
-│       └── sysroute.zig      # Routing table management
-│
+│       ├── sysroute.zig      # Routing table management
+│       └── network.zig        # Network interface utilities
 ├── tests/
+│   ├── test_framework.zig    # Shared test framework
 │   ├── test_unit.zig         # Unit tests (Zig test blocks)
-│   ├── test_runner.zig      # Integration tests (executable)
-│   └── test_tun.zig         # Ping echo test
-│
-├── docs/
-│   └── DESIGN.md            # Architecture documentation
-│
+│   ├── test_runner.zig       # Integration tests (executable)
+│   ├── test_tun.zig          # Ping echo test
+│   ├── test_stack_core.zig   # SystemStack protocol test
+│   ├── test_forwarding.zig    # TCP/UDP/SOCKS5 forwarding test
+│   └── test_integration.zig   # Full integration test
 ├── build.zig                 # Zig build script
-└── README.md                 # This file
+├── build.zig.zon            # Build dependencies
+├── CLAUDE.md                # Project development rules
+├── README.md                # This file
+└── DESIGN.md                # Architecture documentation
 ```
 
 ## API Reference
