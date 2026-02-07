@@ -218,6 +218,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     tun2sock.linkLibC();
+    // Add C source files (route.c, network.c)
+    tun2sock.root_module.addCSourceFiles(.{
+        .files = config.c_sources,
+        .flags = config.cflags,
+    });
+    tun2sock.root_module.addSystemIncludePath(.{ .cwd_relative = "src" });
     // Add Zig modules
     const all_modules = framework.createModules(b, config);
     var tun2sock_iter = all_modules.map.iterator();
@@ -278,6 +284,30 @@ pub fn build(b: *std.Build) void {
         .dest_dir = .{ .override = .{ .custom = b.dupe("bin/macos") } },
     });
     test_tun_step.dependOn(&test_tun_install.step);
+
+    // Build forwarding integration test executable
+    const test_forwarding_step = b.step("test-forwarding", "Build TCP/UDP/SOCKS5 forwarding test");
+    const test_forwarding = b.addExecutable(.{
+        .name = "test_forwarding",
+        .root_source_file = b.path("tests/test_forwarding.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_forwarding.linkLibC();
+    test_forwarding.root_module.addCSourceFiles(.{
+        .files = config.c_sources,
+        .flags = config.cflags,
+    });
+    test_forwarding.root_module.addSystemIncludePath(.{ .cwd_relative = "src" });
+    var test_forwarding_iter = all_modules.map.iterator();
+    while (test_forwarding_iter.next()) |entry| {
+        test_forwarding.root_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    }
+    test_forwarding.root_module.addImport("xev", libxev.module("xev"));
+    const test_forwarding_install = b.addInstallArtifact(test_forwarding, .{
+        .dest_dir = .{ .override = .{ .custom = b.dupe("bin/macos") } },
+    });
+    test_forwarding_step.dependOn(&test_forwarding_install.step);
 
     // Build all static library targets (no tests)
     const all_targets_step = b.step("all", "Build static libraries for all supported targets");

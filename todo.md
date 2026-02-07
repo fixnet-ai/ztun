@@ -91,10 +91,10 @@ sudo ./zig-out/bin/macos/test_forwarding  # Run test
 
 ```
 $ sudo ./zig-out/bin/macos/test_tun
-=== SIMULATED PING TEST COMPLETED ===
-Result: SUCCESS (simulated roundtrip)
-Note: macOS utun does not support packet loopback.
-      The packet format and routing are verified correct.
+=== PACKET FORMAT VERIFICATION TEST ===
+Result: SUCCESS
+Note: Packet format and checksums verified correct.
+      Full roundtrip requires correct route configuration.
 
 $ sudo ./tun2sock --help
 === ztun tun2sock - Transparent Proxy Forwarder ===
