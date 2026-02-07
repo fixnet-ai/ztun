@@ -309,6 +309,30 @@ pub fn build(b: *std.Build) void {
     });
     test_forwarding_step.dependOn(&test_forwarding_install.step);
 
+    // Build full integration test executable (TCP/UDP/SOCKS5)
+    const test_integration_step = b.step("test-integration", "Build full integration test");
+    const test_integration = b.addExecutable(.{
+        .name = "test_integration",
+        .root_source_file = b.path("tests/test_integration.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_integration.linkLibC();
+    test_integration.root_module.addCSourceFiles(.{
+        .files = config.c_sources,
+        .flags = config.cflags,
+    });
+    test_integration.root_module.addSystemIncludePath(.{ .cwd_relative = "src" });
+    var test_integration_iter = all_modules.map.iterator();
+    while (test_integration_iter.next()) |entry| {
+        test_integration.root_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    }
+    test_integration.root_module.addImport("xev", libxev.module("xev"));
+    const test_integration_install = b.addInstallArtifact(test_integration, .{
+        .dest_dir = .{ .override = .{ .custom = b.dupe("bin/macos") } },
+    });
+    test_integration_step.dependOn(&test_integration_install.step);
+
     // Build all static library targets (no tests)
     const all_targets_step = b.step("all", "Build static libraries for all supported targets");
     const build_all = framework.buildAllTargets(b, optimize, config, &framework.standard_targets, &framework.standard_target_names);
