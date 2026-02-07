@@ -481,7 +481,7 @@ pub fn addRoute(device_ptr: *anyopaque, destination: Ipv4Address, gateway: Ipv4A
     _ = destination;
     _ = gateway;
     _ = prefix_len;
-    // Routes are handled by the caller via sysroute
+    // Routes are handled by the caller via network module
     return error.NotSupported;
 }
 

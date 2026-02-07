@@ -32,7 +32,8 @@ const framework = @import("build_tools/build_framework.zig");
 // ==================== Project Configuration ====================
 
 const c_sources = &[_][]const u8{
-    // No C sources - pure Zig implementation
+    "src/system/route.c",
+    "src/system/network.c",
 };
 
 const cflags = &[_][]const u8{
@@ -156,8 +157,13 @@ const zig_modules = &[_]framework.ZigModule{
     },
     // System modules (all in src/system/)
     .{
-        .name = "sysroute",
-        .file = "src/system/sysroute.zig",
+        .name = "network",
+        .file = "src/system/network.zig",
+        .deps = &[_][]const u8{},
+    },
+    .{
+        .name = "network",
+        .file = "src/system/network.zig",
         .deps = &[_][]const u8{},
     },
 };
@@ -254,7 +260,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     test_tun.linkLibC();
-    // Add Zig modules
+    // Add C source files (route.c, network.c)
+    test_tun.root_module.addCSourceFiles(.{
+        .files = config.c_sources,
+        .flags = config.cflags,
+    });
+    test_tun.root_module.addSystemIncludePath(.{ .cwd_relative = "src" });
+    // Add Zig modules (includes network)
     var test_tun_iter = all_modules.map.iterator();
     while (test_tun_iter.next()) |entry| {
         test_tun.root_module.addImport(entry.key_ptr.*, entry.value_ptr.*);

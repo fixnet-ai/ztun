@@ -28,7 +28,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const tun = @import("tun");
 const router = @import("router");
-const sysroute = @import("sysroute");
+const network = @import("network");
 
 // POSIX geteuid for Unix systems
 extern "c" fn geteuid() callconv(.C) c_uint;
@@ -221,13 +221,13 @@ fn routeCallback(
     return .Local;
 }
 
-// Detect default egress interface using sysroute API
+// Detect default egress interface using network API
 fn detectEgressInterface(allocator: std.mem.Allocator, iface_name: []const u8) !struct { name: [:0]const u8, ip: u32, ifindex: u32 } {
-    // Convert to null-terminated string for sysroute API
+    // Convert to null-terminated string for network API
     const iface_name_z = try allocator.dupeZ(u8, iface_name);
 
     // Get interface index from system
-    const ifindex = sysroute.getIfaceIndex(iface_name_z) catch {
+    const ifindex = network.getInterfaceIndex(iface_name_z) catch {
         std.debug.print("[tun2sock] Warning: Failed to get interface index for '{s}', using 1\n", .{iface_name});
         return .{ .name = iface_name_z, .ip = 0, .ifindex = 1 };
     };
@@ -276,7 +276,7 @@ pub fn main() !u8 {
     std.debug.print("  Proxy IP:     0x{X}\n", .{proxy.ip});
     std.debug.print("  Proxy Port:   {d}\n\n", .{proxy.port});
 
-    // Detect egress interface using sysroute API
+    // Detect egress interface using network API
     const egress_iface_name = if (args.egress_iface.len > 0) args.egress_iface else "en0";
     const egress = try detectEgressInterface(allocator, egress_iface_name);
 

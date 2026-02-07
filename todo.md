@@ -5,7 +5,34 @@
 
 Reference: sing-tun + sing-box cross-platform TUN implementation
 
-Last Updated: 2026-02-06
+Last Updated: 2026-02-07
+
+---
+
+## Current Progress
+
+### BSD Routing Socket Debugging - COMPLETED with Workaround
+
+**Issue**: Raw routing socket write fails in Zig with EOPNOTSUPP (errno=39) even with message format identical to working C code.
+
+**Solution**: Implemented fallback to external `route` command when raw socket fails.
+
+**Files Modified**:
+- `src/system/sysroute.zig` - Added `bsdRouteCommandAdd()` fallback function
+
+**Documentation**: All bug fixes recorded in `sysroute.md`
+
+---
+
+## ICMP Echo Loopback Test - IN PROGRESS
+
+**Goal**: Verify that packets sent to TUN device can be routed back via loopback.
+
+**Test Plan**:
+1. Create utun device with IP 10.0.0.2/32
+2. Add route for 10.0.0.2 via utun interface
+3. Ping 10.0.0.2 from localhost
+4. Verify ICMP echo request reaches TUN and response is sent
 
 ---
 
