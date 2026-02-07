@@ -74,7 +74,7 @@ pub const TcpHeaderFull = extern struct {
 
 /// Get data offset (header length) from flags_len
 pub fn getDataOffset(header: *const TcpHeader) u4 {
-    return @as(u4, header.flags_len >> 12);
+    return @truncate(header.flags_len >> 12);
 }
 
 /// Set data offset
@@ -84,7 +84,7 @@ pub fn setDataOffset(header: *TcpHeader, offset: u4) void {
 
 /// Get TCP flags from flags_len
 pub fn getFlags(header: *const TcpHeader) u8 {
-    return @as(u8, header.flags_len & 0x3F);
+    return @truncate(header.flags_len & 0x3F);
 }
 
 /// Set TCP flags
@@ -144,7 +144,7 @@ pub const PacketInfo = struct {
 pub fn parseHeader(data: [*]const u8, len: usize) ?PacketInfo {
     if (len < HDR_MIN_SIZE) return null;
 
-    const header = @as(*const TcpHeader, @ptrCast(data));
+    const header = @as(*const TcpHeader, @ptrCast(@alignCast(data)));
     const hdr_len = headerSize(header);
     if (len < hdr_len) return null;
 

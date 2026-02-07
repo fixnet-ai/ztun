@@ -1,4 +1,4 @@
-//! stack.zig - Protocol stack interface for TUN devices
+//! tun_stack.zig - Protocol stack interface for TUN devices
 //!
 //! Provides the TunStack interface for handling protocol processing
 //! on packets received from TUN devices.

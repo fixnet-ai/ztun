@@ -165,7 +165,7 @@ ztun/
 │   │   ├── device_darwin.zig # macOS/iOS implementation
 │   │   ├── device_windows.zig # Windows implementation
 │   │   ├── device_ios.zig    # iOS PacketFlow wrapper
-│   │   ├── stack.zig         # TunStack interface
+│   │   ├── tun_stack.zig         # TunStack interface
 │   │   └── handler.zig       # PacketHandler interface
 │   │
 │   ├── router/               # Forwarding engine

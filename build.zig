@@ -61,17 +61,17 @@ const zig_modules = &[_]framework.ZigModule{
     .{
         .name = "device_linux",
         .file = "src/tun/device_linux.zig",
-        .deps = &[_][]const u8{ "device" },
+        .deps = &[_][]const u8{"device"},
     },
     .{
         .name = "device_darwin",
         .file = "src/tun/device_darwin.zig",
-        .deps = &[_][]const u8{ "device" },
+        .deps = &[_][]const u8{"device"},
     },
     .{
         .name = "device_windows",
         .file = "src/tun/device_windows.zig",
-        .deps = &[_][]const u8{ "device" },
+        .deps = &[_][]const u8{"device"},
     },
     // IP stack submodules (all in src/ipstack/)
     .{
@@ -82,12 +82,12 @@ const zig_modules = &[_]framework.ZigModule{
     .{
         .name = "ipstack_ipv4",
         .file = "src/ipstack/ipv4.zig",
-        .deps = &[_][]const u8{ "ipstack_checksum" },
+        .deps = &[_][]const u8{"ipstack_checksum"},
     },
     .{
         .name = "ipstack_ipv6",
         .file = "src/ipstack/ipv6.zig",
-        .deps = &[_][]const u8{ "ipstack_checksum" },
+        .deps = &[_][]const u8{"ipstack_checksum"},
     },
     .{
         .name = "ipstack_tcp",
@@ -107,7 +107,7 @@ const zig_modules = &[_]framework.ZigModule{
     .{
         .name = "ipstack_callbacks",
         .file = "src/ipstack/callbacks.zig",
-        .deps = &[_][]const u8{ "ipstack_connection" },
+        .deps = &[_][]const u8{"ipstack_connection"},
     },
     .{
         .name = "ipstack_connection",
@@ -129,6 +129,12 @@ const zig_modules = &[_]framework.ZigModule{
             "tun",
         },
     },
+    // System stack (TunStack interface wrapper for StaticIpstack)
+    .{
+        .name = "stack_system",
+        .file = "src/ipstack/stack_core.zig",
+        .deps = &[_][]const u8{ "tun", "ipstack" },
+    },
     // Router submodules (all in src/router/)
     .{
         .name = "router_route",
@@ -143,7 +149,7 @@ const zig_modules = &[_]framework.ZigModule{
     .{
         .name = "router_socks5",
         .file = "src/router/proxy/socks5.zig",
-        .deps = &[_][]const u8{ "router_route" },
+        .deps = &[_][]const u8{"router_route"},
     },
     .{
         .name = "router",
@@ -332,6 +338,30 @@ pub fn build(b: *std.Build) void {
         .dest_dir = .{ .override = .{ .custom = b.dupe("bin/macos") } },
     });
     test_integration_step.dependOn(&test_integration_install.step);
+
+    // Build SystemStack protocol stack test executable
+    const test_stack_step = b.step("test-stack", "Build SystemStack protocol test");
+    const test_stack = b.addExecutable(.{
+        .name = "test_stack_core",
+        .root_source_file = b.path("tests/test_stack_core.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_stack.linkLibC();
+    test_stack.root_module.addCSourceFiles(.{
+        .files = config.c_sources,
+        .flags = config.cflags,
+    });
+    test_stack.root_module.addSystemIncludePath(.{ .cwd_relative = "src" });
+    var test_stack_iter = all_modules.map.iterator();
+    while (test_stack_iter.next()) |entry| {
+        test_stack.root_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    }
+    test_stack.root_module.addImport("xev", libxev.module("xev"));
+    const test_stack_install = b.addInstallArtifact(test_stack, .{
+        .dest_dir = .{ .override = .{ .custom = b.dupe("bin/macos") } },
+    });
+    test_stack_step.dependOn(&test_stack_install.step);
 
     // Build all static library targets (no tests)
     const all_targets_step = b.step("all", "Build static libraries for all supported targets");

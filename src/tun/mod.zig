@@ -17,7 +17,10 @@ pub const DeviceOps = @import("device.zig").DeviceOps;
 // New interfaces (sing-tun inspired)
 pub const TunDevice = @import("device.zig").TunDevice;
 pub const Options = @import("options.zig").Options;
-pub const TunStack = @import("stack.zig").TunStack;
+pub const TunStack = @import("tun_stack.zig").TunStack;
+pub const StackConfig = @import("tun_stack.zig").StackConfig;
+pub const StackOptions = @import("tun_stack.zig").StackOptions;
+pub const StackType = @import("tun_stack.zig").StackType;
 pub const PacketHandler = @import("handler.zig").PacketHandler;
 pub const PacketResult = @import("handler.zig").PacketResult;
 

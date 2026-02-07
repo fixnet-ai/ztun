@@ -1,4 +1,4 @@
-//! stack_system.zig - System protocol stack implementation for TUN devices
+//! stack_core.zig - System protocol stack implementation for TUN devices
 //!
 //! Implements the TunStack interface using the system's native network stack
 //! for packet processing. This is the default/full stack implementation.
@@ -11,25 +11,28 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+// Use tun module exports to avoid module conflicts
+const tun = @import("tun");
+
 // TUN stack interface
-const TunStack = @import("stack.zig").TunStack;
-const TunError = @import("device.zig").TunError;
-const StackConfig = @import("stack.zig").StackConfig;
-const StackOptions = @import("stack.zig").StackOptions;
+const TunStack = tun.TunStack;
+const TunError = tun.TunError;
+const StackConfig = tun.StackConfig;
+const StackOptions = tun.StackOptions;
 
 // Packet handling interface
-const PacketHandler = @import("handler.zig").PacketHandler;
+const PacketHandler = tun.PacketHandler;
 
 // IP stack implementation
-const ipstack = @import("ipstack_mod");
+const ipstack = @import("ipstack");
 const StaticIpstack = ipstack.StaticIpstack;
 const ipv4 = ipstack.ipv4;
 const ipv6 = ipstack.ipv6;
 const udp = ipstack.udp;
 
 // Address types
-const Ipv4Address = @import("options.zig").Ipv4Address;
-const Ipv6Address = @import("options.zig").Ipv6Address;
+const Ipv4Address = tun.Ipv4Address;
+const Ipv6Address = tun.Ipv6Address;
 
 /// Maximum number of concurrent connections
 const MAX_CONNECTIONS = 1024;
@@ -145,7 +148,7 @@ pub fn createSystemStack(
         .idle_timeout = config.options.udp_timeout,
         .max_connections = MAX_CONNECTIONS,
     };
-    ipstack.StaticIpstack.init(&stack.ipstack, ipstack_config);
+    ipstack.init(&stack.ipstack, ipstack_config);
 
     // Initialize IPv6 if enabled
     stack.ipv6_enabled = config.options.ipv6_enabled;
@@ -155,7 +158,7 @@ pub fn createSystemStack(
             .local_ip = stack.local_ip6,
             .enabled = true,
         };
-        ipstack.StaticIpstack.setIpv6Config(&stack.ipstack, ipv6_config);
+        ipstack.setIpv6Config(&stack.ipstack, ipv6_config);
     }
 
     // Initialize state
@@ -210,7 +213,7 @@ pub fn initSystemStack(
 fn startFn(ctx: *anyopaque, _: *PacketHandler) TunError!void {
     const stack = @as(*SystemStack, @ptrCast(@alignCast(ctx)));
     // IP stack is always running - just reset state
-    ipstack.StaticIpstack.reset(&stack.ipstack);
+    ipstack.reset(&stack.ipstack);
 }
 
 /// Stop the protocol stack
@@ -237,7 +240,7 @@ fn fdFn(ctx: *anyopaque) std.posix.fd_t {
 ///   - packet: Raw IP packet from TUN device
 ///
 /// Returns: Error on failure
-fn processFn(ctx: *anyopaque, packet: []const u8) TunError!void {
+pub fn processFn(ctx: *anyopaque, packet: []const u8) TunError!void {
     const stack = @as(*SystemStack, @ptrCast(@alignCast(ctx)));
 
     // Validate minimum packet size
@@ -250,7 +253,7 @@ fn processFn(ctx: *anyopaque, packet: []const u8) TunError!void {
     const version = packet[0] >> 4;
     if (version == 4) {
         // Process IPv4 packet
-        ipstack.StaticIpstack.processIpv4Packet(
+        ipstack.processIpv4Packet(
             &stack.ipstack,
             packet.ptr,
             packet.len,
@@ -286,7 +289,7 @@ fn processFn(ctx: *anyopaque, packet: []const u8) TunError!void {
 pub fn updateTimestamp(ctx: *anyopaque, timestamp: u32) void {
     const stack = @as(*SystemStack, @ptrCast(@alignCast(ctx)));
     stack.current_time = timestamp;
-    ipstack.StaticIpstack.updateTimestamp(&stack.ipstack, timestamp);
+    ipstack.updateTimestamp(&stack.ipstack, timestamp);
 }
 
 /// Clean up timed out connections
@@ -298,7 +301,7 @@ pub fn updateTimestamp(ctx: *anyopaque, timestamp: u32) void {
 ///   - ctx: SystemStack context
 pub fn cleanupTimeouts(ctx: *anyopaque) void {
     const stack = @as(*SystemStack, @ptrCast(@alignCast(ctx)));
-    ipstack.StaticIpstack.cleanupTimeouts(&stack.ipstack);
+    ipstack.cleanupTimeouts(&stack.ipstack);
 }
 
 /// Get statistics from the stack

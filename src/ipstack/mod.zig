@@ -16,6 +16,9 @@ pub const icmp = @import("ipstack_icmp");
 pub const connection = @import("ipstack_connection");
 pub const callbacks = @import("ipstack_callbacks");
 
+// Re-export SystemStack (TunStack implementation for StaticIpstack)
+pub const stack_system = @import("stack_system");
+
 // Platform detection
 const is_windows = builtin.os.tag == .windows;
 const is_macos = builtin.os.tag == .macos;
@@ -167,7 +170,8 @@ pub fn processIpv4Packet(ipstack: *StaticIpstack, data: [*]const u8, len: usize)
         else => {
             // Raw packet callback
             if (ipstack.config.callbacks.onIpv4Packet) |cb| {
-                cb(ip_info.src_ip, ip_info.dst_ip, ip_info.protocol, data[ip_info.header_len..]);
+                const payload = data[ip_info.header_len..ip_info.total_len];
+                cb(ip_info.src_ip, ip_info.dst_ip, ip_info.protocol, payload);
             }
         },
     }
@@ -366,13 +370,14 @@ fn processIcmpPacket(ipstack: *StaticIpstack, data: [*]const u8, ip_info: ipv4.P
 
     // Handle echo request
     if (icmp_info.type == icmp.TYPE_ECHO_REQUEST) {
+        const icmp_payload = data[icmp_offset + icmp.HDR_SIZE ..icmp_len];
         if (callbacks.invokeIcmpEcho(
             &ipstack.config.callbacks,
             ip_info.src_ip,
             ip_info.dst_ip,
             icmp_info.identifier,
             icmp_info.sequence,
-            data[icmp_offset + icmp.HDR_SIZE ..],
+            icmp_payload,
         )) {
             // Send echo reply
             try sendIcmpEchoReply(ipstack, data + icmp_offset, icmp_len, ip_info.src_ip);
@@ -391,8 +396,8 @@ fn sendIcmpEchoReply(ipstack: *StaticIpstack, req: [*]const u8, req_len: usize, 
         return error.InvalidPacket;
     }
 
-    const req_header = @as(*const icmp.IcmpEcho, @ptrCast(req));
-    const payload = if (req_len > icmp.HDR_SIZE) req[icmp.HDR_SIZE..] else &.{};
+    const req_header = @as(*const icmp.IcmpEcho, @ptrCast(@alignCast(req)));
+    const payload = if (req_len > icmp.HDR_SIZE) req[icmp.HDR_SIZE..req_len] else &[_]u8{};
 
     const total_len = icmp.HDR_SIZE + payload.len;
     if (total_len > PACKET_BUF_SIZE) {

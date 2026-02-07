@@ -34,6 +34,8 @@ pub const TunError = error{
     NotSupported,
     /// Resource exhaustion
     OutOfMemory,
+    /// Invalid packet format
+    InvalidPacket,
     /// Unknown error
     Unknown,
 };

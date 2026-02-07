@@ -33,7 +33,7 @@ pub const PacketInfo = struct {
 pub fn parseHeader(data: [*]const u8, total_len: usize) ?PacketInfo {
     if (total_len < HDR_SIZE) return null;
 
-    const header = @as(*const UdpHeader, @ptrCast(data));
+    const header = @as(*const UdpHeader, @ptrCast(@alignCast(data)));
     // Read length in network byte order (big-endian)
     const length = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(&header.length)), .big);
 

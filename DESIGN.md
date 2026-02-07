@@ -79,7 +79,7 @@ ztun is a pure Zig TUN device library with transparent proxy forwarding capabili
 |  +-----------------------------------------------------------+     |
 |  |  Supporting Modules                                      |     |
 |  |  - options.zig  - TUN configuration options              |     |
-|  |  - stack.zig    - Protocol stack interface               |     |
+|  |  - tun_stack.zig    - Protocol stack interface               |     |
 |  |  - handler.zig  - Packet handler interface               |     |
 |  +-----------------------------------------------------------+     |
 +---------------------------------------------------------------------+
@@ -163,7 +163,7 @@ ztun/
 │   │   ├── device_darwin.zig # macOS/iOS implementation
 │   │   ├── device_windows.zig # Windows implementation
 │   │   ├── device_ios.zig    # iOS PacketFlow wrapper
-│   │   ├── stack.zig         # TunStack interface
+│   │   ├── tun_stack.zig         # TunStack interface
 │   │   └── handler.zig       # PacketHandler interface
 │   ├── ipstack/              # IP protocol stack
 │   │   ├── mod.zig           # IP stack entry

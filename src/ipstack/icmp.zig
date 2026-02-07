@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const checksum = @import("checksum");
+const checksum = @import("ipstack_checksum");
 
 // ICMPv4 constants
 pub const HDR_SIZE = 8;
@@ -97,7 +97,7 @@ pub const PacketInfo = struct {
 pub fn parseHeader(data: [*]const u8, len: usize) ?PacketInfo {
     if (len < HDR_SIZE) return null;
 
-    const header = @as(*const IcmpHeader, @ptrCast(data));
+    const header = @as(*const IcmpHeader, @ptrCast(@alignCast(data)));
 
     // Verify checksum
     const cs = checksum.checksum(data, len);
@@ -109,7 +109,7 @@ pub fn parseHeader(data: [*]const u8, len: usize) ?PacketInfo {
 
     if (header.type == TYPE_ECHO_REQUEST or header.type == TYPE_ECHO_REPLY) {
         if (len >= HDR_SIZE) {
-            const echo = @as(*const IcmpEcho, @ptrCast(data));
+            const echo = @as(*const IcmpEcho, @ptrCast(@alignCast(data)));
             ident = echo.identifier;
             seq = echo.sequence;
         }
@@ -157,7 +157,7 @@ pub fn buildEchoRequest(
     sequence: u16,
     payload: []const u8,
 ) usize {
-    const header = @as(*IcmpEcho, @ptrCast(buf));
+    const header = @as(*IcmpEcho, @ptrCast(@alignCast(buf)));
     header.type = TYPE_ECHO_REQUEST;
     header.code = 0;
     header.checksum = 0;
@@ -189,7 +189,7 @@ pub fn buildEchoReply(
     sequence: u16,
     payload: []const u8,
 ) usize {
-    const header = @as(*IcmpEcho, @ptrCast(buf));
+    const header = @as(*IcmpEcho, @ptrCast(@alignCast(buf)));
     header.type = TYPE_ECHO_REPLY;
     header.code = 0;
     header.checksum = 0;

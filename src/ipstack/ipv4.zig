@@ -61,12 +61,12 @@ pub const Ipv4HeaderFull = extern struct {
 
 /// Get IP version from header (bits 4-7 of first byte)
 pub fn getVersion(header: *const Ipv4Header) u4 {
-    return @as(u4, header.ver_ihl >> 4);
+    return @truncate(header.ver_ihl >> 4);
 }
 
 /// Get IHL (Internet Header Length) from header (bits 0-3 of first byte)
 pub fn getIHL(header: *const Ipv4Header) u4 {
-    return @as(u4, header.ver_ihl & 0x0F);
+    return @truncate(header.ver_ihl & 0x0F);
 }
 
 /// Set version and IHL
@@ -81,12 +81,12 @@ pub fn headerSize(header: *const Ipv4Header) usize {
 
 /// Get flags from flags_frag field (bits 13-15)
 pub fn getFlags(header: *const Ipv4Header) u3 {
-    return @as(u3, (header.flags_frag >> 13) & 0x07);
+    return @truncate(header.flags_frag >> 13);
 }
 
 /// Get fragment offset from flags_frag field (bits 0-12)
 pub fn getFragmentOffset(header: *const Ipv4Header) u13 {
-    return @as(u13, header.flags_frag & 0x1FFF);
+    return @truncate(header.flags_frag & 0x1FFF);
 }
 
 /// Set flags and fragment offset
@@ -116,7 +116,7 @@ pub const PacketInfo = struct {
 pub fn parseHeader(data: [*]const u8, len: usize) ?PacketInfo {
     if (len < HDR_MIN_SIZE) return null;
 
-    const header = @as(*const Ipv4Header, @ptrCast(data));
+    const header = @as(*const Ipv4Header, @ptrCast(@alignCast(data)));
 
     // Validate version
     if (getVersion(header) != 4) return null;
@@ -135,7 +135,7 @@ pub fn parseHeader(data: [*]const u8, len: usize) ?PacketInfo {
     // Check if this is a fragment
     const flags = getFlags(header);
     const offset = getFragmentOffset(header);
-    const is_fragment = offset != 0 or (flags & FRAG_MORE) != 0;
+    const is_fragment = offset != 0 or (flags == 0x02);  // 0x02 = FRAG_MORE bit in extracted 3-bit flags
     const is_first_fragment = (offset == 0);
 
     // Read IP addresses from raw packet data (network byte order)
@@ -168,7 +168,7 @@ pub fn buildHeader(
     protocol: u8,
     payload_len: usize,
 ) usize {
-    const header = @as(*Ipv4Header, @ptrCast(buf));
+    const header = @as(*Ipv4Header, @ptrCast(@alignCast(buf)));
 
     // Version (4) and IHL (5 = 20 bytes)
     header.ver_ihl = (4 << 4) | 5;
@@ -204,7 +204,7 @@ pub fn buildHeader(
 
 /// Calculate and set header checksum
 pub fn setChecksum(buf: [*]u8, ihl: u4) void {
-    const header = @as(*Ipv4Header, @ptrCast(buf));
+    const header = @as(*Ipv4Header, @ptrCast(@alignCast(buf)));
     header.checksum = 0;
 
     const hdr_size = @as(usize, ihl) * 4;
@@ -307,7 +307,7 @@ inline fn checksum(data: [*]const u8, len: usize) u16 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
 
-    return ~@as(u16, @bitCast(sum));
+    return @as(u16, @bitCast(@as(u16, @truncate(sum))));
 }
 
 // Unit tests
