@@ -21,6 +21,12 @@ pub const TunStack = @import("stack.zig").TunStack;
 pub const PacketHandler = @import("handler.zig").PacketHandler;
 pub const PacketResult = @import("handler.zig").PacketResult;
 
+// IP address conversion utilities
+pub const ipv4ToU32 = @import("options.zig").ipv4ToU32;
+pub const u32ToIpv4 = @import("options.zig").u32ToIpv4;
+pub const parseIpv4 = @import("options.zig").parseIpv4;
+pub const formatIpv4 = @import("options.zig").formatIpv4;
+
 // Re-export iOS-specific types (PacketFlow wrapper)
 pub const IosDevice = @import("device_ios.zig").IosDevice;
 pub const PacketReadFn = @import("device_ios.zig").PacketReadFn;

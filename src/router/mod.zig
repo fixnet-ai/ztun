@@ -347,9 +347,28 @@ pub const Router = struct {
             const written = dev.write(data) catch return error.WriteFailed;
             router._stats.bytes_tx += written;
         } else {
-            // Raw fd - write directly
+            // Raw fd - may need platform-specific header (e.g., macOS utun 4-byte header)
+            const header_len = router.config.tun.header_len;
+            const total_len = header_len + data.len;
+
+            if (router.write_buf.len < total_len) {
+                return error.BufferTooSmall;
+            }
+
+            // Add macOS utun header if needed (4-byte AF_INET header)
+            if (header_len > 0) {
+                // AF_INET = 2, followed by 3 zero bytes
+                router.write_buf[0] = 2;
+                router.write_buf[1] = 0;
+                router.write_buf[2] = 0;
+                router.write_buf[3] = 0;
+            }
+
+            // Copy packet data
+            @memcpy(router.write_buf[header_len..total_len], data);
+
             const tun = router.config.tun.fd;
-            const written = std.posix.write(tun, data) catch return error.WriteFailed;
+            const written = std.posix.write(tun, router.write_buf[0..total_len]) catch return error.WriteFailed;
             router._stats.bytes_tx += written;
         }
     }
@@ -1060,34 +1079,33 @@ fn onTunReadable(
 
     router._stats.bytes_rx += n;
 
-    // Skip the 4-byte utun header (AF_INET + reserved bytes)
-    // The actual IP packet starts at offset 4
-    const ip_offset: usize = 4;
-    if (n < ip_offset + 20) {
-        std.debug.print("[TUN] Packet too small ({}) after skipping utun header\n", .{n});
+    // Platform-specific headers are handled by device_darwin.zig readFn
+    // packet_buf[0..n] contains the raw IP packet (no platform headers)
+    if (n < 20) {
+        std.debug.print("[TUN] Packet too small ({})\n", .{n});
         router.submitTunRead();
         return .disarm;
     }
 
-    // Dump received packet (skip utun header)
-    const packet_data = router.packet_buf[ip_offset..n];
+    // Packet data starts at offset 0 (headers already stripped by platform layer)
+    const packet_data = router.packet_buf[0..n];
     const src_ip = std.mem.readInt(u32, packet_data[12..16], .big);
     const dst_ip = std.mem.readInt(u32, packet_data[16..20], .big);
     const protocol = packet_data[9];
-    std.debug.print("\n[TUN] READ: {} bytes from TUN (IP packet: {} bytes)\n", .{n, n - ip_offset});
+    std.debug.print("\n[TUN] READ: {} bytes from TUN\n", .{n});
     std.debug.print("[TUN]   src={s} dst={s} proto={}\n", .{ fmtIp(src_ip), fmtIp(dst_ip), protocol });
     dumpPacket("[TUN]   packet", packet_data);
 
     // Check if this is an ICMP packet - handle echo request immediately
     const ver_ihl = packet_data[0];
     const ihl = ver_ihl & 0x0F;
-    const header_len = @as(usize, ihl) * 4;
+    const ip_header_len = @as(usize, ihl) * 4;
 
     // ICMP protocol = 1
     if (protocol == 1) {
         std.debug.print("[TUN]   -> ICMP packet, handling echo\n", .{});
         // Handle ICMP echo request (ping)
-        router.handleIcmpEcho(header_len) catch {};
+        router.handleIcmpEcho(ip_header_len) catch {};
         router.submitTunRead();
         return .disarm;
     }

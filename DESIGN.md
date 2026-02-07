@@ -201,6 +201,12 @@ pub const TunConfig = struct {
     prefix_len: u8,           // Prefix length (e.g., 24)
     mtu: u16,                 // MTU size
     fd: std.posix.fd_t,       // TUN file descriptor
+    device_ops: ?*const DeviceOps = null,
+
+    /// Platform-specific header length for TUN write operations
+    /// macOS utun: 4 bytes (AF_INET header)
+    /// Linux/Windows: 0 bytes
+    header_len: usize = 0,
 };
 
 // Egress network interface (from application)
@@ -579,13 +585,21 @@ const Socks5Conn = struct {
 
 ## Platform Support
 
-| Platform | TUN Type | Event Loop | Zero-Copy | Notes |
-|----------|----------|------------|-----------|-------|
-| Linux | /dev/net/tun | epoll | Yes | Standard TUN/TAP |
-| macOS | utun socket | kqueue | Yes | 4-byte AF header |
-| Windows | Wintun DLL | IOCP | Yes | Ring buffer I/O |
-| Android | /dev/net/tun | epoll | Yes | Same as Linux |
-| iOS | utun socket | kqueue | Yes | Same as macOS |
+| Platform | TUN Type | Event Loop | Zero-Copy | Header | Notes |
+|----------|----------|------------|-----------|--------|-------|
+| Linux | /dev/net/tun | epoll | Yes | 0 bytes | Standard TUN/TAP |
+| macOS | utun socket | kqueue | Yes | 4 bytes | AF_INET header |
+| Windows | Wintun DLL | IOCP | Yes | 0 bytes | Ring buffer I/O |
+| Android | /dev/net/tun | epoll | Yes | 0 bytes | Same as Linux |
+| iOS | utun socket | kqueue | Yes | 4 bytes | Same as macOS |
+
+### Zero-Copy Implementation
+
+All platforms use zero-copy I/O via pre-allocated static buffers:
+
+- **Read**: Direct read into `packet_buf` (no malloc/free per packet)
+- **Write**: Direct write from `write_buf` (no temporary allocations)
+- **libxev**: Async I/O with completion callbacks
 
 ## sysroute Module
 
@@ -639,6 +653,60 @@ pub fn getIfaceIndex(ifname: [*:0]const u8) RouteError!u32;
 - 4-byte AF_INET/AF_INET6 header on read/write
 - MTU configuration via `SIOCSIFMTU` ioctl
 - Address configuration via `SIOCAIFADDR`/`SIOCAIFADDR_IN6` ioctls
+- **Zero-copy read**: reads directly into caller's buffer (+4 bytes for header)
+- **Unified header handling**: Router adds 4-byte header for raw fd writes
+
+### Platform-Specific Header Handling
+
+Different TUN implementations use different header formats:
+
+| Platform | Read Header | Write Header | Header Length |
+|----------|-------------|--------------|---------------|
+| Linux | None | None | 0 bytes |
+| macOS/iOS | 4-byte AF_INET | 4-byte AF_INET | 4 bytes |
+| Windows | None | None | 0 bytes |
+
+#### macOS utun Header Format
+
+The macOS utun socket prepends a 4-byte header to each packet:
+
+```
+Byte 0: Address family (2 = AF_INET, 30 = AF_INET6)
+Byte 1-3: Reserved (must be zero)
+```
+
+#### Unified Buffer Architecture
+
+Router holds unified read/write buffers and handles platform headers via configuration:
+
+```zig
+// TunConfig - platform header length
+pub const TunConfig = struct {
+    name: [:0]const u8,
+    ifindex: u32,
+    ip: u32,
+    prefix_len: u8,
+    mtu: u16,
+    fd: std.posix.fd_t,
+    device_ops: ?*const DeviceOps = null,
+
+    /// Platform-specific header length for TUN write operations
+    /// macOS utun: 4 bytes (AF_INET header)
+    /// Linux/Windows: 0 bytes
+    header_len: usize = 0,
+};
+```
+
+**Read path:**
+1. Router submits async read to `packet_buf`
+2. device_darwin.zig readFn reads `(buf.len + 4)` bytes into buffer
+3. readFn returns `actual_bytes - 4` (header stripped)
+4. Router processes `packet_buf[0..n]` as pure IP packet
+
+**Write path:**
+1. Router copies packet to `write_buf[header_len..]`
+2. If `header_len > 0`, writes 4-byte AF_INET header to `write_buf[0..4]`
+3. Writes `write_buf[0..total_len]` to raw fd
 
 ### Windows (device_windows.zig)
 

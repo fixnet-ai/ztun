@@ -39,8 +39,6 @@ extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
 extern "c" fn getsockopt(fd: c_int, level: c_int, optname: c_int, optval: *anyopaque, optlen: *std.posix.socklen_t) c_int;
 extern "c" fn write(fd: c_int, buf: *const anyopaque, n: usize) isize;
 extern "c" fn read(fd: c_int, buf: *anyopaque, n: usize) isize;
-extern "c" fn malloc(size: usize) ?*anyopaque;
-extern "c" fn free(ptr: *anyopaque) callconv(.C) void;
 extern "c" fn memset(ptr: *anyopaque, value: c_int, size: usize) callconv(.C) void;
 extern "c" fn if_nametoindex(name: [*:0]const u8) c_uint;
 extern "c" fn getpid() c_int;
@@ -236,40 +234,28 @@ fn createTunDevice(state: *DarwinDeviceState) *TunDevice {
 fn readFn(ctx: *anyopaque, buf: []u8) TunError!usize {
     const state = @as(*DarwinDeviceState, @ptrCast(@alignCast(ctx)));
 
-    // Read with extra space for the 4-byte utun header
-    const header_ptr = malloc(buf.len + 4) orelse return error.OutOfMemory;
-    defer free(header_ptr);
-    const header_buf = @as([*]u8, @ptrCast(header_ptr))[0..buf.len + 4];
+    // macOS utun: 内核在数据前添加 4-byte AF_INET header
+    // 我们需要额外 4 字节空间来容纳 header
+    const header_space = 4;
 
-    const n = read(state.fd, header_buf.ptr, buf.len + 4);
+    // 直接读取到用户提供缓冲区 + 4 字节空间（零分配）
+    const n = read(state.fd, buf.ptr, buf.len + header_space);
     if (n < 0) return error.IoError;
-    if (n <= 4) return 0;
+    if (n < header_space) return 0; // 只有 header，没有数据
 
-    // Strip the 4-byte utun header (first byte is address family)
-    const bytes = @as(usize, @intCast(n));
-    @memcpy(buf[0..bytes - 4], header_buf[4..bytes]);
-    return bytes - 4;
+    // 返回实际 IP 包大小（剥离 4 字节 header）
+    // Router 从 offset 0 开始使用数据
+    return @as(usize, @intCast(n - header_space));
 }
 
 fn writeFn(ctx: *anyopaque, buf: []const u8) TunError!usize {
     const state = @as(*DarwinDeviceState, @ptrCast(@alignCast(ctx)));
 
-    // Allocate temp buffer for header + packet
-    const packet_ptr = malloc(buf.len + 4) orelse return error.OutOfMemory;
-    defer free(packet_ptr);
-    const packet_buf = @as([*]u8, @ptrCast(packet_ptr))[0..buf.len + 4];
-
-    // Add 4-byte utun header (AF_INET = 2 for IPv4)
-    packet_buf[0] = 2;
-    packet_buf[1] = 0;
-    packet_buf[2] = 0;
-    packet_buf[3] = 0;
-    @memcpy(packet_buf[4..], buf);
-
-    const n = write(state.fd, packet_buf.ptr, buf.len + 4);
+    // Router 层面统一添加 4-byte header，所以 buf 已包含 header
+    // 直接写入即可（零分配）
+    const n = write(state.fd, buf.ptr, buf.len);
     if (n < 0) return error.IoError;
-    if (n <= 4) return 0;
-    return @as(usize, @intCast(n - 4));
+    return @as(usize, @intCast(n));
 }
 
 fn nameFn(ctx: *anyopaque) TunError![]const u8 {
@@ -416,21 +402,18 @@ pub fn createLegacy(config: Options) TunError!*DeviceContext {
     };
 
     // Allocate DeviceContext
-    const ctx = malloc(@sizeOf(DeviceContext));
-    if (@intFromPtr(ctx) == 0) {
-        // On error, cleanup device
+    const ctx = std.heap.c_allocator.create(DeviceContext) catch {
         device.close();
         return error.IoError;
-    }
+    };
 
     // Initialize context with device state
-    const c = @as(*DeviceContext, @alignCast(@ptrCast(ctx)));
-    c.* = .{ .ptr = device.ctx };
+    ctx.* = .{ .ptr = device.ctx };
 
     // Note: device is leaked here, but its memory is managed through ctx
     // The caller must use destroy() to cleanup
 
-    return c;
+    return ctx;
 }
 
 /// Receive a packet from the TUN device

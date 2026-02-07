@@ -160,6 +160,26 @@ pub fn formatIpv4(ip: Ipv4Address, buf: *[16]u8) []u8 {
     }) catch unreachable;
 }
 
+/// Convert IPv4 address to u32 (network byte order)
+/// Used for efficient bitwise operations and packet processing
+pub fn ipv4ToU32(ip: Ipv4Address) u32 {
+    return @as(u32, ip[0]) << 24 |
+        @as(u32, ip[1]) << 16 |
+        @as(u32, ip[2]) << 8 |
+        @as(u32, ip[3]);
+}
+
+/// Convert u32 to IPv4 address (network byte order)
+/// Used when converting from packet/IP operations to address format
+pub fn u32ToIpv4(ip_be: u32) Ipv4Address {
+    return .{
+        @as(u8, @truncate(ip_be >> 24)),
+        @as(u8, @truncate(ip_be >> 16)),
+        @as(u8, @truncate(ip_be >> 8)),
+        @as(u8, @truncate(ip_be)),
+    };
+}
+
 /// Parse IPv6 address from string notation (e.g., "fd00::1")
 pub fn parseIpv6(str: []const u8) !Ipv6Address {
     var result: Ipv6Address = undefined;

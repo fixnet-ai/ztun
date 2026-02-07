@@ -286,17 +286,27 @@ pub fn main() !u8 {
         egress.ip,
     });
 
-    // Create TUN device (name is auto-generated on macOS)
+    // Create TUN device using new Options API
     std.debug.print("Creating TUN device...\n", .{});
 
-    var builder = tun.DeviceBuilder{};
-    _ = builder.setMtu(args.tun_mtu);
+    // Convert tun_ip (u32) to [4]u8 array for Options
+    const tun_ip_bytes: [4]u8 = .{
+        @as(u8, @truncate(tun_ip >> 24)),
+        @as(u8, @truncate(tun_ip >> 16)),
+        @as(u8, @truncate(tun_ip >> 8)),
+        @as(u8, @truncate(tun_ip)),
+    };
 
-    // Set TUN IP address (gateway is same as tun_ip for point-to-point)
-    const gateway_ip = tun_ip; // For point-to-point, gateway = tun_ip
-    _ = builder.setIpv4(.{ @as(u8, @truncate(gateway_ip >> 24)), @as(u8, @truncate(gateway_ip >> 16)), @as(u8, @truncate(gateway_ip >> 8)), @as(u8, @truncate(gateway_ip)) }, args.prefix_len, null);
+    // Create Options struct
+    var opts = tun.Options{};
+    opts.mtu = args.tun_mtu;
+    opts.ipv4 = .{
+        .address = tun_ip_bytes,
+        .prefix = args.prefix_len,
+        .destination = null, // point-to-point, no peer
+    };
 
-    const device = builder.build() catch {
+    const device = tun.Device.create(opts) catch {
         std.debug.print("Error: Failed to create TUN device\n", .{});
         return 1;
     };
@@ -327,6 +337,11 @@ pub fn main() !u8 {
         .mtu = args.tun_mtu,
         .fd = device.getFd(),
         .device_ops = null,
+        // macOS utun requires 4-byte AF_INET header on write
+        .header_len = switch (builtin.os.tag) {
+            .macos, .ios => 4,
+            else => 0,
+        },
     };
 
     // Create egress configuration

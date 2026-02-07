@@ -71,6 +71,12 @@ pub const TunConfig = struct {
     /// Device operations (optional, for platforms with device-specific headers like macOS utun)
     /// When provided, Router uses these operations instead of raw fd
     device_ops: ?*const DeviceOps = null,
+
+    /// Platform-specific header length for TUN write operations
+    /// macOS utun: 4 bytes (AF_INET header added by kernel on read, required on write)
+    /// Linux/Windows: 0 bytes
+    /// This is used when writing packets via raw fd (non-device_ops path)
+    header_len: usize = 0,
 };
 
 /// Egress network interface configuration provided by the application
