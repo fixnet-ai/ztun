@@ -1,70 +1,86 @@
 # ztun - Cross-Platform TUN Device Library
 
-A pure Zig library for creating/managing TUN devices and a pure Zig IP stack (TCP/UDP/ICMP) on Linux, macOS, and Windows.
+A pure Zig library for creating/managing TUN devices with transparent proxy forwarding capabilities on Linux, macOS, and Windows.
 
 ## Features
 
 - **TUN Device**: Cross-platform TUN support (Linux /dev/net/tun, macOS utun, Windows Wintun)
 - **Pure Zig**: No C dependencies, compiles with Zig 0.13.0
-- **IP Stack**: Full TCP/UDP/ICMP protocol implementation with static memory allocation
-- **Builder Pattern**: Easy device creation and configuration
-- **RingBuffer**: Internal batch packet handling optimization
-- **Dual Stack**: Complete IPv4 and IPv6 support
+- **Router**: Transparent proxy forwarding engine with libxev async I/O
+- **SOCKS5 Proxy**: Built-in SOCKS5 client for TCP/UDP forwarding
+- **NAT Support**: UDP session NAT translation for transparent proxy
+- **Zero-Copy**: Pre-allocated buffers for optimal performance
+- **Dual Stack**: IPv4 and IPv6 support
 
 ## Quick Start
 
-### TUN Device Only
+### TUN Device
 
 ```zig
 const tun = @import("tun");
+const Options = tun.Options;
 
-// Build a TUN device
-var builder = tun.DeviceBuilder.init();
-builder.setName("tun0");
-builder.setMtu(1500);
-builder.setIpv4(.{ 10, 0, 0, 1 }, 24, null);
-
-const device = builder.build() catch {
-    // Handle error
+// Create TUN device options
+const opts = tun.Options{
+    .mtu = 1500,
+    .network = .{
+        .ipv4 = .{ .address = .{ 10, 0, 0, 1 }, .prefix = 24 },
+    },
 };
+
+// Create the device
+var device = try tun.create(std.heap.c_allocator, opts);
 defer device.destroy();
 
 // Read/write packets
-var buf: [4096]u8 = undefined;
-const len = try device.recv(&buf);
-try device.send(buf[0..len]);
+var buf: [1500]u8 = undefined;
+const n = try device.read(&buf);
+try device.write(buf[0..n]);
 ```
 
-### TUN + IP Stack
+### Router with SOCKS5 Proxy
 
 ```zig
-const tun = @import("tun");
-const ipstack = @import("ipstack");
+const router = @import("router");
 
-// Build a TUN device
-var builder = tun.DeviceBuilder.init();
-builder.setName("tun0");
-const device = try builder.build();
-defer device.destroy();
-
-// Initialize IP stack with static memory (no heap allocation)
-var stack = ipstack.StaticIpstack.init(.{
-    .tun_device = device,
-    .local_ip = ip4(10, 0, 0, 1),
-    .pseudo_src_ip = ip4(10, 0, 0, 2),
-    .callbacks = .{
-        .onTcpAccept = myAccept,
-        .onTcpData = myData,
-        .onUdp = myUdp,
-    },
-});
-
-// Process packets from TUN
-var pkt_buf: [65536]u8 = undefined;
-while (true) {
-    const len = try device.recv(&pkt_buf);
-    try stack.processPacket(pkt_buf[0..len]);
+// Define routing callback
+fn myRouteCallback(
+    src_ip: u32,
+    src_port: u16,
+    dst_ip: u32,
+    dst_port: u16,
+    protocol: u8,
+) router.RouteDecision {
+    // Route decisions based on destination
+    if (isPrivateIp(dst_ip)) return .Local;
+    return .Socks5;  // Forward through SOCKS5 proxy
 }
+
+// Initialize router
+var rt = try router.Router.init(allocator, .{
+    .tun = .{
+        .name = "tun0",
+        .ifindex = if_nametoindex("tun0"),
+        .ip = ip4(10, 0, 0, 1),
+        .prefix_len = 24,
+        .mtu = 1500,
+        .fd = tun_fd,
+    },
+    .egress = .{
+        .name = "en0",
+        .ifindex = if_nametoindex("en0"),
+        .ip = ip4(192, 168, 1, 100),
+    },
+    .proxy = .{
+        .type = .Socks5,
+        .addr = "127.0.0.1:1080",
+    },
+    .route_cb = myRouteCallback,
+});
+defer rt.deinit();
+
+// Run event loop
+rt.run();
 ```
 
 ## Build Commands
@@ -139,18 +155,28 @@ On macOS, TUN devices are created as utun interfaces. Due to macOS kernel restri
 ```
 ztun/
 ├── src/
-│   ├── tun/                  # TUN device library
+│   ├── main.zig              # Library entry point (exports public API)
+│   ├── tun2sock.zig          # Standalone TUN to SOCKS5 forwarding app
+│   ├── tun/                  # TUN device module
 │   │   ├── mod.zig           # Main module (exports, imports)
-│   │   ├── builder.zig       # DeviceBuilder
-│   │   ├── device.zig        # Device interface
-│   │   ├── device_linux.zig  # Linux implementation
-│   │   ├── device_macos.zig  # macOS implementation
+│   │   ├── options.zig       # TUN configuration options
+│   │   ├── device.zig        # TunDevice/DeviceOps interfaces & Device type
+│   │   ├── device_linux.zig  # Linux/Android implementation
+│   │   ├── device_darwin.zig # macOS/iOS implementation
 │   │   ├── device_windows.zig # Windows implementation
-│   │   ├── platform.zig      # Platform utilities
-│   │   └── ringbuf.zig       # Ring buffer for packet batching
+│   │   ├── device_ios.zig    # iOS PacketFlow wrapper
+│   │   ├── stack.zig         # TunStack interface
+│   │   └── handler.zig       # PacketHandler interface
+│   │
+│   ├── router/               # Forwarding engine
+│   │   ├── mod.zig           # Router with libxev async I/O
+│   │   ├── route.zig         # Route types and configuration
+│   │   ├── nat.zig           # UDP NAT session table
+│   │   └── proxy/
+│   │       └── socks5.zig    # SOCKS5 protocol helpers
 │   │
 │   ├── ipstack/              # Pure Zig IP stack
-│   │   ├── mod.zig           # Main module (StaticIpstack)
+│   │   ├── mod.zig           # IP stack entry
 │   │   ├── checksum.zig      # Internet checksum
 │   │   ├── ipv4.zig          # IPv4 header parsing/building
 │   │   ├── ipv6.zig          # IPv6 header parsing/building
@@ -160,14 +186,16 @@ ztun/
 │   │   ├── connection.zig    # TCP connection state machine
 │   │   └── callbacks.zig     # Callback interface definitions
 │   │
-│   └── main.zig              # Root module exports
+│   └── system/               # System utilities
+│       └── sysroute.zig      # Routing table management
 │
 ├── tests/
 │   ├── test_unit.zig         # Unit tests (Zig test blocks)
-│   └── test_runner.zig       # Integration tests (executable)
+│   ├── test_runner.zig      # Integration tests (executable)
+│   └── test_tun.zig         # Ping echo test
 │
 ├── docs/
-│   └── ztun-design.md        # Architecture documentation
+│   └── DESIGN.md            # Architecture documentation
 │
 ├── build.zig                 # Zig build script
 └── README.md                 # This file
@@ -177,40 +205,66 @@ ztun/
 
 ### TUN Module
 
-**DeviceBuilder:**
+**Options:**
 
-- `init()` - Create a new builder
-- `setName(name: []const u8)` - Set device name (optional)
-- `setMtu(mtu: u16)` - Set MTU (default: 1500)
-- `setIpv4(address: Ipv4Address, prefix: u8, peer: ?Ipv4Address)` - Configure IPv4
-- `setIpv6(address: Ipv6Address, prefix: u32)` - Configure IPv6 (optional)
-- `build() !*Device` - Create the device
+```zig
+const Options = struct {
+    mtu: ?u16 = null,
+    network: ?NetworkConfig = null,
+    packet_info: bool = false,
+    gso: bool = false,
+    fd: ?std.posix.fd_t = null,
+    dns: ?DnsConfig = null,
+    routes: ?RouteConfig = null,
+};
 
-**Device:**
+const NetworkConfig = struct {
+    ipv4: ?Ipv4Network = null,
+    ipv6: ?Ipv6Network = null,
+};
+```
 
-- `recv(buf: []u8) !usize` - Read a packet from TUN
-- `send(buf: []const u8) !usize` - Write a packet to TUN
-- `name() ![]const u8` - Get device name
-- `mtu() !u16` - Get MTU
+**TunDevice:**
+
+- `read(buf: []u8) !usize` - Read a packet from TUN
+- `write(buf: []const u8) !usize` - Write a packet to TUN
+- `fd() fd_t` - Get file descriptor
 - `destroy()` - Destroy device and release resources
 
-### IP Stack Module
+**DeviceOps:**
 
-**StaticIpstack:**
+- `read(buf: []u8) !usize` - Read with function pointer
+- `write(buf: []const u8) !usize` - Write with function pointer
+- `fd() fd_t` - Get file descriptor
+- `destroy()` - Destroy device
 
-- `init(config: Config) StaticIpstack` - Initialize with static memory
-- `processPacket(packet: []const u8) !void` - Process incoming packet
-- `tcpSend(conn: *Connection, data: []const u8) !void` - Send TCP data
-- `udpSend(src_ip: u32, src_port: u16, dst_ip: u32, dst_port: u16, data: []const u8) !void` - Send UDP packet
-- `cleanupTimeouts(current_time: u32) void` - Clean up idle connections
+### Router Module
 
-**Callbacks:**
+**TunConfig:**
 
-- `onTcpAccept(src_ip, src_port, dst_ip, dst_port) bool` - Accept/reject TCP connection
-- `onTcpData(conn: *Connection, data: []const u8) void` - Receive TCP data
-- `onTcpReset(conn: *Connection) void` - Connection reset
-- `onTcpClose(conn: *Connection) void` - Connection closed
-- `onTcpEstablished(conn: *Connection) void` - Connection established
-- `onUdp(src_ip, src_port, dst_ip, dst_port, data) void` - Receive UDP packet
-- `onIcmp(src_ip, dst_ip, type, code, data) void` - Receive ICMP packet
-- `onIcmpEcho(src_ip, dst_ip, identifier, sequence, payload) bool` - Echo request
+```zig
+const TunConfig = struct {
+    name: [:0]const u8,
+    ifindex: u32,
+    ip: u32,
+    prefix_len: u8,
+    mtu: u16,
+    fd: std.posix.fd_t,
+    device_ops: ?*const DeviceOps = null,
+    header_len: usize = 0,  // 4 for macOS, 0 for Linux/Windows
+};
+```
+
+**RouteDecision:**
+
+- `.Direct` - Forward through raw socket
+- `.Socks5` - Forward through SOCKS5 proxy
+- `.Nat` - UDP NAT mode
+- `.Local` - Handle locally (write back to TUN)
+- `.Drop` - Silently drop
+
+**Router:**
+
+- `init(allocator, config) !Router` - Initialize router
+- `run() void` - Run event loop (blocking)
+- `deinit() void` - Cleanup resources

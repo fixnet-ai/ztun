@@ -101,46 +101,50 @@ ztun is a pure Zig TUN device library with transparent proxy forwarding capabili
 5. **Egress traffic bypasses TUN** - Uses raw socket with SO_BINDTODEVICE
 6. **TunDevice interface for platform abstraction** - Function pointer-based design
 
-## TunDevice Interface
+## DeviceOps Interface
 
 ```zig
-/// TUN device operations interface
-pub const TunDevice = interface {
-    /// Read a packet from the TUN device
-    fn read(ctx: *anyopaque, buf: []u8) TunError!usize;
+/// Device operations interface for platform-specific TUN handling.
+/// Uses function pointer-based struct pattern (Zig doesn't have interface keyword).
+pub const DeviceOps = struct {
+    /// Opaque pointer to device-specific state
+    ctx: *anyopaque,
 
-    /// Write a packet to the TUN device
-    fn write(ctx: *anyopaque, buf: []const u8) TunError!usize;
+    /// Read a packet from the device
+    /// Returns the number of bytes read (excluding any device-specific headers)
+    readFn: *const fn (ctx: *anyopaque, buf: []u8) TunError!usize,
 
-    /// Get the device name
-    fn name(ctx: *anyopaque) TunError![]const u8;
+    /// Write a packet to the device
+    /// Takes raw IP packet (without device headers), writes with proper headers
+    writeFn: *const fn (ctx: *anyopaque, buf: []const u8) TunError!usize,
 
-    /// Get the interface index
-    fn ifIndex(ctx: *anyopaque) TunError!u32;
+    /// Get the file descriptor for libxev polling
+    fdFn: *const fn (ctx: *anyopaque) std.posix.fd_t,
 
-    /// Set non-blocking mode
-    fn setNonBlocking(ctx: *anyopaque, enabled: bool) TunError!void;
+    /// Destroy the device and cleanup resources
+    destroyFn: *const fn (ctx: *anyopaque) void,
 
-    /// Add an IPv4 address at runtime
-    fn addIpv4(ctx: *anyopaque, addr: [4]u8, prefix_len: u8) TunError!void;
+    /// Wrapper methods for convenience
+    pub fn read(self: *const DeviceOps, buf: []u8) TunError!usize {
+        return self.readFn(self.ctx, buf);
+    }
 
-    /// Add an IPv6 address at runtime
-    fn addIpv6(ctx: *anyopaque, addr: [16]u8, prefix_len: u8) TunError!void;
+    pub fn write(self: *const DeviceOps, buf: []const u8) TunError!usize {
+        return self.writeFn(self.ctx, buf);
+    }
 
-    /// Close the device
-    fn close(ctx: *anyopaque) void;
+    pub fn fd(self: *const DeviceOps) std.posix.fd_t {
+        return self.fdFn(self.ctx);
+    }
+
+    pub fn destroy(self: *const DeviceOps) void {
+        self.destroyFn(self.ctx);
+    }
 };
 
-/// Opaque device context used with TunDevice functions
-pub const DeviceContext = opaque {
-    /// Create a TUN device with options
-    pub fn create(allocator: std.mem.Allocator, options: Options) TunError!*DeviceContext;
-
-    /// Get device operations
-    pub fn device(ctx: *DeviceContext) *const TunDevice;
-
-    /// Get the internal context pointer
-    pub fn context(ctx: *DeviceContext) *anyopaque;
+/// Device context - holds platform-specific data (opaque pointer wrapper)
+pub const DeviceContext = struct {
+    ptr: *anyopaque,
 };
 ```
 
@@ -149,17 +153,18 @@ pub const DeviceContext = opaque {
 ```
 ztun/
 ├── src/
-│   ├── main.zig              # Library entry point (exports tun module)
+│   ├── main.zig              # Library entry point (exports public API)
 │   ├── tun2sock.zig          # Standalone TUN to SOCKS5 forwarding app
 │   ├── tun/                  # TUN device module
 │   │   ├── mod.zig           # Main TUN interface (platform dispatch)
 │   │   ├── options.zig       # TUN configuration options
-│   │   ├── device.zig        # TunDevice interface & DeviceContext
-│   │   ├── stack.zig         # TunStack interface
-│   │   ├── handler.zig       # PacketHandler interface
+│   │   ├── device.zig        # TunDevice/DeviceOps interfaces & Device type
 │   │   ├── device_linux.zig  # Linux/Android implementation
 │   │   ├── device_darwin.zig # macOS/iOS implementation
-│   │   └── device_windows.zig # Windows implementation
+│   │   ├── device_windows.zig # Windows implementation
+│   │   ├── device_ios.zig    # iOS PacketFlow wrapper
+│   │   ├── stack.zig         # TunStack interface
+│   │   └── handler.zig       # PacketHandler interface
 │   ├── ipstack/              # IP protocol stack
 │   │   ├── mod.zig           # IP stack entry
 │   │   ├── checksum.zig      # Internet checksum

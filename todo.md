@@ -1,16 +1,17 @@
 # ztun Development Todo List
 
 ## Current Status
-**Phase: Integration Testing - tun2sock executable built and verified**
+**Phase: Documentation Update - DESIGN.md & README.md synchronized with code**
 
-Reference: sing-tun + sing-box cross-platform TUN implementation (in `../vendor/`)
+**Recent Changes**:
+- macOS header handling refactor completed (zero-copy, unified buffer)
+- DESIGN.md updated with correct DeviceOps interface
+- README.md updated with new Options API
+- main.zig updated to export current public API
 
 **Build Status**: All components compiling successfully
 - `zig build` - PASSED
-- `zig build tun2sock` - PASSED
-- `zig build test-tun` - PASSED
-
-**Final Goal**: Generate usable `./src/tun2sock.zig` executable and verify it works on macOS
+- `zig build test` - PASSED
 
 ## Recent Fixes (2026-02-07)
 
