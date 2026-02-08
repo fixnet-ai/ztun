@@ -1,7 +1,46 @@
 # ztun Development Todo List
 
-**Version**: 0.1.8
+**Version**: 0.2.0
 **Last Updated**: 2026-02-08
+
+---
+
+## Release v0.2.0 - Production Readiness
+
+**Date**: 2026-02-08
+
+### Features
+
+- Cross-platform support: macOS, Linux, Windows, iOS
+- Transparent proxy routing with route filtering
+- ICMP auto-reply for ping support
+- UDP NAT proxy for DNS and other UDP traffic
+- SOCKS5 proxy integration for TCP forwarding
+- C FFI interoperability fixes for byte order handling
+
+### Cross-Platform Builds
+
+All targets compile successfully:
+- x86_64-macos, aarch64-macos
+- x86_64-linux-gnu, aarch64-linux-gnu
+- x86_64-windows-gnu
+- x86_64-ios-simulator, aarch64-ios
+
+### Bug Fixes
+
+- Fixed network.c loopback check (removed incorrect ntohl())
+- Fixed device_linux.zig double byte order conversion
+- Fixed device_darwin.zig peer address overflow
+- Fixed device_darwin.zig struct assignment safety
+- Fixed macOS utun 4-byte header stripping
+- iOS cross-platform compilation support
+
+### Testing
+
+- Integration tests: 90/90 PASSED
+- Forwarding tests: 30/30 PASSED
+- TUN tests: 3/3 SUCCESS
+- No memory leaks detected
 
 ---
 
