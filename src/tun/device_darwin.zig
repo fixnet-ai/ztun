@@ -323,14 +323,23 @@ fn configureIpv4(_: std.posix.fd_t, ifname: []const u8, address: Ipv4Address, pr
     addr.sin_family = AF_INET;
     @memset(addr.sin_zero[0..], 0);
 
-    // SIOCSIFADDR
-    addr.sin_addr = address;
+    // SIOCSIFADDR - use memcpy for explicit byte copy
+    @memcpy(addr.sin_addr[0..4], &address);
     const SIOCSIFADDR: c_ulong = 0x8020690c;
     _ = ioctl(sock, SIOCSIFADDR, &req);
 
     // SIOCSIFDSTADDR (peer)
-    const peer_addr = [4]u8{ address[0], address[1], address[2], address[3] + 1 };
-    addr.sin_addr = peer_addr;
+    // Calculate peer address = address + 1 (with proper carry handling)
+    const ip_u32 = @as(u32, address[0]) << 24 | @as(u32, address[1]) << 16 |
+                   @as(u32, address[2]) << 8 | @as(u32, address[3]);
+    const peer_u32 = ip_u32 +% 1;
+    const peer_addr = [4]u8{
+        @as(u8, @truncate((peer_u32 >> 24) & 0xFF)),
+        @as(u8, @truncate((peer_u32 >> 16) & 0xFF)),
+        @as(u8, @truncate((peer_u32 >> 8) & 0xFF)),
+        @as(u8, @truncate(peer_u32 & 0xFF)),
+    };
+    @memcpy(addr.sin_addr[0..4], &peer_addr);
     const SIOCSIFDSTADDR: c_ulong = 0x8020690e;
     _ = ioctl(sock, SIOCSIFDSTADDR, &req);
 

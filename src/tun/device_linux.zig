@@ -258,13 +258,11 @@ fn configureIpv4(_: std.posix.fd_t, ifname: []const u8, address: Ipv4Address, pr
     @memcpy(req.ifr_name[0..ifname.len], ifname);
 
     // Set IP address using SIOCSIFADDR
-    // Note: Linux ioctl SIOCSIFADDR expects sin_addr in network byte order
+    // Note: address is already in network byte order from options.zig
     const addr = @as(*sockaddr_in, @alignCast(@ptrCast(&req.ifr_ifru.addr)));
     addr.sin_family = AF_INET;
-    // Convert IP from host byte order to network byte order
-    const ip_host_order = @as(u32, address[0]) << 24 | @as(u32, address[1]) << 16 | @as(u32, address[2]) << 8 | @as(u32, address[3]);
-    const ip_network_order = @byteSwap(ip_host_order);
-    addr.sin_addr = @as(*const [4]u8, @ptrCast(&ip_network_order)).*;
+    // Direct copy - address is already network byte order
+    @memcpy(addr.sin_addr[0..4], &address);
 
     const SIOCSIFADDR = 0x8916;
     if (ioctl(sock, SIOCSIFADDR, &req) < 0) {

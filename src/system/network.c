@@ -103,7 +103,7 @@ int get_local_ips(ip_info_t* ips, int max_count) {
             struct sockaddr_in* addr = (struct sockaddr_in*)ifa->ifa_addr;
             inet_ntop(AF_INET, &addr->sin_addr, ips[count].ip, sizeof(ips[count].ip));
             ips[count].is_ipv6 = 0;
-            ips[count].is_loopback = (ntohl(addr->sin_addr.s_addr) >> 24) == 127;
+            ips[count].is_loopback = (addr->sin_addr.s_addr & 0xFF) == 127;
             count++;
         } else if (family == AF_INET6) {
             // IPv6
@@ -159,7 +159,7 @@ int get_local_ips(ip_info_t* ips, int max_count) {
                 struct sockaddr_in* addr = (struct sockaddr_in*)first_unicast->Address.lpSockaddr;
                 inet_ntop(AF_INET, &addr->sin_addr, ips[count].ip, sizeof(ips[count].ip));
                 ips[count].is_ipv6 = 0;
-                ips[count].is_loopback = (ntohl(addr->sin_addr.s_addr) >> 24) == 127;
+                ips[count].is_loopback = (addr->sin_addr.s_addr & 0xFF) == 127;
                 count++;
             } else if (family == AF_INET6) {
                 struct sockaddr_in6* addr = (struct sockaddr_in6*)first_unicast->Address.lpSockaddr;
