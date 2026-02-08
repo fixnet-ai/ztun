@@ -18,14 +18,28 @@
 
 // ==================== Platform Detection ====================
 
+// Note: PLATFORM_IOS and PLATFORM_MACOS are mutually exclusive
+// When building for Apple platforms, Zig sets target-specific defines:
+// - PLATFORM_MACOS: macOS (darwin) builds
+// - PLATFORM_IOS: iOS device/simulator builds
+
 #if !defined(PLATFORM_LINUX) && !defined(PLATFORM_MACOS) && !defined(PLATFORM_WINDOWS) && \
-    !defined(OS_UNIX) && !defined(OS_WIN)
+    !defined(PLATFORM_IOS) && !defined(OS_UNIX) && !defined(OS_WIN)
 
     #if defined(__linux__)
         #define PLATFORM_LINUX 1
         #define OS_UNIX 1
     #elif defined(__APPLE__)
-        #define PLATFORM_MACOS 1
+        // Check for iOS before macOS
+        #if defined(TARGET_OS_IOS) && TARGET_OS_IOS
+            #define PLATFORM_IOS 1
+        #elif defined(__MACH__) && defined(__APPLE__)
+            // Fallback for older Xcode/macOS SDKs
+            #define PLATFORM_MACOS 1
+        #else
+            // Default to macOS for Apple platforms
+            #define PLATFORM_MACOS 1
+        #endif
         #define OS_UNIX 1
     #elif defined(_WIN32) || defined(_WIN64)
         #define PLATFORM_WINDOWS 1
@@ -34,6 +48,15 @@
         #define PLATFORM_OTHER 1
     #endif
 
+#endif
+
+// Backward compatibility: ensure PLATFORM_MACOS is defined for macOS builds
+#if defined(PLATFORM_IOS) && !defined(PLATFORM_MACOS)
+    // iOS and macOS are mutually exclusive
+#elif defined(__MACH__) && defined(__APPLE__) && !defined(PLATFORM_IOS)
+    #if !defined(PLATFORM_MACOS)
+        #define PLATFORM_MACOS 1
+    #endif
 #endif
 
 // ==================== 类型定义 ====================

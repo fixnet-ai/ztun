@@ -41,6 +41,7 @@
 #endif
 
 // iOS (including simulator) doesn't have net/route.h in its SDK
+// but we need RTM_* constants for bsd_route_list when PLATFORM_MACOS is defined
 #if defined(PLATFORM_MACOS)
     #include <net/route.h>
     #include <net/if.h>
@@ -49,8 +50,78 @@
     #include <ifaddrs.h>
 #elif defined(PLATFORM_IOS)
     // iOS doesn't provide route management APIs
+    // Define minimal types and constants needed for route_list stub
+    #include <sys/types.h>
     #include <net/if.h>
     #include <ifaddrs.h>
+    #include <arpa/inet.h>
+
+    // Use guards to avoid redefinition conflicts with SDK headers
+    #ifndef RTM_VERSION
+        #define RTM_VERSION 3
+    #endif
+    #ifndef RTM_ADD
+        #define RTM_ADD 0x1
+    #endif
+    #ifndef RTM_DELETE
+        #define RTM_DELETE 0x2
+    #endif
+    #ifndef RTA_DST
+        #define RTA_DST 0x1
+    #endif
+    #ifndef RTA_GATEWAY
+        #define RTA_GATEWAY 0x2
+    #endif
+    #ifndef RTA_NETMASK
+        #define RTA_NETMASK 0x3
+    #endif
+    #ifndef RTA_IFP
+        #define RTA_IFP 0x4
+    #endif
+    #ifndef RTAX_MAX
+        #define RTAX_MAX 8
+    #endif
+    #ifndef RTF_UP
+        #define RTF_UP 0x1
+    #endif
+    #ifndef RTF_CLONING
+        #define RTF_CLONING 0x400
+    #endif
+    #ifndef RTF_STATIC
+        #define RTF_STATIC 0x800
+    #endif
+
+    // Only define NET_RT_* if not already defined by SDK
+    #ifndef NET_RT_DUMP
+        #define NET_RT_DUMP 0x1
+    #endif
+    #ifndef NET_RT_FLAGS
+        #define NET_RT_FLAGS 0x2
+    #endif
+
+    // Define rt_msghdr only if not provided by SDK
+    #ifndef _NET_ROUTE_H_
+        struct rt_msghdr {
+            u_short rtm_msglen;
+            u_char rtm_version;
+            u_char rtm_type;
+            u_int rtm_index;
+            u_int rtm_flags;
+            u_int rtm_addrs;
+            int rtm_pid;
+            int rtm_seq;
+            int rtm_errno;
+            int rtm_use;
+            u_int rtm_inits;
+            struct {
+                u_int32_t rtm_refcnt;
+                u_int32_t rtm_hops;
+                u_int32_t rtm_expiry;
+                u_int32_t rtm_pksz;
+                u_int32_t rtm_filler[2];
+            } rtm_rmx;
+        };
+    #endif
 #endif
 
 #ifdef OS_WIN
@@ -1366,6 +1437,8 @@ int route_list(route_entry_t* routes, int max_count) {
 #ifdef PLATFORM_LINUX
     // TODO: Linux implementation
     ROUTE_WARN("[ROUTE] route_list not yet implemented for Linux");
+    (void)routes;
+    (void)max_count;
     return 0;
 #endif
 
@@ -1373,7 +1446,17 @@ int route_list(route_entry_t* routes, int max_count) {
     return windows_route_list(routes, max_count);
 #endif
 
+#ifdef PLATFORM_IOS
+    // iOS doesn't support route operations due to sandbox restrictions
+    ROUTE_WARN("[ROUTE] route_list not supported on iOS");
+    (void)routes;
+    (void)max_count;
+    return 0;
+#endif
+
     ROUTE_WARN("[ROUTE] route_list not yet implemented for this platform");
+    (void)routes;
+    (void)max_count;
     return 0;
 }
 

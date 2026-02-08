@@ -346,4 +346,40 @@ macOS utun prepends a 4-byte AF_INET header to packets. Use temporary buffer to 
 
 ---
 
-**Important**: DO NOT use ifconfig/route shell commands for TUN IP configuration or system routing. Use C-based API (network module) instead.
+## Phase 6: Production Readiness (NEXT)
+
+### Task 6.1: Code Quality
+
+- [ ] Add unit tests for route filtering logic
+- [ ] Add error handling for edge cases
+- [ ] Add graceful shutdown handling
+- [ ] Verify memory safety with AddressSanitizer (Linux)
+
+### Task 6.2: Documentation
+
+- [ ] Update README.md with macOS usage guide
+- [ ] Document TUN device requirements
+- [ ] Document SOCKS5 proxy configuration
+- [ ] Add troubleshooting section
+
+### Task 6.3: Cross-platform Testing
+
+- [ ] Test on Linux (x86_64)
+- [ ] Test on Windows (if applicable)
+- [ ] Verify all builds compile:
+  ```bash
+  zig build all
+  ```
+
+### Task 6.4: Release Preparation
+
+- [ ] Bump version to v0.2.0
+- [ ] Add CHANGELOG.md entry
+- [ ] Tag release v0.2.0
+
+- [ ] Test all binaries in zig-out/bin/
+
+---
+
+```bash
+

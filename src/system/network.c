@@ -25,16 +25,24 @@
 #define NET_WARN(fmt, ...) fprintf(stderr, "[NETWORK WARN] " fmt "\n", ##__VA_ARGS__)
 #define NET_INFO(fmt, ...) fprintf(stderr, "[NETWORK] " fmt "\n", ##__VA_ARGS__)
 
-// ==================== 平台检测 ====================
+// ==================== Platform Detection ====================
 
+// Note: PLATFORM_IOS and PLATFORM_MACOS are mutually exclusive
 #if !defined(PLATFORM_LINUX) && !defined(PLATFORM_MACOS) && !defined(PLATFORM_WINDOWS) && \
-    !defined(OS_UNIX) && !defined(OS_WIN)
+    !defined(PLATFORM_IOS) && !defined(OS_UNIX) && !defined(OS_WIN)
 
     #if defined(__linux__)
         #define PLATFORM_LINUX 1
         #define OS_UNIX 1
     #elif defined(__APPLE__)
-        #define PLATFORM_MACOS 1
+        // Check for iOS before macOS
+        #if defined(TARGET_OS_IOS) && TARGET_OS_IOS
+            #define PLATFORM_IOS 1
+        #elif defined(__MACH__) && defined(__APPLE__)
+            #define PLATFORM_MACOS 1
+        #else
+            #define PLATFORM_MACOS 1
+        #endif
         #define OS_UNIX 1
     #elif defined(_WIN32) || defined(_WIN64)
         #define PLATFORM_WINDOWS 1
@@ -43,6 +51,14 @@
         #define PLATFORM_OTHER 1
     #endif
 
+#endif
+
+// Backward compatibility
+#if defined(PLATFORM_IOS) && !defined(PLATFORM_MACOS)
+#elif defined(__MACH__) && defined(__APPLE__) && !defined(PLATFORM_IOS)
+    #if !defined(PLATFORM_MACOS)
+        #define PLATFORM_MACOS 1
+    #endif
 #endif
 
 // ==================== 头文件 ====================
