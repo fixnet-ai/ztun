@@ -148,6 +148,15 @@ int route_init(void);
 /// Cleanup route module resources
 void route_cleanup(void);
 
+/// Verify a route exists in the routing table
+///
+/// Parameters:
+///   route: Route entry to verify (matches by destination, mask, interface)
+///
+/// Returns:
+///   1 if route exists, 0 if not found, -1 on error
+int route_verify(const route_entry_t* route);
+
 // ==================== IPv6 Helper Functions ====================
 
 /// Create IPv6 route entry (convenience function)

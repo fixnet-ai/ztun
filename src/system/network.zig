@@ -26,13 +26,14 @@
 //! ```
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 // ==================== C 外部函数声明 ====================
 
 /// 本地 IP 地址信息
 pub const IpInfo = extern struct {
-    ip: [64]u8,       // IP 地址字符串（IPv4 或 IPv6）
-    is_ipv6: c_int,   // 是否为 IPv6
+    ip: [64]u8, // IP 地址字符串（IPv4 或 IPv6）
+    is_ipv6: c_int, // 是否为 IPv6
     is_loopback: c_int, // 是否为回环地址
 };
 
@@ -51,8 +52,8 @@ extern fn select_egress_ip_for_target(target_ip: [*:0]const u8, ip_buf: [*]u8, b
 
 /// 地址族枚举（与 C route_entry_t 对应）
 pub const RouteAddressFamily = enum(u8) {
-    ipv4 = 2,   // AF_INET
-    ipv6 = 10,  // AF_INET6
+    ipv4 = 2, // AF_INET
+    ipv6 = 10, // AF_INET6
 };
 
 /// IPv6 地址（128位，16字节）
@@ -157,6 +158,9 @@ extern fn route_add(route: *const RouteEntry) c_int;
 /// 删除路由
 extern fn route_delete(route: *const RouteEntry) c_int;
 
+/// 验证路由是否存在
+extern fn route_verify(route: *const RouteEntry) c_int;
+
 /// 查询路由表
 extern fn route_list(routes: ?[*]RouteEntry, max_count: c_int) c_int;
 
@@ -237,9 +241,20 @@ pub fn getInterfaceIp(alloc: std.mem.Allocator, iface_name: []const u8) ![]u8 {
 /// 添加单条路由
 ///
 /// 使用系统 API（而非 shell 命令）添加路由
+/// 添加后立即验证路由是否真正存在于系统中
 pub fn addRoute(route: *const RouteEntry) !void {
     if (route_add(route) != 0) {
         return error.RouteAddFailed;
+    }
+
+    // 验证路由是否真正添加成功
+    std.time.sleep(10 * std.time.ns_per_ms); // 短暂等待让系统更新路由表
+    const verified = route_verify(route);
+    if (verified < 0) {
+        return error.RouteVerifyError;
+    }
+    if (verified == 0) {
+        return error.RouteNotFoundAfterAdd;
     }
 }
 
@@ -252,9 +267,21 @@ pub fn deleteRoute(route: *const RouteEntry) !void {
     }
 }
 
+/// 验证路由是否存在于系统中
+///
+/// 用于验证路由添加操作是否真正成功
+pub fn verifyRoute(route: *const RouteEntry) !bool {
+    const result = route_verify(route);
+    if (result < 0) {
+        return error.RouteVerifyError;
+    }
+    return result == 1;
+}
+
 /// 批量添加路由
 ///
 /// 使用系统 API 批量添加路由，失败时回滚已添加的路由
+/// 每条路由添加后立即验证是否真正存在于系统中
 pub fn addRoutes(routes: []const RouteEntry) !void {
     // 初始化路由模块
     if (route_init() != 0) {
@@ -276,6 +303,16 @@ pub fn addRoutes(routes: []const RouteEntry) !void {
             return error.RouteAddFailed;
         }
         added += 1;
+
+        // 验证路由是否真正添加成功
+        std.time.sleep(10 * std.time.ns_per_ms); // 短暂等待
+        const verified = route_verify(route);
+        if (verified < 0) {
+            return error.RouteVerifyError;
+        }
+        if (verified == 0) {
+            return error.RouteNotFoundAfterAdd;
+        }
     }
 }
 
@@ -433,9 +470,9 @@ pub fn parseIp(ip_str: []const u8) !u32 {
 
     // Convert to u32 (network byte order)
     return (@as(u32, parts[0]) << 24) |
-           (@as(u32, parts[1]) << 16) |
-           (@as(u32, parts[2]) << 8) |
-           @as(u32, parts[3]);
+        (@as(u32, parts[1]) << 16) |
+        (@as(u32, parts[2]) << 8) |
+        @as(u32, parts[3]);
 }
 
 // ==================== 便捷路由配置函数 ====================
@@ -455,7 +492,6 @@ pub fn configSystemRoute(
     route_config: []const u8,
     gateway: u32,
 ) !void {
-    const builtin = @import("builtin");
 
     // Windows 权限检查
     if (builtin.os.tag == .windows) {
@@ -492,7 +528,6 @@ pub fn configSystemRoute(
 /// 使用系统 API 而非 shell 命令
 /// 直接使用接口索引，避免名称解析问题
 pub fn cleanSystemRouteByIndex(route_config: []const u8, tun_idx: u32, gateway: u32) void {
-    const builtin = @import("builtin");
 
     // Android 沙箱不支持路由操作
     if (builtin.os.tag == .linux and builtin.abi == .android) {
@@ -518,7 +553,6 @@ pub fn cleanSystemRouteByIndex(route_config: []const u8, tun_idx: u32, gateway: 
 ///
 /// 使用系统 API 而非 shell 命令
 pub fn cleanSystemRoute(route_config: []const u8, tun_name: ?[]const u8, gateway: u32) void {
-    const builtin = @import("builtin");
 
     // Android 沙箱不支持路由操作
     if (builtin.os.tag == .linux and builtin.abi == .android) {

@@ -920,21 +920,26 @@ pub const Router = struct {
     }
 
     /// Handle ICMP echo request - send echo reply
-    fn handleIcmpEcho(router: *Router, icmp_offset: usize) !void {
-        // ICMP header is at icmp_offset in the packet
+    fn handleIcmpEcho(router: *Router, ip_header_len: usize) !void {
+        // ICMP header is at ip_header_len in the packet
         // ICMP Echo Request: Type = 8, Code = 0
         // ICMP Echo Reply: Type = 0, Code = 0
 
-        const packet_len = router.packet_buf[2..4];
-        const total_len = std.mem.readInt(u16, packet_len, .big);
+        const packet = router.packet_buf[0..];
+        if (packet.len < 20) {
+            std.debug.print("[ICMP] Packet too small for IP header\n", .{});
+            return;
+        }
 
-        if (total_len < icmp_offset + 8) {
+        const total_len = std.mem.readInt(u16, packet[2..4], .big);
+
+        if (packet.len < ip_header_len + 8) {
             std.debug.print("[ICMP] Packet too small for ICMP\n", .{});
             return;
         }
 
         // Check if this is an echo request (type 8)
-        const icmp_type = router.packet_buf[icmp_offset];
+        const icmp_type = packet[ip_header_len];
         if (icmp_type != 8) {
             std.debug.print("[ICMP] Not an echo request (type={})\n", .{icmp_type});
             return;
@@ -943,11 +948,11 @@ pub const Router = struct {
         std.debug.print("[ICMP] Echo request received, sending reply\n", .{});
 
         // Copy packet to write buffer
-        @memcpy(router.write_buf[0..total_len], router.packet_buf[0..total_len]);
+        @memcpy(router.write_buf[0..total_len], packet);
 
         // Get src/dst IPs from original packet (in network byte order)
-        const src_ip = std.mem.readInt(u32, router.packet_buf[12..16], .big);
-        const dst_ip = std.mem.readInt(u32, router.packet_buf[16..20], .big);
+        const src_ip = std.mem.readInt(u32, packet[12..16], .big);
+        const dst_ip = std.mem.readInt(u32, packet[16..20], .big);
 
         std.debug.print("[ICMP]   src={s} dst={s}\n", .{ fmtIp(src_ip), fmtIp(dst_ip) });
 
@@ -958,16 +963,16 @@ pub const Router = struct {
         std.mem.writeInt(u32, router.write_buf[16..20], dst_ip, .big);
 
         // Change ICMP type from 8 (Echo Request) to 0 (Echo Reply)
-        router.write_buf[icmp_offset] = 0;
+        router.write_buf[ip_header_len] = 0;
 
         // Zero out checksum field before recalculating (MUST be 0 for correct calculation)
-        router.write_buf[icmp_offset + 2] = 0;
-        router.write_buf[icmp_offset + 3] = 0;
+        router.write_buf[ip_header_len + 2] = 0;
+        router.write_buf[ip_header_len + 3] = 0;
 
         // Recalculate ICMP checksum (includes pseudo-header)
         // ICMP checksum = one's complement of sum(pseudo-header + ICMP header + data)
         // Pseudo-header: src_ip + dst_ip + zero + protocol (1) + ICMP length
-        const icmp_len = total_len - icmp_offset;
+        const icmp_len = total_len - ip_header_len;
 
         var sum: u32 = 0;
 
@@ -986,7 +991,7 @@ pub const Router = struct {
         sum += @as(u32, @intCast(icmp_len));
 
         // Add ICMP header + data
-        var i: usize = icmp_offset;
+        var i: usize = ip_header_len;
         while (i + 1 < total_len) : (i += 2) {
             sum += std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(&router.write_buf[i])), .big);
         }
@@ -1001,7 +1006,7 @@ pub const Router = struct {
         const checksum = @as(u16, @truncate(~sum));
 
         // Write checksum
-        std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(&router.write_buf[icmp_offset + 2])), checksum, .big);
+        std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(&router.write_buf[ip_header_len + 2])), checksum, .big);
 
         // Write reply back to TUN
         try router.writeToTunBuf(router.write_buf[0..total_len]);
@@ -1080,7 +1085,7 @@ fn onTunReadable(
     router._stats.bytes_rx += n;
 
     // Platform-specific headers are handled by device_darwin.zig readFn
-    // packet_buf[0..n] contains the raw IP packet (no platform headers)
+    // The 4-byte AF_INET header has been stripped and IP packet copied to offset 0
     if (n < 20) {
         std.debug.print("[TUN] Packet too small ({})\n", .{n});
         router.submitTunRead();
@@ -1104,7 +1109,7 @@ fn onTunReadable(
     // ICMP protocol = 1
     if (protocol == 1) {
         std.debug.print("[TUN]   -> ICMP packet, handling echo\n", .{});
-        // Handle ICMP echo request (ping)
+        // Handle ICMP echo request (ping) - pass ip_header_len to skip IP header
         router.handleIcmpEcho(ip_header_len) catch {};
         router.submitTunRead();
         return .disarm;

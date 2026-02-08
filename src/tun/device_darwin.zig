@@ -243,9 +243,13 @@ fn readFn(ctx: *anyopaque, buf: []u8) TunError!usize {
     if (n < 0) return error.IoError;
     if (n < header_space) return 0; // 只有 header，没有数据
 
-    // 返回实际 IP 包大小（剥离 4 字节 header）
-    // Router 从 offset 0 开始使用数据
-    return @as(usize, @intCast(n - header_space));
+    // 实际 IP 包从偏移 4 开始，需要复制到缓冲区开头
+    // 这样 router 可以从 offset 0 开始使用数据
+    const ip_size = @as(usize, @intCast(n)) - header_space;
+    if (ip_size > 0) {
+        @memcpy(buf[0..ip_size], buf[header_space..@as(usize, @intCast(n))]);
+    }
+    return ip_size;
 }
 
 fn writeFn(ctx: *anyopaque, buf: []const u8) TunError!usize {

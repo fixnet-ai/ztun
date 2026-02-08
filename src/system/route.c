@@ -153,8 +153,17 @@ static uint32_t cidr_to_mask(int prefix_len) {
     return htonl(~(0xFFFFFFFF >> prefix_len));
 }
 
-/// 打印 IPv4 地址（用于调试）
+/// 打印 IPv4 地址（用于调试，输入为 host byte order）
 static const char* ipv4_to_str(uint32_t ip, char* buf, size_t buf_len) {
+    // Input is in host byte order, convert to network for inet_ntop
+    struct in_addr addr;
+    addr.s_addr = htonl(ip);
+    return inet_ntop(AF_INET, &addr, buf, buf_len);
+}
+
+/// 打印 IPv4 地址（用于调试，输入为 network byte order - 如 route_entry_t 所用）
+static const char* ipv4_to_str_nbo(uint32_t ip, char* buf, size_t buf_len) {
+    // Input is already in network byte order (as per route_entry_t definition)
     struct in_addr addr;
     addr.s_addr = ip;
     return inet_ntop(AF_INET, &addr, buf, buf_len);
@@ -534,7 +543,7 @@ static int bsd_route_add(const route_entry_t* route) {
 
         struct sockaddr_in* sa;
 
-        // 目标地址
+        // route目标地址 (->ipv4.dst is already in network byte order per route.h)
         sa = (struct sockaddr_in*)ptr;
         sa->sin_family = AF_INET;
         sa->sin_len = sizeof(struct sockaddr_in);
@@ -559,8 +568,8 @@ static int bsd_route_add(const route_entry_t* route) {
         rtm->rtm_msglen += sizeof(struct sockaddr_in);
 
         ROUTE_DEBUG("[ROUTE] Sending IPv4 RTM_ADD: dst=%s, gateway=%s, iface=%u",
-                   ipv4_to_str(route->ipv4.dst, ip_str, sizeof(ip_str)),
-                   ipv4_to_str(route->ipv4.gateway, ip_str, sizeof(ip_str)),
+                   ipv4_to_str_nbo(route->ipv4.dst, ip_str, sizeof(ip_str)),
+                   ipv4_to_str_nbo(route->ipv4.gateway, ip_str, sizeof(ip_str)),
                    route->iface_idx);
     }
 
@@ -569,6 +578,7 @@ static int bsd_route_add(const route_entry_t* route) {
 
     // 发送消息
     ssize_t ret = write(sock, msg, rtm->rtm_msglen);
+    fprintf(stderr, "[ROUTE] write() ret=%zd, expected=%u, errno=%d\n", ret, (unsigned int)rtm->rtm_msglen, errno);
     close(sock);
 
     if (ret < 0 || (size_t)ret != rtm->rtm_msglen) {
@@ -577,7 +587,7 @@ static int bsd_route_add(const route_entry_t* route) {
         return -1;
     }
 
-    ROUTE_DEBUG("[ROUTE] Route added successfully");
+    fprintf(stderr, "[ROUTE] Route added successfully\n");
     return 0;
 }
 
@@ -610,7 +620,8 @@ static int bsd_route_delete(const route_entry_t* route) {
 
     if (is_ipv6) {
         // IPv6 路由
-        rtm->rtm_addrs = RTA_DST | RTA_GATEWAY;
+        rtm->rtm_addrs = RTA_DST | RTA_GATEWAY | RTA_IFP;
+        rtm->rtm_flags |= RTF_CLONING;
 
         // 目标地址
         struct sockaddr_in6* sa6 = (struct sockaddr_in6*)ptr;
@@ -628,15 +639,24 @@ static int bsd_route_delete(const route_entry_t* route) {
         ptr += sizeof(struct sockaddr_in6);
         rtm->rtm_msglen += sizeof(struct sockaddr_in6);
 
-        ROUTE_DEBUG("[ROUTE] Sending IPv6 RTM_DELETE: dst=%s",
-                   ipv6_to_str(route->ipv6.dst.addr, ip_str, sizeof(ip_str)));
+        // 掩码
+        sa6 = (struct sockaddr_in6*)ptr;
+        sa6->sin6_family = AF_INET6;
+        sa6->sin6_len = sizeof(struct sockaddr_in6);
+        memcpy(&sa6->sin6_addr, route->ipv6.mask.prefix, 16);
+        ptr += sizeof(struct sockaddr_in6);
+        rtm->rtm_msglen += sizeof(struct sockaddr_in6);
+
+        ROUTE_DEBUG("[ROUTE] Sending IPv6 RTM_DELETE: dst=%s, iface=%u",
+                   ipv6_to_str(route->ipv6.dst.addr, ip_str, sizeof(ip_str)),
+                   route->iface_idx);
     } else {
         // IPv4 路由
-        rtm->rtm_addrs = RTA_DST | RTA_GATEWAY;
+        rtm->rtm_addrs = RTA_DST | RTA_GATEWAY | RTA_IFP;
 
         struct sockaddr_in* sa;
 
-        // 目标地址
+        // 目标地址 (route->ipv4.dst is already in network byte order)
         sa = (struct sockaddr_in*)ptr;
         sa->sin_family = AF_INET;
         sa->sin_len = sizeof(struct sockaddr_in);
@@ -652,9 +672,21 @@ static int bsd_route_delete(const route_entry_t* route) {
         ptr += sizeof(struct sockaddr_in);
         rtm->rtm_msglen += sizeof(struct sockaddr_in);
 
-        ROUTE_DEBUG("[ROUTE] Sending IPv4 RTM_DELETE: dst=%s",
-                   ipv4_to_str(route->ipv4.dst, ip_str, sizeof(ip_str)));
+        // 掩码 (用于删除路由匹配)
+        sa = (struct sockaddr_in*)ptr;
+        sa->sin_family = AF_INET;
+        sa->sin_len = sizeof(struct sockaddr_in);
+        sa->sin_addr.s_addr = route->ipv4.mask;
+        ptr += sizeof(struct sockaddr_in);
+        rtm->rtm_msglen += sizeof(struct sockaddr_in);
+
+        ROUTE_DEBUG("[ROUTE] Sending IPv4 RTM_DELETE: dst=%s, iface=%u",
+                   ipv4_to_str_nbo(route->ipv4.dst, ip_str, sizeof(ip_str)),
+                   route->iface_idx);
     }
+
+    // 设置接口索引 (必须设置才能正确删除)
+    rtm->rtm_index = (unsigned short)route->iface_idx;
 
     ssize_t ret = write(sock, msg, rtm->rtm_msglen);
 
@@ -819,6 +851,157 @@ static int bsd_route_list(route_entry_t* routes, int max_count) {
 }
 
 #endif // PLATFORM_MACOS
+
+// ========================================
+// Route Verification (Cross-Platform)
+// ========================================
+
+/// Verify a route exists in the routing table (BSD/macOS)
+static int bsd_route_verify(const route_entry_t* route) {
+    int sock = socket(PF_ROUTE, SOCK_RAW, AF_UNSPEC);
+    if (sock < 0) {
+        ROUTE_ERROR("[ROUTE] Failed to create routing socket for verify: errno=%d", errno);
+        return -1;
+    }
+    close(sock);
+
+    // Query routing table
+    int num_routes = route_list(NULL, 0);
+    if (num_routes < 0) {
+        ROUTE_ERROR("[ROUTE] Failed to query routes for verify");
+        return -1;
+    }
+
+    if (num_routes == 0) {
+        ROUTE_DEBUG("[ROUTE] No routes in table to verify against");
+        return 0;
+    }
+
+    route_entry_t* routes = malloc(sizeof(route_entry_t) * num_routes);
+    if (!routes) {
+        ROUTE_ERROR("[ROUTE] Memory allocation failed for verify");
+        return -1;
+    }
+
+    int count = route_list(routes, num_routes);
+    if (count < 0) {
+        free(routes);
+        ROUTE_ERROR("[ROUTE] Failed to list routes for verify");
+        return -1;
+    }
+
+    // Search for matching route (match by dst, mask, and iface_idx)
+    int found = 0;
+    for (int i = 0; i < count; i++) {
+        const route_entry_t* r = &routes[i];
+        if (r->family != route->family) continue;
+
+        if (r->family == ROUTE_AF_INET) {
+            // Compare destination, mask, and interface
+            if (r->ipv4.dst == route->ipv4.dst &&
+                r->ipv4.mask == route->ipv4.mask &&
+                r->iface_idx == route->iface_idx) {
+                found = 1;
+
+                // Verify gateway matches if specified
+                if (route->ipv4.gateway != 0 && r->ipv4.gateway != route->ipv4.gateway) {
+                    char expected[32], actual[32];
+                    ROUTE_WARN("[ROUTE] Route exists but gateway differs: expected=%s, actual=%s",
+                               ipv4_to_str_nbo(route->ipv4.gateway, expected, sizeof(expected)),
+                               ipv4_to_str_nbo(r->ipv4.gateway, actual, sizeof(actual)));
+                    found = 0;
+                }
+                break;
+            }
+        }
+    }
+
+    char dst_str[32];
+    if (found) {
+        ROUTE_DEBUG("[ROUTE] Route verified: dst=%s iface=%d",
+                   ipv4_to_str_nbo(route->ipv4.dst, dst_str, sizeof(dst_str)),
+                   route->iface_idx);
+    } else {
+        ROUTE_WARN("[ROUTE] Route NOT found: dst=%s mask=%s iface=%d",
+                   ipv4_to_str_nbo(route->ipv4.dst, dst_str, sizeof(dst_str)),
+                   ipv4_to_str_nbo(route->ipv4.mask, dst_str, sizeof(dst_str)),
+                   route->iface_idx);
+    }
+
+    free(routes);
+    return found;
+}
+
+/// Forward declaration for winsock_init
+static int winsock_init(void);
+
+/// Verify a route exists (Windows)
+static int windows_route_verify(const route_entry_t* route) {
+    if (winsock_init() < 0) {
+        return -1;
+    }
+
+    // Query routing table
+    int num_routes = route_list(NULL, 0);
+    if (num_routes < 0) {
+        ROUTE_ERROR("[ROUTE] Failed to query routes for verify");
+        return -1;
+    }
+
+    if (num_routes == 0) {
+        ROUTE_DEBUG("[ROUTE] No routes in table to verify against");
+        return 0;
+    }
+
+    route_entry_t* routes = malloc(sizeof(route_entry_t) * num_routes);
+    if (!routes) {
+        ROUTE_ERROR("[ROUTE] Memory allocation failed for verify");
+        return -1;
+    }
+
+    int count = route_list(routes, num_routes);
+    if (count < 0) {
+        free(routes);
+        ROUTE_ERROR("[ROUTE] Failed to list routes for verify");
+        return -1;
+    }
+
+    // Search for matching route
+    int found = 0;
+    for (int i = 0; i < count; i++) {
+        const route_entry_t* r = &routes[i];
+        if (r->family != route->family) continue;
+
+        if (r->family == ROUTE_AF_INET) {
+            if (r->ipv4.dst == route->ipv4.dst &&
+                r->ipv4.mask == route->ipv4.mask &&
+                r->iface_idx == route->iface_idx) {
+                found = 1;
+                break;
+            }
+        } else if (r->family == ROUTE_AF_INET6) {
+            if (r->iface_idx == route->iface_idx) {
+                // For IPv6, just check route exists on interface
+                found = 1;
+                break;
+            }
+        }
+    }
+
+    free(routes);
+    return found;
+}
+
+/// Verify a route exists in the routing table (public API)
+int route_verify(const route_entry_t* route) {
+    ROUTE_DEBUG("[ROUTE] route_verify called");
+
+#ifdef PLATFORM_WINDOWS
+    return windows_route_verify(route);
+#else
+    return bsd_route_verify(route);
+#endif
+}
 
 // ========================================
 // Windows: IP Helper API
