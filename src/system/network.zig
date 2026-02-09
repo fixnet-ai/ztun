@@ -176,6 +176,9 @@ extern fn route_cleanup() void;
 /// Windows: 检查是否有管理员权限
 extern fn route_has_admin_privileges() c_int;
 
+/// 配置 TUN 接口 IP 地址 (BSD/macOS)
+extern fn configure_tun_ip(ifname: [*:0]const u8, ip_addr: [*:0]const u8) c_int;
+
 // ==================== Zig 包装函数 ====================
 
 /// 获取所有本地 IP 地址
@@ -234,6 +237,13 @@ pub fn getInterfaceIp(alloc: std.mem.Allocator, iface_name: []const u8) ![]u8 {
     _ = alloc;
     // TODO: 需要在 C 层实现按接口名获取 IP
     return error.NotImplemented;
+}
+
+/// 配置 TUN 接口 IP 地址
+///
+/// 在 macOS 上，TUN 接口需要先配置 IP 地址才能添加路由
+pub fn configureTunIp(ifname: [*:0]const u8, ip_addr: [*:0]const u8) c_int {
+    return configure_tun_ip(ifname, ip_addr);
 }
 
 // ==================== 系统路由管理（新 API）====================
@@ -298,7 +308,7 @@ pub fn addRoutes(routes: []const RouteEntry) !void {
         }
     }
 
-    for (routes) |*route| {
+    for (routes, 0..) |*route, i| {
         if (route_add(route) != 0) {
             return error.RouteAddFailed;
         }
@@ -306,7 +316,8 @@ pub fn addRoutes(routes: []const RouteEntry) !void {
 
         // 验证路由是否真正添加成功
         std.time.sleep(10 * std.time.ns_per_ms); // 短暂等待
-        const verified = route_verify(route);
+        // Use index-based access to avoid pointer issues
+        const verified = route_verify(&routes[i]);
         if (verified < 0) {
             return error.RouteVerifyError;
         }
@@ -516,6 +527,8 @@ pub fn configSystemRoute(
         if (trimmed.len == 0) continue;
 
         const route = try parseRoute(trimmed, iface_idx, gateway);
+        std.debug.print("[NET] Route parsed: cidr={s} dst=0x{X:0>8} mask=0x{X:0>8} gateway=0x{X:0>8} iface={d}\n",
+            .{ trimmed, route.un.ipv4.dst, route.un.ipv4.mask, route.un.ipv4.gateway, route.iface_idx });
         try routes.append(route);
     }
 

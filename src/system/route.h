@@ -182,6 +182,18 @@ int route_create_ipv6(const uint8_t* dst, uint8_t prefix_len,
 ///   mask_out: Output mask (16 bytes)
 void route_ipv6_prefix_to_mask(uint8_t prefix_len, uint8_t* mask_out);
 
+// ==================== TUN Interface Configuration ====================
+
+/// Configure TUN interface IP address (BSD/macOS)
+///
+/// Parameters:
+///   ifname: Interface name (e.g., "utun0")
+///   ip_addr: IP address in dotted-decimal format (e.g., "10.0.0.1")
+///
+/// Returns:
+///   0 on success, -1 on error
+int configure_tun_ip(const char* ifname, const char* ip_addr);
+
 // ==================== Platform-Specific API ====================
 
 #ifdef PLATFORM_LINUX

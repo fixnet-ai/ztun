@@ -163,9 +163,10 @@ static const char* ipv4_to_str(uint32_t ip, char* buf, size_t buf_len) {
 
 /// 打印 IPv4 地址（用于调试，输入为 network byte order - 如 route_entry_t 所用）
 static const char* ipv4_to_str_nbo(uint32_t ip, char* buf, size_t buf_len) {
-    // Input is already in network byte order (as per route_entry_t definition)
+    // Convert network byte order to host byte order for printing
+    uint32_t host_ip = ntohl(ip);
     struct in_addr addr;
-    addr.s_addr = ip;
+    addr.s_addr = host_ip;
     return inet_ntop(AF_INET, &addr, buf, buf_len);
 }
 
@@ -538,7 +539,8 @@ static int bsd_route_add(const route_entry_t* route) {
         if (route->ipv4.gateway != 0) {
             rtm->rtm_flags |= RTF_GATEWAY;
         } else {
-            rtm->rtm_flags |= RTF_CLONING;
+            // For direct routes (no gateway), use RTF_STATIC to ensure permanent addition
+            rtm->rtm_flags |= RTF_STATIC;
         }
 
         struct sockaddr_in* sa;
@@ -565,6 +567,10 @@ static int bsd_route_add(const route_entry_t* route) {
         sa->sin_len = sizeof(struct sockaddr_in);
         sa->sin_addr.s_addr = route->ipv4.mask;
         ptr += sizeof(struct sockaddr_in);
+
+        // Debug: 打印发送的原始值
+        fprintf(stderr, "[ROUTE] Sending IPv4 RTM_ADD: dst=0x%08X mask=0x%08X gateway=0x%08X iface=%u\n",
+                   route->ipv4.dst, route->ipv4.mask, route->ipv4.gateway, route->iface_idx);
         rtm->rtm_msglen += sizeof(struct sockaddr_in);
 
         ROUTE_DEBUG("[ROUTE] Sending IPv4 RTM_ADD: dst=%s, gateway=%s, iface=%u",
@@ -621,7 +627,12 @@ static int bsd_route_delete(const route_entry_t* route) {
     if (is_ipv6) {
         // IPv6 路由
         rtm->rtm_addrs = RTA_DST | RTA_GATEWAY | RTA_IFP;
-        rtm->rtm_flags |= RTF_CLONING;
+        // For direct routes (no gateway), use RTF_STATIC to ensure permanent addition
+        if (route->ipv6.gateway.addr[0] == 0 && route->ipv6.gateway.addr[1] == 0) {
+            rtm->rtm_flags |= RTF_STATIC;
+        } else {
+            rtm->rtm_flags |= RTF_GATEWAY;
+        }
 
         // 目标地址
         struct sockaddr_in6* sa6 = (struct sockaddr_in6*)ptr;
@@ -853,11 +864,32 @@ static int bsd_route_list(route_entry_t* routes, int max_count) {
 #endif // PLATFORM_MACOS
 
 // ========================================
+// Route Command Fallback (BSD)
+// ========================================
+
+/// Add route using system command (BSD/macOS fallback) - forward declaration
+static int bsd_route_add_cmd(const route_entry_t* route);
+
+// ========================================
 // Route Verification (Cross-Platform)
 // ========================================
 
 /// Verify a route exists in the routing table (BSD/macOS)
 static int bsd_route_verify(const route_entry_t* route) {
+    // Print raw bytes of dst to debug byte order (always print for debugging)
+    fprintf(stderr, "[VERIFY] Raw bytes of route->ipv4.dst: %02X %02X %02X %02X\n",
+               ((uint8_t*)&route->ipv4.dst)[0],
+               ((uint8_t*)&route->ipv4.dst)[1],
+               ((uint8_t*)&route->ipv4.dst)[2],
+               ((uint8_t*)&route->ipv4.dst)[3]);
+
+    char dst_str[32], mask_str[32], gw_str[32];
+    fprintf(stderr, "[VERIFY] Input route: dst=%s mask=%s gateway=%s iface=%u family=%d\n",
+               ipv4_to_str_nbo(route->ipv4.dst, dst_str, sizeof(dst_str)),
+               ipv4_to_str_nbo(route->ipv4.mask, mask_str, sizeof(mask_str)),
+               ipv4_to_str_nbo(route->ipv4.gateway, gw_str, sizeof(gw_str)),
+               route->iface_idx, route->family);
+
     int sock = socket(PF_ROUTE, SOCK_RAW, AF_UNSPEC);
     if (sock < 0) {
         ROUTE_ERROR("[ROUTE] Failed to create routing socket for verify: errno=%d", errno);
@@ -916,7 +948,6 @@ static int bsd_route_verify(const route_entry_t* route) {
         }
     }
 
-    char dst_str[32];
     if (found) {
         ROUTE_DEBUG("[ROUTE] Route verified: dst=%s iface=%d",
                    ipv4_to_str_nbo(route->ipv4.dst, dst_str, sizeof(dst_str)),
@@ -924,7 +955,7 @@ static int bsd_route_verify(const route_entry_t* route) {
     } else {
         ROUTE_WARN("[ROUTE] Route NOT found: dst=%s mask=%s iface=%d",
                    ipv4_to_str_nbo(route->ipv4.dst, dst_str, sizeof(dst_str)),
-                   ipv4_to_str_nbo(route->ipv4.mask, dst_str, sizeof(dst_str)),
+                   ipv4_to_str_nbo(route->ipv4.mask, mask_str, sizeof(mask_str)),
                    route->iface_idx);
     }
 
@@ -1553,7 +1584,8 @@ int route_add(const route_entry_t* route) {
 #endif
 
 #ifdef PLATFORM_MACOS
-    return bsd_route_add(route);
+    // Use system command fallback for route add (routing sockets unreliable for TUN)
+    return bsd_route_add_cmd(route);
 #endif
 
 #ifdef PLATFORM_IOS
@@ -1683,3 +1715,76 @@ void route_set_timeout(int timeout_ms) {
 }
 
 #endif // PLATFORM_LINUX
+
+// ========================================
+// TUN Interface Configuration
+// ========================================
+
+/// Configure TUN interface IP address (BSD/macOS)
+int configure_tun_ip(const char* ifname, const char* ip_addr) {
+    if (!ifname || !ip_addr) {
+        ROUTE_ERROR("[ROUTE] configure_tun_ip: NULL pointer");
+        return -1;
+    }
+
+    // Build ifconfig command: ifconfig <ifname> <ip_addr> <ip_addr>
+    // For point-to-point interfaces, we set local_ip = remote_ip = ip_addr
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "ifconfig %s %s %s 2>&1", ifname, ip_addr, ip_addr);
+
+    ROUTE_INFO("[ROUTE] Configuring TUN IP: %s", cmd);
+
+    int result = system(cmd);
+    if (result != 0) {
+        ROUTE_WARN("[ROUTE] ifconfig failed with exit code %d", result);
+        return -1;
+    }
+
+    ROUTE_INFO("[ROUTE] TUN interface %s configured with IP %s", ifname, ip_addr);
+    return 0;
+}
+
+/// Add route using system command (BSD/macOS fallback)
+int bsd_route_add_cmd(const route_entry_t* route) {
+    if (!route) {
+        ROUTE_ERROR("[ROUTE] bsd_route_add_cmd: NULL pointer");
+        return -1;
+    }
+
+    // Convert IP addresses from network byte order to string
+    char dst_str[32], mask_str[32];
+    ipv4_to_str_nbo(route->ipv4.dst, dst_str, sizeof(dst_str));
+    ipv4_to_str_nbo(route->ipv4.mask, mask_str, sizeof(mask_str));
+
+    // Get interface name from index
+    char ifname[64];
+    if (!if_indextoname(route->iface_idx, ifname)) {
+        ROUTE_ERROR("[ROUTE] Failed to get interface name from index %u", route->iface_idx);
+        return -1;
+    }
+
+    // Build route command: route -n add -net <dst> -netmask <mask> -interface <ifname>
+    // For TUN point-to-point interfaces, always use -interface to force route to specific interface
+    char cmd[512];
+
+    // First, try to delete existing route to avoid "File exists" error
+    snprintf(cmd, sizeof(cmd), "route -n delete -net %s -netmask %s -interface %s 2>/dev/null",
+             dst_str, mask_str, ifname);
+    ROUTE_INFO("[ROUTE] Deleting existing route: %s", cmd);
+    system(cmd);
+
+    // Add the new route using -interface (best for TUN devices)
+    snprintf(cmd, sizeof(cmd), "route -n add -net %s -netmask %s -interface %s 2>&1",
+             dst_str, mask_str, ifname);
+
+    ROUTE_INFO("[ROUTE] Adding route via command: %s", cmd);
+
+    int result = system(cmd);
+    if (result != 0) {
+        ROUTE_WARN("[ROUTE] route command failed with exit code %d", result);
+        return -1;
+    }
+
+    ROUTE_INFO("[ROUTE] Route added via command: %s -> %s", dst_str, ifname);
+    return 0;
+}

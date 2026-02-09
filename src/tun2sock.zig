@@ -35,6 +35,9 @@ extern "c" fn geteuid() callconv(.C) c_uint;
 // Windows IsUserAnAdmin check - returns BOOL (1 = admin, 0 = not admin)
 extern "c" fn IsUserAnAdmin() callconv(.Windows) c_uint;
 
+// C library system() function for running shell commands
+extern fn system(cmd: [*:0]const u8) c_int;
+
 /// Check if running with administrator/root privileges
 fn isElevated() bool {
     if (builtin.os.tag == .windows) {
@@ -261,6 +264,18 @@ pub fn main() !u8 {
     const tun_ifindex = device.ifIndex() catch 0;
     std.debug.print("TUN interface index: {d} (name='{s}')\n", .{ tun_ifindex, tun_name });
 
+    // Configure TUN interface IP address (required before adding routes on macOS)
+    if (builtin.os.tag == .macos or builtin.os.tag == .ios) {
+        const tun_name_z = try allocator.dupeZ(u8, tun_name);
+        defer allocator.free(tun_name_z);
+        const tun_ip_z = try allocator.dupeZ(u8, args.tun_ip);
+        defer allocator.free(tun_ip_z);
+        std.debug.print("Configuring TUN IP: {s} -> {s}\n", .{ tun_name, args.tun_ip });
+        if (network.configureTunIp(tun_name_z, tun_ip_z) != 0) {
+            std.debug.print("Warning: Failed to configure TUN IP, routes may fail\n", .{});
+        }
+    }
+
     // Configure route: target_ip/32 -> TUN (via C layer)
     const target_cidr = try std.fmt.allocPrint(allocator, "{s}/32", .{args.target_ip});
     defer allocator.free(target_cidr);
@@ -275,9 +290,10 @@ pub fn main() !u8 {
     };
     std.debug.print("Route configured: {s} -> {s}\n", .{ target_cidr, args.tun_ip });
 
-    // Create TUN configuration for router
+    // Parse TUN IP for router configuration
     const tun_ip_nbo = network.parseIp(args.tun_ip) catch 0;
 
+    // Create TUN configuration for router
     const tun_config = router.TunConfig{
         .name = try allocator.dupeZ(u8, tun_name),
         .ifindex = tun_ifindex,
