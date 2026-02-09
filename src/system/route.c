@@ -545,7 +545,7 @@ static int bsd_route_add(const route_entry_t* route) {
 
         struct sockaddr_in* sa;
 
-        // route目标地址 (->ipv4.dst is already in network byte order per route.h)
+        // route目标地址
         sa = (struct sockaddr_in*)ptr;
         sa->sin_family = AF_INET;
         sa->sin_len = sizeof(struct sockaddr_in);
@@ -567,10 +567,6 @@ static int bsd_route_add(const route_entry_t* route) {
         sa->sin_len = sizeof(struct sockaddr_in);
         sa->sin_addr.s_addr = route->ipv4.mask;
         ptr += sizeof(struct sockaddr_in);
-
-        // Debug: 打印发送的原始值
-        fprintf(stderr, "[ROUTE] Sending IPv4 RTM_ADD: dst=0x%08X mask=0x%08X gateway=0x%08X iface=%u\n",
-                   route->ipv4.dst, route->ipv4.mask, route->ipv4.gateway, route->iface_idx);
         rtm->rtm_msglen += sizeof(struct sockaddr_in);
 
         ROUTE_DEBUG("[ROUTE] Sending IPv4 RTM_ADD: dst=%s, gateway=%s, iface=%u",
@@ -1584,7 +1580,10 @@ int route_add(const route_entry_t* route) {
 #endif
 
 #ifdef PLATFORM_MACOS
-    // Use system command fallback for route add (routing sockets unreliable for TUN)
+    // Use system command for route add (BSD routing sockets silently fail for TUN)
+    // The route command internally uses routing sockets but handles TUN devices
+    // correctly through proper sockaddr_dl structures and interface-specific flags.
+    // Since there's no higher-level libc API, we invoke the route command directly.
     return bsd_route_add_cmd(route);
 #endif
 
@@ -1763,19 +1762,20 @@ int bsd_route_add_cmd(const route_entry_t* route) {
         return -1;
     }
 
-    // Build route command: route -n add -net <dst> -netmask <mask> -interface <ifname>
-    // For TUN point-to-point interfaces, always use -interface to force route to specific interface
+    // Build route command using Tailscale-compatible format:
+    // route -q -n add -inet <dst>/<prefix> -iface <ifname>
+    // Note: macOS route command uses -inet instead of -net, -iface instead of -interface
     char cmd[512];
 
     // First, try to delete existing route to avoid "File exists" error
-    snprintf(cmd, sizeof(cmd), "route -n delete -net %s -netmask %s -interface %s 2>/dev/null",
-             dst_str, mask_str, ifname);
+    snprintf(cmd, sizeof(cmd), "route -q -n delete -inet %s/%d -iface %s 2>/dev/null",
+             dst_str, 32, ifname);
     ROUTE_INFO("[ROUTE] Deleting existing route: %s", cmd);
     system(cmd);
 
-    // Add the new route using -interface (best for TUN devices)
-    snprintf(cmd, sizeof(cmd), "route -n add -net %s -netmask %s -interface %s 2>&1",
-             dst_str, mask_str, ifname);
+    // Add the new route using -inet and -iface flags (Tailscale/macOS convention)
+    snprintf(cmd, sizeof(cmd), "route -q -n add -inet %s/%d -iface %s 2>&1",
+             dst_str, 32, ifname);
 
     ROUTE_INFO("[ROUTE] Adding route via command: %s", cmd);
 
