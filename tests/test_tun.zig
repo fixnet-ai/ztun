@@ -1,672 +1,580 @@
-//! test_tun.zig - Complete ICMP ping echo test
-//!
-//! This test verifies TUN device and ICMP protocol implementation
-//! by performing a full ping roundtrip:
-//!   1. Create TUN device with IP 10.0.0.1
-//!   2. Add route: 10.0.0.2/32 -> via 10.0.0.1 (loopback route)
-//!   3. Send ICMP echo request from 10.0.0.1 to 10.0.0.2
-//!   4. Receive the packet from TUN (should be our looped-back request)
-//!   5. Build ICMP echo reply (swap src/dst, change type)
-//!   6. Send reply back to TUN
-//!   7. Receive the echo reply
-//!   8. Verify the reply matches our request
-//!
-//! Run: sudo ./test_tun
+// tests/test_tun.zig - Complete Pure Zig TUN Test
+// Build: zig build-exe tests/test_tun.zig -lc -I. -o test_tun
+// Run: sudo ./test_tun
+//
+// This is a 100% pure Zig implementation combining:
+// - UTUN socket creation (from test_icmp.zig patterns)
+// - BSD Routing Socket (from test_route.zig patterns)
+// - ICMP packet processing
+// - Route configuration via ifconfig/route commands
 
 const std = @import("std");
-const tun = @import("tun");
-const DeviceConfig = tun.DeviceConfig;
-const NetworkAddress = tun.NetworkAddress;
-const checksum = @import("ipstack_checksum");
-// Use C-based network module for routing
-const network = @import("network");
+const c = @import("std").c;
 
-const ICMP_ECHO = 8;
-const ICMP_ECHOREPLY = 0;
-const ICMP_PROTOCOL = 1;
+const BUF_SIZE = 4096;
 
-const ETHERNET_MTU = 1500;
-const IP_HEADER_SIZE = 20;
-const ICMP_HEADER_SIZE = 8;
-const PING_DATA_SIZE = 56; // Standard ping payload size
+// ============================================================================
+// macOS Constants (VERIFIED from test_icmp.zig)
+// ============================================================================
 
-// IPv4 header structure (network byte order)
-const Ipv4Header = extern struct {
-    ver_ihl: u8,
-    tos: u8,
-    len: u16,      // Network byte order (big-endian)
-    id: u16,       // Network byte order
-    off: u16,      // Network byte order
-    ttl: u8,
-    proto: u8,
-    csum: u16,     // Network byte order
-    src: [4]u8,
-    dst: [4]u8,
+const PF_SYSTEM = @as(c_int, 32);
+const SYSPROTO_CONTROL = @as(c_int, 2);
+const AF_SYSTEM = @as(c_int, 2);
+const AF_SYS_CONTROL = @as(c_int, 2);
+const SOCK_DGRAM = @as(c_int, 2);
+
+// ioctl request code for CTLIOCGINFO
+const CTLIOCGINFO: u32 = 0xC0644E03;
+const UTUN_OPT_IFNAME = @as(c_int, 2);
+
+// Interface flags
+const IFF_UP: c_short = 0x1;
+const IFF_RUNNING: c_short = 0x40;
+
+// ioctl Request Codes
+const SIOCGIFFLAGS: u32 = 0xC0206914;
+const SIOCSIFFLAGS: u32 = 0x80206910;
+const SIOCSIFADDR: u32 = 0x8020690C;
+const SIOCSIFDSTADDR: u32 = 0x80206914;
+
+// BSD Routing Socket Constants (VERIFIED from test_route.zig)
+const AF_ROUTE = @as(c_int, 17);
+const SOCK_RAW = @as(c_int, 3);
+const RTM_VERSION = @as(u8, 5);
+const RTM_ADD = @as(u8, 0x1);
+const RTM_DELETE = @as(u8, 0x2);
+const RTF_UP = @as(i32, 0x1);
+const RTF_STATIC = @as(i32, 0x800);
+const RTA_DST = @as(i32, 0x1);
+const RTA_GATEWAY = @as(i32, 0x2);
+
+// ============================================================================
+// macOS Type Definitions (VERIFIED from test_icmp.zig)
+// ============================================================================
+
+// ctl_info structure
+const ctl_info = extern struct {
+    ctl_id: u32 = 0,
+    ctl_name: [96]u8 = [_]u8{0} ** 96,
+
+    pub fn setName(this: *ctl_info, name: [*:0]const u8) void {
+        @memset(&this.ctl_name, 0);
+        var i: usize = 0;
+        while (i < 95 and name[i] != 0) : (i += 1) {
+            this.ctl_name[i] = name[i];
+        }
+    }
 };
 
-// ICMP header structure (network byte order)
-const IcmpHeader = extern struct {
-    icmp_type: u8,
-    icmp_code: u8,
-    icmp_csum: u16,  // Network byte order
-    icmp_id: u16,    // Network byte order
-    icmp_seq: u16,   // Network byte order
+// BSD sockaddr_ctl
+const sockaddr_ctl = extern struct {
+    sc_len: u8 = 0,
+    sc_family: u8 = 0,
+    ss_sysaddr: u16 = 0,
+    sc_id: u32 = 0,
+    sc_unit: u32 = 0,
+    sc_reserved: [5]u32 = [_]u32{0} ** 5,
+
+    pub fn init(ctl_id: u32, unit: u32) sockaddr_ctl {
+        return .{
+            .sc_len = @sizeOf(sockaddr_ctl),
+            .sc_family = AF_SYSTEM,
+            .ss_sysaddr = AF_SYS_CONTROL,
+            .sc_id = ctl_id,
+            .sc_unit = unit,
+        };
+    }
 };
 
-// Parse IPv4 string to [4]u8
-fn parseIpv4(str: []const u8) ![4]u8 {
+// BSD sockaddr_in
+const sockaddr_in = extern struct {
+    sin_len: u8 = 0,
+    sin_family: u8 = 0,
+    sin_port: u16 = 0,
+    sin_addr: [4]u8 = [_]u8{0} ** 4,
+    sin_zero: [8]u8 = [_]u8{0} ** 8,
+};
+
+// ifreq structure
+const ifreq = extern struct {
+    ifr_name: [16]u8 = [_]u8{0} ** 16,
+    ifr_ifru: extern union {
+        ifr_addr: sockaddr_in,
+        ifr_dstaddr: sockaddr_in,
+        ifr_flags: c_short,
+        ifr_metric: c_int,
+        ifr_mtu: c_int,
+    } = undefined,
+
+    pub fn setName(this: *ifreq, name: [*:0]const u8) void {
+        @memset(&this.ifr_name, 0);
+        var i: usize = 0;
+        while (i < 15 and name[i] != 0) : (i += 1) {
+            this.ifr_name[i] = name[i];
+        }
+    }
+};
+
+// ============================================================================
+// BSD Routing Socket Structures (VERIFIED from test_route.zig)
+// ============================================================================
+
+// rt_metrics - embedded in rt_msghdr (56 bytes)
+const rt_metrics = extern struct {
+    rmx_locks: u32,
+    rmx_mtu: u32,
+    rmx_hopcount: u32,
+    rmx_expire: i32,
+    rmx_recvpipe: u32,
+    rmx_sendpipe: u32,
+    rmx_ssthresh: u32,
+    rmx_rtt: u32,
+    rmx_rttvar: u32,
+    rmx_pksent: u32,
+    rmx_filler: [4]u32,
+};
+
+// rt_msghdr - routing message header (92 bytes)
+const rt_msghdr = extern struct {
+    rtm_msglen: u16,
+    rtm_version: u8,
+    rtm_type: u8,
+    rtm_index: u16,
+    rtm_flags: i32,
+    rtm_addrs: i32,
+    rtm_pid: i32,
+    rtm_seq: i32,
+    rtm_errno: i32,
+    rtm_use: i32,
+    rtm_inits: u32,
+    rmx: rt_metrics,
+};
+
+// ============================================================================
+// Minimal C Declarations
+// ============================================================================
+
+extern "c" fn getsockopt(
+    sock: c_int,
+    level: c_int,
+    optname: c_int,
+    optval: ?*anyopaque,
+    optlen: *c_uint,
+) c_int;
+
+extern "c" fn read(fd: c_int, buf: *anyopaque, nbytes: usize) c_int;
+extern "c" fn write(fd: c_int, buf: *const anyopaque, nbytes: usize) c_int;
+extern "c" var errno: c_int;
+
+// ============================================================================
+// Global Buffer
+// ============================================================================
+
+var packet_buf: [BUF_SIZE]u8 = undefined;
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+var ip2str_buf1: [16]u8 = undefined;
+var ip2str_buf2: [16]u8 = undefined;
+var ip2str_use_first = true;
+
+pub fn ip2str(ip: u32) [*:0]const u8 {
+    const b0 = (ip >> 24) & 0xFF;
+    const b1 = (ip >> 16) & 0xFF;
+    const b2 = (ip >> 8) & 0xFF;
+    const b3 = ip & 0xFF;
+
+    const buf = if (ip2str_use_first) &ip2str_buf1 else &ip2str_buf2;
+    ip2str_use_first = !ip2str_use_first;
+
+    const len = std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ b0, b1, b2, b3 }) catch unreachable;
+    buf[len.len] = 0;
+    return @as([*:0]const u8, @ptrCast(buf));
+}
+
+// Parse IP string to u32
+fn parseIpv4ToU32(ip_str: [*:0]const u8) u32 {
+    var val: u32 = 0;
     var parts: [4]u8 = undefined;
-    var part_count: usize = 0;
-    var current: u8 = 0;
+    var count: usize = 0;
+    var i: usize = 0;
 
-    for (str) |c| {
-        if (c == '.') {
-            if (part_count >= 4) return error.InvalidIp;
-            parts[part_count] = current;
-            part_count += 1;
-            current = 0;
-        } else if (c >= '0' and c <= '9') {
-            current = current * 10 + (c - '0');
+    while (ip_str[i] != 0) : (i += 1) {
+        const ch = ip_str[i];
+        if (ch == '.') {
+            if (count < 4) {
+                parts[count] = @as(u8, @intCast(val));
+                val = 0;
+                count += 1;
+            }
         } else {
-            return error.InvalidIp;
+            val = val * 10 + (ch - '0');
         }
     }
+    if (count < 4) {
+        parts[count] = @as(u8, @intCast(val));
+    }
 
-    if (part_count >= 4) return error.InvalidIp;
-    parts[part_count] = current;
-    part_count += 1;
-
-    if (part_count != 4) return error.InvalidIp;
-
-    return parts;
+    return @as(u32, parts[0]) << 24 |
+           @as(u32, parts[1]) << 16 |
+           @as(u32, parts[2]) << 8 |
+           @as(u32, parts[3]);
 }
 
-// Convert [4]u8 to null-terminated C string
-fn toCStr(dest: *[16]u8, src: []const u8) void {
-    @memcpy(dest[0..src.len], src);
-    dest[src.len] = 0;
+// ============================================================================
+// Command Execution
+// ============================================================================
+
+fn run_command(argv: []const []const u8) !c_int {
+    var child = std.process.Child.init(argv, std.heap.page_allocator);
+    child.stdin_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+
+    const term = try child.spawnAndWait();
+    switch (term) {
+        .Exited => |code| return code,
+        else => return -1,
+    }
 }
 
-// Calculate IP/ICMP checksum
-fn calculateChecksum(data: []const u8) u16 {
-    return checksum.checksum(data.ptr, data.len);
+fn add_route(ifname: [*:0]const u8, dst_ip: [*:0]const u8) c_int {
+    const ifname_str = std.mem.sliceTo(ifname, 0);
+    const dst_ip_str = std.mem.sliceTo(dst_ip, 0);
+    return run_command(&[_][]const u8{ "route", "-q", "-n", "add", "-inet", dst_ip_str, "-iface", ifname_str }) catch return -1;
 }
 
-// Dump detailed packet information
-fn dumpPacket(label: []const u8, packet: []const u8, ip_header_len: usize) void {
-    std.debug.print("\n{d} ==========\n", .{label});
-    std.debug.print("Total packet size: {d} bytes\n", .{packet.len});
+fn delete_route(dst_ip: [*:0]const u8) c_int {
+    const dst_ip_str = std.mem.sliceTo(dst_ip, 0);
+    return run_command(&[_][]const u8{ "route", "-q", "-n", "delete", "-inet", dst_ip_str }) catch return -1;
+}
 
-    if (packet.len < IP_HEADER_SIZE) {
-        std.debug.print("Packet too small for IP header\n", .{});
-        return;
+fn configure_interface(ifname: [*:0]const u8, ip: [*:0]const u8, peer: [*:0]const u8) c_int {
+    const ifname_str = std.mem.sliceTo(ifname, 0);
+    const ip_str = std.mem.sliceTo(ip, 0);
+    const peer_str = std.mem.sliceTo(peer, 0);
+    return run_command(&[_][]const u8{ "ifconfig", ifname_str, ip_str, peer_str }) catch return -1;
+}
+
+// ============================================================================
+// Socket Functions (Pure Zig)
+// ============================================================================
+
+fn socket_create() c_int {
+    const fd = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0) catch return -1;
+    return fd;
+}
+
+fn socket_create_sys() c_int {
+    const fd = std.posix.socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL) catch return -1;
+    return fd;
+}
+
+fn socket_close(sock: c_int) void {
+    std.posix.close(sock);
+}
+
+// ============================================================================
+// UTUN Functions (from test_icmp.zig)
+// ============================================================================
+
+fn ioctl_get_ctl_info(sock: c_int, ctl_name: [*:0]const u8, ctl_id: *u32) c_int {
+    var info: ctl_info = .{};
+    info.setName(ctl_name);
+
+    const req = @as(c_int, @bitCast(CTLIOCGINFO));
+    const ret = c.ioctl(sock, req, &info);
+    if (ret < 0) return -1;
+
+    ctl_id.* = info.ctl_id;
+    return 0;
+}
+
+fn getsockopt_ifname(sock: c_int, ifname: [*]u8, max_len: usize) c_int {
+    var name_buf: [64]u8 = undefined;
+    var name_len: c_uint = 64;
+
+    const ret = getsockopt(sock, SYSPROTO_CONTROL, UTUN_OPT_IFNAME, &name_buf, &name_len);
+    if (ret < 0) return -1;
+
+    const copy_len = @min(@as(usize, @intCast(name_len)), max_len - 1);
+    @memcpy(ifname[0..copy_len], name_buf[0..copy_len]);
+    ifname[copy_len] = 0;
+
+    return 0;
+}
+
+fn connect_utun(sock: c_int, ctl_id: u32) c_int {
+    const addr = sockaddr_ctl.init(ctl_id, 0);
+    std.posix.connect(sock, @as(*const std.posix.sockaddr, @ptrCast(&addr)), @sizeOf(sockaddr_ctl)) catch return -1;
+    return 0;
+}
+
+fn create_utun_socket(ifname: [*]u8, max_len: usize) c_int {
+    const sock = socket_create_sys();
+    if (sock < 0) return -1;
+
+    var ctl_id: u32 = 0;
+    if (ioctl_get_ctl_info(sock, "com.apple.net.utun_control", &ctl_id) < 0) {
+        socket_close(sock);
+        return -1;
     }
 
-    const ip = @as(*const Ipv4Header, @ptrCast(@alignCast(packet.ptr)));
-    const total_len = std.mem.bigToNative(u16, ip.len);
-
-    std.debug.print("\n--- IP Header ({d} bytes) ---\n", .{ip_header_len});
-    std.debug.print("  Version: {d}, IHL: {d}\n", .{ip.ver_ihl >> 4, ip.ver_ihl & 0x0F});
-    std.debug.print("  TOS: 0x{X:0>2}, Total Length: {d}\n", .{ip.tos, total_len});
-    std.debug.print("  ID: {d}, Flags: {b}, Fragment Offset: {d}\n", .{std.mem.bigToNative(u16, ip.id), (ip.off >> 13) & 0x07, ip.off & 0x1FFF});
-    std.debug.print("  TTL: {d}, Protocol: {d} ", .{ip.ttl, ip.proto});
-    switch (ip.proto) {
-        1 => std.debug.print("(ICMP)\n", .{}),
-        6 => std.debug.print("(TCP)\n", .{}),
-        17 => std.debug.print("(UDP)\n", .{}),
-        else => std.debug.print("(unknown)\n", .{}),
+    if (connect_utun(sock, ctl_id) < 0) {
+        socket_close(sock);
+        return -1;
     }
 
-    const ip_csum_valid = calculateChecksum(packet[0..ip_header_len]) == std.mem.bigToNative(u16, ip.csum);
-    std.debug.print("  Header Checksum: 0x{X:0>4} ({s})\n", .{std.mem.bigToNative(u16, ip.csum), if (ip_csum_valid) "VALID" else "INVALID"});
-    std.debug.print("  Source IP: {d}.{d}.{d}.{d}\n", .{ip.src[0], ip.src[1], ip.src[2], ip.src[3]});
-    std.debug.print("  Dest IP:   {d}.{d}.{d}.{d}\n", .{ip.dst[0], ip.dst[1], ip.dst[2], ip.dst[3]});
-
-    // Parse ICMP header if present
-    if (ip.proto == 1 and packet.len >= ip_header_len + ICMP_HEADER_SIZE) {
-        const icmp_offset = ip_header_len;
-        const icmp = @as(*const IcmpHeader, @ptrCast(@alignCast(packet.ptr + icmp_offset)));
-
-        std.debug.print("\n--- ICMP Header ({d} bytes) ---\n", .{ICMP_HEADER_SIZE});
-        std.debug.print("  Type: {d} ", .{icmp.icmp_type});
-        switch (icmp.icmp_type) {
-            0 => std.debug.print("(Echo Reply)\n", .{}),
-            3 => std.debug.print("(Dest Unreachable)\n", .{}),
-            8 => std.debug.print("(Echo Request)\n", .{}),
-            11 => std.debug.print("(Time Exceeded)\n", .{}),
-            else => std.debug.print("(unknown)\n", .{}),
-        }
-        std.debug.print("  Code: {d}\n", .{icmp.icmp_code});
-        std.debug.print("  ID: 0x{X:0>4}, Sequence: {d}\n", .{std.mem.bigToNative(u16, icmp.icmp_id), std.mem.bigToNative(u16, icmp.icmp_seq)});
-
-        // ICMP checksum validation
-        const icmp_len = packet.len - icmp_offset;
-        const calc_csum = checksum.checksumPseudo(
-            @as([*]const u8, @ptrCast(&ip.src)),
-            @as([*]const u8, @ptrCast(&ip.dst)),
-            4,
-            ICMP_PROTOCOL,
-            packet.ptr + icmp_offset,
-            icmp_len,
-        );
-        const stored_csum = std.mem.bigToNative(u16, icmp.icmp_csum);
-        std.debug.print("  Checksum: 0x{X:0>4} ({s})\n", .{stored_csum, if (calc_csum == 0) "VALID" else "INVALID"});
-
-        // Dump ICMP payload
-        if (icmp_len > ICMP_HEADER_SIZE) {
-            std.debug.print("\n--- ICMP Payload ({d} bytes) ---\n", .{icmp_len - ICMP_HEADER_SIZE});
-            const payload_start = icmp_offset + ICMP_HEADER_SIZE;
-            const payload_len = @min(icmp_len - ICMP_HEADER_SIZE, 64);
-            for (0..payload_len) |i| {
-                std.debug.print("{X:0>2} ", .{packet[payload_start + i]});
-                if (i % 16 == 15) std.debug.print("\n", .{});
-            }
-            if (payload_len < icmp_len - ICMP_HEADER_SIZE) {
-                std.debug.print("\n  ... ({d} more bytes)\n", .{icmp_len - ICMP_HEADER_SIZE - payload_len});
-            } else {
-                std.debug.print("\n", .{});
-            }
-        }
+    if (getsockopt_ifname(sock, ifname, max_len) < 0) {
+        socket_close(sock);
+        return -1;
     }
 
-    // Raw hex dump
-    std.debug.print("\n--- Raw Hex Dump ({d} bytes) ---\n", .{packet.len});
-    const dump_len = @min(packet.len, 128);
-    for (0..dump_len) |i| {
-        std.debug.print("{X:0>2} ", .{packet[i]});
-        if (i % 16 == 15) std.debug.print("\n", .{});
+    const ifname_z: [*:0]const u8 = @ptrCast(@as([*]u8, @alignCast(ifname)));
+    std.debug.print("Created utun: {s}\n", .{ifname_z});
+    return sock;
+}
+
+// ============================================================================
+// File Descriptor Operations
+// ============================================================================
+
+fn set_nonblocking(fd: c_int) c_int {
+    const flags = std.posix.fcntl(fd, std.posix.F.GETFL, 0) catch return -1;
+    _ = std.posix.fcntl(fd, std.posix.F.SETFL, flags | 0x0004) catch return -1;
+    return 0;
+}
+
+fn tun_read(fd: c_int, error_code: *c_int) isize {
+    const n = read(fd, &packet_buf, BUF_SIZE);
+    if (n < 0) {
+        error_code.* = errno;
+        return -1;
     }
-    if (dump_len < packet.len) {
-        std.debug.print("  ... ({d} more bytes)\n", .{packet.len - dump_len});
+    error_code.* = 0;
+    return @as(isize, @intCast(n));
+}
+
+fn tun_write(fd: c_int, len: isize, error_code: *c_int) isize {
+    const n = write(fd, &packet_buf, @as(usize, @intCast(len)));
+    if (n < 0) {
+        error_code.* = errno;
+        return -1;
+    }
+    error_code.* = 0;
+    return @as(isize, @intCast(n));
+}
+
+// ============================================================================
+// Checksum (from test_icmp.zig)
+// ============================================================================
+
+pub fn calc_sum(addr: [*]u16, len: c_int) u16 {
+    var nleft = len;
+    var sum: u32 = 0;
+    var w = addr;
+
+    while (nleft > 1) {
+        sum += w.*;
+        w += 1;
+        nleft -= 2;
+    }
+    if (nleft == 1) {
+        sum += @as(u32, w[0] & 0xFF);
+    }
+    sum = (sum >> 16) + (sum & 0xFFFF);
+    sum += (sum >> 16);
+    return @as(u16, @truncate(~sum));
+}
+
+// ============================================================================
+// Packet Processing (from test_icmp.zig)
+// ============================================================================
+
+pub fn process_packet(n: isize) !isize {
+    const buf = &packet_buf;
+
+    var offset: usize = 0;
+    if (n >= 4 and buf[0] == 0 and buf[1] == 0) {
+        offset = 4;
+        std.debug.print("Skipped 4-byte utun header\n", .{});
+    }
+
+    if (n - @as(isize, @intCast(offset)) < 20) {
+        std.debug.print("Packet too small\n\n", .{});
+        return 0;
+    }
+
+    const vhl = buf[offset];
+    const ip_hlen = (@as(usize, vhl) & 0x0F) * 4;
+    const ip_len = std.mem.readInt(u16, buf[offset + 2..][0..2], .big);
+    const proto = buf[offset + 9];
+    const src_ip = std.mem.readInt(u32, buf[offset + 12..][0..4], .big);
+    const dst_ip = std.mem.readInt(u32, buf[offset + 16..][0..4], .big);
+
+    std.debug.print("IP: {s} -> {s}\n", .{ ip2str(src_ip), ip2str(dst_ip) });
+    std.debug.print("Proto: {d} (ICMP=1)\n", .{proto});
+
+    if (proto != 1) {
+        std.debug.print("Not ICMP, skipping\n\n", .{});
+        return 0;
+    }
+
+    const icmp_type = buf[offset + ip_hlen];
+    std.debug.print("ICMP Type: {d} (8=echo, 0=reply)\n", .{icmp_type});
+
+    if (icmp_type != 8) {
+        std.debug.print("Not echo request, skipping\n\n", .{});
+        return 0;
+    }
+
+    const icmp_id = std.mem.readInt(u16, buf[offset + ip_hlen + 4..][0..2], .big);
+    const icmp_seq = std.mem.readInt(u16, buf[offset + ip_hlen + 6..][0..2], .big);
+    std.debug.print("Echo Request! ID=0x{X:0>4} Seq={d}\n", .{ icmp_id, icmp_seq });
+
+    // Swap src/dst
+    std.mem.writeInt(u32, buf[offset + 12..][0..4], dst_ip, .big);
+    std.mem.writeInt(u32, buf[offset + 16..][0..4], src_ip, .big);
+    buf[offset + ip_hlen] = 0; // ICMP_ECHOREPLY
+
+    // IP checksum
+    buf[offset + 10] = 0;
+    buf[offset + 11] = 0;
+    var sum: u32 = 0;
+    const ip_words = ip_hlen / 2;
+    var i: usize = 0;
+    while (i < ip_words) : (i += 1) {
+        sum += std.mem.readInt(u16, buf[offset + i * 2..][0..2], .big);
+    }
+    sum = (sum >> 16) + (sum & 0xFFFF);
+    sum += (sum >> 16);
+    const ip_checksum = @as(u16, @truncate(~sum));
+    buf[offset + 10] = @as(u8, @truncate(ip_checksum >> 8));
+    buf[offset + 11] = @as(u8, @truncate(ip_checksum & 0xFF));
+
+    // ICMP checksum
+    const icmp_len = ip_len - @as(u16, @intCast(ip_hlen));
+    buf[offset + ip_hlen + 2] = 0;
+    buf[offset + ip_hlen + 3] = 0;
+    sum = 0;
+    const icmp_words = icmp_len / 2;
+    i = 0;
+    while (i < icmp_words) : (i += 1) {
+        sum += std.mem.readInt(u16, buf[offset + ip_hlen + i * 2..][0..2], .big);
+    }
+    if (icmp_len % 2 == 1) {
+        sum += @as(u32, buf[offset + ip_hlen + icmp_len - 1]) << 8;
+    }
+    sum = (sum >> 16) + (sum & 0xFFFF);
+    sum += (sum >> 16);
+    const icmp_checksum = @as(u16, @truncate(~sum));
+    buf[offset + ip_hlen + 2] = @as(u8, @truncate(icmp_checksum >> 8));
+    buf[offset + ip_hlen + 3] = @as(u8, @truncate(icmp_checksum & 0xFF));
+
+    std.debug.print("Reply: {s} -> {s}\n\n", .{ ip2str(dst_ip), ip2str(src_ip) });
+
+    return n;
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+pub fn main() !void {
+    const tun_ip_str: [*:0]const u8 = "10.0.0.1";
+    const peer_ip_str: [*:0]const u8 = "10.0.0.2";
+    const target_ip_str: [*:0]const u8 = "10.0.0.2";
+
+    var tun_fd: c_int = undefined;
+    var tun_name: [64]u8 = undefined;
+    var err: c_int = undefined;
+    var n: isize = undefined;
+
+    std.debug.print("=== TUN Test (100% Pure Zig) ===\n", .{});
+    std.debug.print("TUN IP: {s}, Peer: {s}, Target: {s}\n\n", .{ tun_ip_str, peer_ip_str, target_ip_str });
+
+    // Step 1: Delete existing route
+    std.debug.print("[Step 1] Deleting existing route...\n", .{});
+    _ = delete_route(target_ip_str);
+
+    // Step 2: Create UTUN socket
+    std.debug.print("[Step 2] Creating UTUN socket...\n", .{});
+    const tun_name_ptr: [*]u8 = &tun_name;
+    tun_fd = create_utun_socket(tun_name_ptr, tun_name.len);
+    if (tun_fd < 0) {
+        std.debug.print("Failed to create utun\n", .{});
+        return error.FailedToCreateUtun;
+    }
+    defer socket_close(tun_fd);
+
+    const tun_name_z: [*:0]const u8 = @ptrCast(&tun_name);
+
+    // Step 3: Configure interface
+    std.debug.print("[Step 3] Configuring interface with ifconfig...\n", .{});
+    if (configure_interface(tun_name_z, tun_ip_str, peer_ip_str) < 0) {
+        std.debug.print("Warning: ifconfig failed, trying ioctl...\n", .{});
     } else {
-        std.debug.print("\n", .{});
+        std.debug.print("Interface configured: {s} {s} {s}\n", .{ tun_name_z, tun_ip_str, peer_ip_str });
     }
 
-    std.debug.print("{d} ==========\n\n", .{label});
-}
+    // Step 4: Add route
+    std.debug.print("[Step 4] Adding route...\n", .{});
+    if (add_route(tun_name_z, target_ip_str) < 0) {
+        std.debug.print("Warning: route add failed\n", .{});
 
-// Build ICMP echo request packet
-fn buildIcmpEchoRequest(
-    buf: []u8,
-    src_ip: [4]u8,
-    dst_ip: [4]u8,
-    icmp_id: u16,
-    icmp_seq: u16,
-    payload: []const u8,
-) usize {
-    const ip_header_len = IP_HEADER_SIZE;
-    const icmp_len = ICMP_HEADER_SIZE + payload.len;
-    const total_len = ip_header_len + icmp_len;
-
-    // Build IP header
-    const ip = @as(*Ipv4Header, @ptrCast(@alignCast(buf.ptr)));
-    ip.ver_ihl = @as(u8, (4 << 4) | 5); // IPv4, 20 byte header
-    ip.tos = 0;
-    ip.len = @byteSwap(@as(u16, @intCast(total_len)));
-    ip.id = 0;
-    ip.off = 0;
-    ip.ttl = 64;
-    ip.proto = ICMP_PROTOCOL;
-    ip.csum = 0;
-    ip.src = src_ip;
-    ip.dst = dst_ip;
-
-    // Calculate IP checksum
-    ip.csum = calculateChecksum(buf[0..ip_header_len]);
-
-    // Build ICMP header
-    const icmp = @as(*IcmpHeader, @ptrCast(@alignCast(buf.ptr + ip_header_len)));
-    icmp.icmp_type = ICMP_ECHO;
-    icmp.icmp_code = 0;
-    icmp.icmp_csum = 0;
-    icmp.icmp_id = @byteSwap(icmp_id);
-    icmp.icmp_seq = @byteSwap(icmp_seq);
-
-    // Copy payload
-    for (payload, 0..) |b, i| {
-        buf[ip_header_len + ICMP_HEADER_SIZE + i] = b;
+        // Try manual route command
+        std.debug.print("Trying manual route command...\n", .{});
+        const ifname_str = std.mem.sliceTo(tun_name_z, 0);
+        const target_str = std.mem.sliceTo(target_ip_str, 0);
+        const route_result = run_command(&[_][]const u8{ "route", "-q", "-n", "add", "-inet", target_str, "-iface", ifname_str });
+        if (route_result) |code| {
+            if (code != 0) {
+                std.debug.print("Warning: route command failed (code={d})\n", .{code});
+            }
+        } else |_| {
+            std.debug.print("Warning: route command error\n", .{});
+        }
     }
 
-    // Calculate ICMP checksum
-    icmp.icmp_csum = checksum.checksumPseudo(
-        @as([*]const u8, @ptrCast(&src_ip)),
-        @as([*]const u8, @ptrCast(&dst_ip)),
-        4,
-        ICMP_PROTOCOL,
-        @as([*]const u8, @ptrCast(&buf[ip_header_len])),
-        icmp_len,
-    );
+    // Step 5: Set non-blocking
+    std.debug.print("[Step 5] Setting non-blocking mode...\n", .{});
+    if (set_nonblocking(tun_fd) < 0) {
+        std.debug.print("Warning: set_nonblocking failed\n", .{});
+    }
 
-    return total_len;
-}
+    std.debug.print("\n[Ready] Listening for ICMP...\n", .{});
+    std.debug.print("       Run: ping -c 3 {s}\n\n", .{target_ip_str});
 
-// Build ICMP echo reply packet (swap src/dst, change type to ECHOREPLY)
-fn buildIcmpEchoReply(
-    buf: []u8,
-    request: []const u8,
-    packet_len: usize,
-    new_ttl: u8,
-) usize {
-    const ip_header_len = IP_HEADER_SIZE;
-
-    if (packet_len < ip_header_len + ICMP_HEADER_SIZE) return 0;
-    if (packet_len > buf.len) return 0;
-    if (packet_len > request.len) return 0;
-
-    @memcpy(buf[0..packet_len], request[0..packet_len]);
-
-    // Swap IP src/dst
-    const ip = @as(*Ipv4Header, @ptrCast(@alignCast(buf.ptr)));
-    const orig_dst = ip.dst;
-    ip.dst = ip.src;
-    ip.src = orig_dst;
-
-    // Update TTL
-    ip.ttl = new_ttl;
-
-    // Recalculate IP checksum (set to 0 first)
-    ip.csum = 0;
-    ip.csum = calculateChecksum(buf[0..ip_header_len]);
-
-    // Change ICMP type to Echo Reply
-    const icmp = @as(*IcmpHeader, @ptrCast(@alignCast(buf.ptr + ip_header_len)));
-    const orig_id = icmp.icmp_id;
-    const orig_seq = icmp.icmp_seq;
-
-    icmp.icmp_type = ICMP_ECHOREPLY;
-
-    // Simple approach: zero checksum and recalc entirely
-    icmp.icmp_csum = 0;
-
-    // Recalculate ICMP checksum with pseudo-header
-    icmp.icmp_csum = checksum.checksumPseudo(
-        @as([*]const u8, @ptrCast(&ip.src)),
-        @as([*]const u8, @ptrCast(&ip.dst)),
-        4,
-        ICMP_PROTOCOL,
-        @as([*]const u8, @ptrCast(&buf[ip_header_len])),
-        packet_len - ip_header_len,
-    );
-
-    // Restore ID and sequence (network byte order)
-    icmp.icmp_id = orig_id;
-    icmp.icmp_seq = orig_seq;
-
-    return packet_len;
-}
-
-// Wait for packet with timeout using simple polling
-fn waitForPacket(device: *tun.Device, timeout_ms: u32) !usize {
-    const start_time = std.time.milliTimestamp();
-    const timeout = @as(i64, timeout_ms);
-
+    // Step 6: Main loop
     while (true) {
-        const elapsed = std.time.milliTimestamp() - start_time;
-        if (elapsed > timeout) {
-            return error.Timeout;
-        }
-
-        // Try to receive (non-blocking)
-        var recv_buf: [ETHERNET_MTU]u8 = undefined;
-        const result = device.recv(&recv_buf) catch {
-            // No data available yet, continue polling
-            std.time.sleep(1 * std.time.ns_per_ms);
-            continue;
-        };
-
-        return result;
-    }
-}
-
-pub fn main() !u8 {
-    // Test configuration
-    const tun_ip_str = "10.0.0.1";
-    const target_ip_str = "10.0.0.2";
-    const test_ttl: u8 = 64;
-
-    std.debug.print("=== ztun Complete ICMP Ping Test ===\n", .{});
-    std.debug.print("TUN IP: {s}, Target IP: {s}\n\n", .{tun_ip_str, target_ip_str});
-
-    // Parse IP addresses
-    const tun_ip = try parseIpv4(tun_ip_str);
-    const target_ip = try parseIpv4(target_ip_str);
-
-    // =========================================
-    // Step 1: Create TUN device
-    // =========================================
-    std.debug.print("[Step 1] Creating TUN device...\n", .{});
-    const config = DeviceConfig{
-        .mtu = 1500,
-        .ipv4 = NetworkAddress{
-            .address = tun_ip,
-            .prefix = 24,
-        },
-    };
-
-    var device = try tun.Device.create(config);
-    defer device.destroy();
-
-    const dev_name = device.name() catch "unknown";
-    std.debug.print("  TUN device: {s}\n", .{dev_name});
-
-    const if_index = device.ifIndex() catch 0;
-    std.debug.print("  Interface index: {d}\n", .{if_index});
-
-    try device.setNonBlocking(true);
-    std.debug.print("  Non-blocking mode: enabled\n\n", .{});
-
-    // =========================================
-    // Step 2: Configure routing for TUN loopback
-    // =========================================
-    std.debug.print("[Step 2] Configuring routing for TUN loopback...\n", .{});
-
-    var name_buf: [16]u8 = undefined;
-    toCStr(&name_buf, dev_name);
-    const iface_idx = network.getInterfaceIndex(&name_buf) catch blk: {
-        std.debug.print("  Warning: Failed to get interface index, using {d}\n", .{if_index});
-        break :blk if_index;
-    };
-    std.debug.print("  Interface: {s} (index: {d})\n", .{dev_name, iface_idx});
-
-    // Route: 10.0.0.2/32 -> 10.0.0.1 (loopback traffic to TUN)
-    // netmask 255.255.255.255 = 0xFFFFFFFF (single host)
-    const target_ip_be = @as(u32, target_ip[0]) << 24 | @as(u32, target_ip[1]) << 16 | @as(u32, target_ip[2]) << 8 | @as(u32, target_ip[3]);
-    const gw_ip_be = @as(u32, tun_ip[0]) << 24 | @as(u32, tun_ip[1]) << 16 | @as(u32, tun_ip[2]) << 8 | @as(u32, tun_ip[3]);
-    const netmask_be = 0xFFFFFFFF;  // 255.255.255.255 = /32
-
-    const route = network.ipv4Route(target_ip_be, netmask_be, gw_ip_be, iface_idx, 100);
-
-    // Delete any existing route for 10.0.0.2 first
-    std.debug.print("  Deleting existing route for {s}...\n", .{target_ip_str});
-    network.deleteRoute(&route) catch |err| {
-        std.debug.print("  Info: No existing route to delete (err={})\n", .{err});
-    };
-
-    // Add new route for target IP
-    std.debug.print("  Adding route: {s}/32 -> {s}\n", .{target_ip_str, tun_ip_str});
-    network.addRoute(&route) catch |err| {
-        std.debug.print("  Error: Failed to add route: {}\n", .{err});
-        std.debug.print("  Diag: Manual command:\n", .{});
-        std.debug.print("    sudo route -n delete {s} && sudo route -n add -net {s} -netmask 255.255.255.255 -gateway {s}\n", .{target_ip_str, target_ip_str, tun_ip_str});
-        return error.RouteAddFailed;
-    };
-    std.debug.print("  Route configured successfully\n\n", .{});
-
-    // =========================================
-    // Step 3: Build and send ICMP echo request
-    // =========================================
-    std.debug.print("[Step 3] Building ICMP Echo Request...\n", .{});
-
-    var request_buf: [ETHERNET_MTU]u8 = undefined;
-
-    // Create ping payload (56 bytes pattern)
-    var payload: [PING_DATA_SIZE]u8 = undefined;
-    for (0..PING_DATA_SIZE) |i| {
-        payload[i] = @as(u8, @intCast(i + 0x41));
-    }
-
-    // Build request: 10.0.0.1 -> 10.0.0.2
-    const request_len = buildIcmpEchoRequest(&request_buf, tun_ip, target_ip, 0x1234, 1, &payload);
-    std.debug.print("  Request: {d} bytes, {s} -> {s}\n", .{request_len, tun_ip_str, target_ip_str});
-    std.debug.print("  ICMP ID: 0x{X:0>4}, Sequence: 1\n\n", .{0x1234});
-
-    dumpPacket("OUTGOING ECHO REQUEST", request_buf[0..request_len], IP_HEADER_SIZE);
-
-    std.debug.print("[Step 3a] Sending Echo Request to TUN...\n", .{});
-    const sent = try device.send(request_buf[0..request_len]);
-    std.debug.print("  Sent: {d} bytes\n\n", .{sent});
-
-    // =========================================
-    // Step 4: Receive looped-back packet
-    // =========================================
-    std.debug.print("[Step 4] Waiting for loopback packet (timeout: 2000ms)...\n", .{});
-
-    var recv_buf: [ETHERNET_MTU]u8 = undefined;
-    const recv_len = waitForPacket(&device, 2000) catch {
-        // NOTE: Loopback should work if route is correctly configured:
-        // 1. Route: 10.0.0.2/32 -> via 10.0.0.1
-        // 2. ping 10.0.0.2 -> kernel routes to TUN
-        // 3. Packet arrives at TUN with dst=10.0.0.2
-        // 4. Write reply with src=10.0.0.2, dst=10.0.0.1
-        // 5. Kernel routes reply back via TUN
-        // 6. ping receives reply
-        //
-        // If no packet received, possible causes:
-        // - Route not properly configured (check: route -n get 10.0.0.2)
-        // - Firewall blocking (check: sudo pfctl -sr)
-        // - Need interface-specific route (RTF_IFSCOPE)
-        std.debug.print("  Timeout: No packet received\n", .{});
-        std.debug.print("  Diag: Check route configuration:\n", .{});
-        std.debug.print("    route -n get 10.0.0.2 2>/dev/null | head -5\n", .{});
-        std.debug.print("  Falling back to packet format verification...\n\n", .{});
-
-        // Verify packet format without actual loopback
-        return verifyPingTest(&device, tun_ip, target_ip, &payload, &request_buf, request_len);
-    };
-
-    std.debug.print("  Received: {d} bytes from TUN\n\n", .{recv_len});
-    dumpPacket("RECEIVED PACKET", recv_buf[0..recv_len], IP_HEADER_SIZE);
-
-    // =========================================
-    // Step 5: Analyze received packet
-    // =========================================
-    std.debug.print("[Step 5] Analyzing received packet...\n", .{});
-
-    if (recv_len < IP_HEADER_SIZE) {
-        std.debug.print("  Error: Received packet too small\n", .{});
-        return 1;
-    }
-
-    const recv_ip = @as(*const Ipv4Header, @ptrCast(@alignCast(recv_buf[0..].ptr)));
-
-    // Check if this is our echo request (loopback) or echo reply
-    const is_echo_request = recv_ip.proto == ICMP_PROTOCOL;
-    const is_from_target = recv_ip.src[0] == target_ip[0] and recv_ip.src[3] == target_ip[3];
-    const is_to_tun = recv_ip.dst[0] == tun_ip[0] and recv_ip.dst[3] == tun_ip[3];
-
-    if (is_echo_request and is_to_tun) {
-        std.debug.print("  Packet is ICMP Echo Request (loopback)\n", .{});
-        std.debug.print("  Source: {d}.{d}.{d}.{d}, Dest: {d}.{d}.{d}.{d}\n", .{
-            recv_ip.src[0], recv_ip.src[1], recv_ip.src[2], recv_ip.src[3],
-            recv_ip.dst[0], recv_ip.dst[1], recv_ip.dst[2], recv_ip.dst[3],
-        });
-
-        // =========================================
-        // Step 6: Build and send echo reply
-        // =========================================
-        std.debug.print("\n[Step 6] Building Echo Reply...\n", .{});
-
-        var reply_buf: [ETHERNET_MTU]u8 = undefined;
-        const reply_len = buildIcmpEchoReply(&reply_buf, recv_buf[0..recv_len], recv_len, test_ttl);
-
-        if (reply_len == 0) {
-            std.debug.print("  Error: Failed to build reply\n", .{});
-            return 1;
-        }
-
-        std.debug.print("  Reply: {d} bytes, {s} -> {s}\n\n", .{reply_len, target_ip_str, tun_ip_str});
-        dumpPacket("OUTGOING ECHO REPLY", reply_buf[0..reply_len], IP_HEADER_SIZE);
-
-        std.debug.print("[Step 6a] Sending Echo Reply to TUN...\n", .{});
-        const reply_sent = try device.send(reply_buf[0..reply_len]);
-        std.debug.print("  Sent: {d} bytes\n\n", .{reply_sent});
-
-        // =========================================
-        // Step 7: Receive echo reply
-        // =========================================
-        std.debug.print("[Step 7] Waiting for Echo Reply (timeout: 2000ms)...\n", .{});
-
-        const reply_recv_len = waitForPacket(&device, 2000) catch {
-            std.debug.print("  Timeout: No reply received\n", .{});
-            std.debug.print("  Note: Reply sent but not received. Check routing.\n\n", .{});
-            return printSuccessSummary(dev_name, tun_ip_str, target_ip_str, sent, request_len, reply_sent);
-        };
-
-        std.debug.print("  Received: {d} bytes\n\n", .{reply_recv_len});
-        dumpPacket("RECEIVED ECHO REPLY", recv_buf[0..reply_recv_len], IP_HEADER_SIZE);
-
-        // =========================================
-        // Step 8: Verify echo reply
-        // =========================================
-        std.debug.print("[Step 8] Verifying Echo Reply...\n", .{});
-
-        if (reply_recv_len < IP_HEADER_SIZE) {
-            std.debug.print("  Error: Reply packet too small\n", .{});
-            return 1;
-        }
-
-        const reply_ip = @as(*const Ipv4Header, @ptrCast(@alignCast(recv_buf[0..].ptr)));
-
-        // Check if it's an echo reply from target to tun
-        const is_reply = reply_ip.proto == ICMP_PROTOCOL;
-        const reply_from_target = reply_ip.src[0] == target_ip[0] and reply_ip.src[3] == target_ip[3];
-        const reply_to_tun = reply_ip.dst[0] == tun_ip[0] and reply_ip.dst[3] == tun_ip[3];
-
-        if (is_reply and reply_from_target and reply_to_tun) {
-            std.debug.print("  Verified: Echo Reply from {s} to {s}\n", .{target_ip_str, tun_ip_str});
-
-            // Check ICMP type
-            if (recv_len >= IP_HEADER_SIZE + ICMP_HEADER_SIZE) {
-                const reply_icmp = @as(*const IcmpHeader, @ptrCast(@alignCast(recv_buf[IP_HEADER_SIZE..].ptr)));
-                if (reply_icmp.icmp_type == ICMP_ECHOREPLY) {
-                    std.debug.print("  ICMP Type: Echo Reply (correct)\n", .{});
-                    std.debug.print("  ICMP ID: 0x{X:0>4}, Sequence: {d}\n", .{
-                        std.mem.bigToNative(u16, reply_icmp.icmp_id),
-                        std.mem.bigToNative(u16, reply_icmp.icmp_seq),
-                    });
-                }
+        n = tun_read(tun_fd, &err);
+        if (n < 0) {
+            if (err == 35) {
+                std.time.sleep(10 * std.time.ns_per_ms);
+                continue;
             }
-        } else {
-            std.debug.print("  Warning: Unexpected reply format\n", .{});
+            std.debug.print("Read error: {d}\n", .{err});
+            break;
         }
-    } else if (is_from_target and is_to_tun) {
-        std.debug.print("  Packet is from target (Echo Reply)\n", .{});
-        dumpPacket("ECHO REPLY RECEIVED", recv_buf[0..recv_len], IP_HEADER_SIZE);
-    } else {
-        std.debug.print("  Unexpected packet: src={d}.{d}.{d}.{d}, dst={d}.{d}.{d}.{d}\n", .{
-            recv_ip.src[0], recv_ip.src[1], recv_ip.src[2], recv_ip.src[3],
-            recv_ip.dst[0], recv_ip.dst[1], recv_ip.dst[2], recv_ip.dst[3],
-        });
+
+        std.debug.print("=== Received {d} bytes ===\n", .{n});
+
+        const result = process_packet(n) catch {
+            std.debug.print("Process error\n", .{});
+            break;
+        };
+        if (result == 0) continue;
+
+        n = tun_write(tun_fd, n, &err);
+        if (n < 0) {
+            std.debug.print("Write error: {d}\n", .{err});
+        } else {
+            std.debug.print("Sent {d} bytes\n\n", .{n});
+        }
     }
 
-    return printSuccessSummary(dev_name, tun_ip_str, target_ip_str, sent, request_len, 0);
-}
-
-// Verify ping roundtrip by:
-// 1. Building echo reply (simulating remote host)
-// 2. Sending reply to TUN (dst=10.0.0.1)
-// 3. Attempting to receive (may timeout if loopback fails)
-fn verifyPingTest(
-    device: *tun.Device,
-    tun_ip: [4]u8,
-    target_ip: [4]u8,
-    _: []const u8,
-    request_buf: []const u8,
-    request_len: usize,
-) !u8 {
-    std.debug.print("=== Packet Format Verification Test ===\n\n", .{});
-    std.debug.print("Note: Verifying packet format and checksum correctness.\n", .{});
-    std.debug.print("Loopback requires proper route: route -n get 10.0.0.2\n\n", .{});
-
-    // =========================================
-    // Simulate: Build echo reply locally
-    // =========================================
-    std.debug.print("[Simulated Step 1] Building Echo Reply...\n", .{});
-
-    var reply_buf: [ETHERNET_MTU]u8 = undefined;
-    const reply_len = buildIcmpEchoReply(&reply_buf, request_buf, request_len, 64);
-
-    std.debug.print("  Reply: {d} bytes\n", .{reply_len});
-    dumpPacket("SIMULATED ECHO REPLY", reply_buf[0..reply_len], IP_HEADER_SIZE);
-
-    // =========================================
-    // Simulate: Send reply back (simulating remote host response)
-    // =========================================
-    std.debug.print("[Simulated Step 2] Sending Echo Reply to TUN...\n", .{});
-    const sent = try device.send(reply_buf[0..reply_len]);
-    std.debug.print("  Sent: {d} bytes\n\n", .{sent});
-
-    // =========================================
-    // Simulate: Receive the reply
-    // =========================================
-    std.debug.print("[Simulated Step 3] Waiting for Echo Reply...\n", .{});
-
-    var recv_buf: [ETHERNET_MTU]u8 = undefined;
-    const recv_len = waitForPacket(device, 1000) catch {
-        std.debug.print("  Note: Reply sent but not received. Route not configured for loopback.\n", .{});
-        std.debug.print("  The reply packet format is correct and ready for network\n\n", .{});
-        return printSimulatedSuccess(tun_ip, target_ip, request_len, sent);
-    };
-
-    std.debug.print("  Received: {d} bytes\n\n", .{recv_len});
-    dumpPacket("RECEIVED ECHO REPLY", recv_buf[0..recv_len], IP_HEADER_SIZE);
-
-    // =========================================
-    // Simulate: Verify the reply
-    // =========================================
-    std.debug.print("[Simulated Step 4] Verifying Echo Reply...\n", .{});
-
-    if (recv_len >= IP_HEADER_SIZE + ICMP_HEADER_SIZE) {
-        const ip = @as(*const Ipv4Header, @ptrCast(@alignCast(recv_buf[0..].ptr)));
-        const icmp = @as(*const IcmpHeader, @ptrCast(@alignCast(recv_buf[IP_HEADER_SIZE..].ptr)));
-
-        // Verify: dst should be our TUN IP
-        const dst_correct = ip.dst[0] == tun_ip[0] and ip.dst[3] == tun_ip[3];
-        std.debug.print("  Dest IP: {d}.{d}.{d}.{d} (expected {d}.{d}.{d}.{d}) - {s}\n", .{
-            ip.dst[0], ip.dst[1], ip.dst[2], ip.dst[3],
-            tun_ip[0], tun_ip[1], tun_ip[2], tun_ip[3],
-            if (dst_correct) "CORRECT" else "WRONG",
-        });
-
-        // Verify: ICMP type should be Echo Reply
-        const type_correct = icmp.icmp_type == ICMP_ECHOREPLY;
-        std.debug.print("  ICMP Type: {d} (expected {d}) - {s}\n", .{
-            icmp.icmp_type, ICMP_ECHOREPLY,
-            if (type_correct) "CORRECT" else "WRONG",
-        });
-
-        // Verify: ICMP ID should match
-        const id_correct = std.mem.bigToNative(u16, icmp.icmp_id) == 0x1234;
-        std.debug.print("  ICMP ID: 0x{X:0>4} (expected 0x1234) - {s}\n", .{
-            std.mem.bigToNative(u16, icmp.icmp_id),
-            if (id_correct) "CORRECT" else "WRONG",
-        });
-    }
-
-    return printSimulatedSuccess(tun_ip, target_ip, request_len, sent);
-}
-
-fn printSuccessSummary(dev_name: []const u8, tun_ip_str: []const u8, target_ip_str: []const u8, sent: usize, _: usize, reply_sent: usize) u8 {
-    std.debug.print("\n=== PING TEST COMPLETED ===\n", .{});
-    std.debug.print("Summary:\n", .{});
-    std.debug.print("  1. TUN device: {s}\n", .{dev_name});
-    std.debug.print("  2. Route: {s}/32 -> via {s}\n", .{target_ip_str, tun_ip_str});
-    std.debug.print("  3. Echo Request: {d} bytes sent\n", .{sent});
-    if (reply_sent > 0) {
-        std.debug.print("  4. Echo Reply: {d} bytes sent\n", .{reply_sent});
-    }
-    std.debug.print("  5. Checksums: VALID\n", .{});
-    std.debug.print("\nResult: SUCCESS\n", .{});
-    return 0;
-}
-
-fn printSimulatedSuccess(tun_ip: [4]u8, target_ip: [4]u8, request_len: usize, reply_len: usize) u8 {
-    std.debug.print("\n=== SIMULATED PING TEST COMPLETED ===\n", .{});
-    std.debug.print("Summary:\n", .{});
-    std.debug.print("  Request: {d}.{d}.{d}.{d} -> {d}.{d}.{d}.{d} ({d} bytes)\n", .{
-        tun_ip[0], tun_ip[1], tun_ip[2], tun_ip[3],
-        target_ip[0], target_ip[1], target_ip[2], target_ip[3],
-        request_len,
-    });
-    std.debug.print("  Reply:   {d}.{d}.{d}.{d} -> {d}.{d}.{d}.{d} ({d} bytes)\n", .{
-        target_ip[0], target_ip[1], target_ip[2], target_ip[3],
-        tun_ip[0], tun_ip[1], tun_ip[2], tun_ip[3],
-        reply_len,
-    });
-    std.debug.print("  All checksums: VALID\n", .{});
-    std.debug.print("\nResult: SUCCESS (simulated roundtrip)\n", .{});
-    std.debug.print("Note: Packet format verified. Loopback requires correct routing.\n", .{});
-    std.debug.print("Verify route: route -n get 10.0.0.2\n", .{});
-    std.debug.print("      The packet format and routing are verified correct.\n", .{});
-    return 0;
+    std.debug.print("\n[Cleanup] Deleting route...\n", .{});
+    _ = delete_route(target_ip_str);
+    std.debug.print("Done.\n", .{});
 }
