@@ -1,5 +1,5 @@
 // test_icmp.zig - TUN ICMP Echo Reply Test (100% Pure Zig)
-// Build: zig build-exe test_icmp.zig macos_types.zig -lc -I.
+// Build: zig build-exe test_icmp.zig -lc -I.
 // Run: sudo ./test_icmp
 //
 // This version uses 100% pure Zig for all logic, including macOS-specific
@@ -7,9 +7,107 @@
 
 const std = @import("std");
 const c = @import("std").c;
-const macos = @import("macos_types.zig");
 
 const BUF_SIZE = 4096;
+
+// ============================================================================
+// macOS Constants
+// ============================================================================
+
+const PF_SYSTEM = @as(c_int, 32);
+const SYSPROTO_CONTROL = @as(c_int, 2);
+const AF_SYSTEM = @as(c_int, 2);
+const AF_SYS_CONTROL = @as(c_int, 2);
+const SOCK_DGRAM = @as(c_int, 2);
+
+// ioctl request code for CTLIOCGINFO
+// _IOWR('N', 3, struct_ctl_info) = 0xC0644E03 (sizeof(ctl_info) = 100)
+const CTLIOCGINFO: u32 = 0xC0644E03;
+const UTUN_OPT_IFNAME = @as(c_int, 2);
+
+const IFNAMSIZ = 16;
+const IFR_SIZE = 32;
+
+// Interface flags (from net/if.h)
+const IFF_UP: c_short = 0x1;
+const IFF_RUNNING: c_short = 0x40;
+
+// ioctl Request Codes (from sys/sockio.h)
+const SIOCGIFFLAGS: u32 = 0xC0206914;    // _IOWR('i', 17, struct ifreq)
+const SIOCSIFFLAGS: u32 = 0x80206910;    // _IOW('i', 16, struct ifreq)
+const SIOCSIFADDR: u32 = 0x8020690C;      // _IOW('i', 12, struct ifreq)
+const SIOCSIFDSTADDR: u32 = 0x80206914;   // _IOW('i', 14, struct ifreq)
+
+// ============================================================================
+// macOS Type Definitions
+// ============================================================================
+
+// ctl_info structure (for CTLIOCGINFO ioctl)
+const ctl_info = extern struct {
+    ctl_id: u32 = 0,
+    ctl_name: [96]u8 = [_]u8{0} ** 96,
+
+    pub fn setName(this: *ctl_info, name: [*:0]const u8) void {
+        @memset(&this.ctl_name, 0);
+        var i: usize = 0;
+        while (i < 95 and name[i] != 0) : (i += 1) {
+            this.ctl_name[i] = name[i];
+        }
+    }
+};
+
+// BSD sockaddr_ctl structure (for PF_SYSTEM connect)
+const sockaddr_ctl = extern struct {
+    sc_len: u8 = 0,
+    sc_family: u8 = 0,
+    ss_sysaddr: u16 = 0,
+    sc_id: u32 = 0,
+    sc_unit: u32 = 0,
+    sc_reserved: [5]u32 = [_]u32{0} ** 5,
+
+    pub fn init(ctl_id: u32, unit: u32) sockaddr_ctl {
+        return .{
+            .sc_len = @sizeOf(sockaddr_ctl),
+            .sc_family = AF_SYSTEM,
+            .ss_sysaddr = AF_SYS_CONTROL,
+            .sc_id = ctl_id,
+            .sc_unit = unit,
+        };
+    }
+};
+
+// BSD sockaddr_in (used in ifreq)
+const sockaddr_in = extern struct {
+    sin_len: u8 = 0,
+    sin_family: u8 = 0,
+    sin_port: u16 = 0,
+    sin_addr: [4]u8 = [_]u8{0} ** 4,
+    sin_zero: [8]u8 = [_]u8{0} ** 8,
+};
+
+// ifreq structure (for ioctl operations)
+const ifreq = extern struct {
+    ifr_name: [16]u8 = [_]u8{0} ** 16,
+    ifr_ifru: extern union {
+        ifr_addr: sockaddr_in,
+        ifr_dstaddr: sockaddr_in,
+        ifr_flags: c_short,
+        ifr_metric: c_int,
+        ifr_mtu: c_int,
+        ifr_broadaddr: sockaddr_in,
+        ifr_netmask: sockaddr_in,
+        ifr_media: c_int,
+        ifr_data: *anyopaque,
+    } = undefined,
+
+    pub fn setName(this: *ifreq, name: [*:0]const u8) void {
+        @memset(&this.ifr_name, 0);
+        var i: usize = 0;
+        while (i < 15 and name[i] != 0) : (i += 1) {
+            this.ifr_name[i] = name[i];
+        }
+    }
+};
 
 // ============================================================================
 // Minimal C Declarations (still required for getsockopt)
@@ -30,21 +128,14 @@ extern "c" fn write(fd: c_int, buf: *const anyopaque, nbytes: usize) c_int;
 extern "c" var errno: c_int;
 
 // ============================================================================
-// Constants
-// ============================================================================
-
-const UTUN_OPT_IFNAME = macos.UTUN_OPT_IFNAME;
-const SYSPROTO_CONTROL = macos.SYSPROTO_CONTROL;
-
-// ============================================================================
 // UTUN Control Info (Pure Zig using c.ioctl)
 // ============================================================================
 
 fn ioctl_get_ctl_info(sock: c_int, ctl_name: [*:0]const u8, ctl_id: *u32) c_int {
-    var info: macos.ctl_info = .{};
+    var info: ctl_info = .{};
     info.setName(ctl_name);
 
-    const req = @as(c_int, @bitCast(macos.CTLIOCGINFO));
+    const req = @as(c_int, @bitCast(CTLIOCGINFO));
     const ret = c.ioctl(sock, req, &info);
     if (ret < 0) return -1;
 
@@ -120,7 +211,7 @@ fn socket_create() c_int {
 }
 
 fn socket_create_sys() c_int {
-    const fd = std.posix.socket(macos.PF_SYSTEM, macos.SOCK_DGRAM, macos.SYSPROTO_CONTROL) catch return -1;
+    const fd = std.posix.socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL) catch return -1;
     return fd;
 }
 
@@ -133,8 +224,8 @@ fn socket_close_zig(sock: c_int) void {
 // ============================================================================
 
 fn connect_utun(sock: c_int, ctl_id: u32) c_int {
-    const addr = macos.sockaddr_ctl.init(ctl_id, 0); // sc_unit = 0 (auto-assign)
-    std.posix.connect(sock, @as(*const std.posix.sockaddr, @ptrCast(&addr)), @sizeOf(macos.sockaddr_ctl)) catch return -1;
+    const addr = sockaddr_ctl.init(ctl_id, 0); // sc_unit = 0 (auto-assign)
+    std.posix.connect(sock, @as(*const std.posix.sockaddr, @ptrCast(&addr)), @sizeOf(sockaddr_ctl)) catch return -1;
     return 0;
 }
 
@@ -205,10 +296,10 @@ fn tun_close(fd: c_int) void {
 // ============================================================================
 
 fn ioctl_get_flags(sock: c_int, ifname: [*:0]const u8, flags: *c_int) c_int {
-    var ifr: macos.ifreq = .{};
+    var ifr: ifreq = .{};
     ifr.setName(ifname);
 
-    const req = @as(c_int, @bitCast(macos.SIOCGIFFLAGS));
+    const req = @as(c_int, @bitCast(SIOCGIFFLAGS));
     const ret = c.ioctl(sock, req, &ifr);
     if (ret < 0) return -1;
 
@@ -217,17 +308,17 @@ fn ioctl_get_flags(sock: c_int, ifname: [*:0]const u8, flags: *c_int) c_int {
 }
 
 fn ioctl_set_flags(sock: c_int, ifname: [*:0]const u8, flags: c_int) c_int {
-    var ifr: macos.ifreq = .{};
+    var ifr: ifreq = .{};
     ifr.setName(ifname);
     ifr.ifr_flags = flags;
 
-    const req = @as(c_int, @bitCast(macos.SIOCSIFFLAGS));
+    const req = @as(c_int, @bitCast(SIOCSIFFLAGS));
     const ret = c.ioctl(sock, req, &ifr);
     return if (ret < 0) -1 else 0;
 }
 
 fn ioctl_set_ip(sock: c_int, ifname: [*:0]const u8, ip: [*:0]const u8) c_int {
-    var ifr: macos.ifreq = .{};
+    var ifr: ifreq = .{};
     ifr.setName(ifname);
 
     // Parse IP string
@@ -250,17 +341,17 @@ fn ioctl_set_ip(sock: c_int, ifname: [*:0]const u8, ip: [*:0]const u8) c_int {
     if (count == 3) {
         parts[3] = @as(u8, @intCast(val));
         ifr.ifr_addr.sin_family = @as(u8, @intCast(std.posix.AF.INET));
-        ifr.ifr_addr.sin_len = @sizeOf(macos.sockaddr_in);
+        ifr.ifr_addr.sin_len = @sizeOf(sockaddr_in);
         ifr.ifr_addr.sin_addr = parts;
     }
 
-    const req = @as(c_int, @bitCast(macos.SIOCSIFADDR));
+    const req = @as(c_int, @bitCast(SIOCSIFADDR));
     const ret = c.ioctl(sock, req, &ifr);
     return if (ret < 0) -1 else 0;
 }
 
 fn ioctl_set_peer(sock: c_int, ifname: [*:0]const u8, peer: [*:0]const u8) c_int {
-    var ifr: macos.ifreq = .{};
+    var ifr: ifreq = .{};
     ifr.setName(ifname);
 
     // Parse IP string
@@ -283,11 +374,11 @@ fn ioctl_set_peer(sock: c_int, ifname: [*:0]const u8, peer: [*:0]const u8) c_int
     if (count == 3) {
         parts[3] = @as(u8, @intCast(val));
         ifr.ifr_dstaddr.sin_family = @as(u8, @intCast(std.posix.AF.INET));
-        ifr.ifr_dstaddr.sin_len = @sizeOf(macos.sockaddr_in);
+        ifr.ifr_dstaddr.sin_len = @sizeOf(sockaddr_in);
         ifr.ifr_dstaddr.sin_addr = parts;
     }
 
-    const req = @as(c_int, @bitCast(macos.SIOCSIFDSTADDR));
+    const req = @as(c_int, @bitCast(SIOCSIFDSTADDR));
     const ret = c.ioctl(sock, req, &ifr);
     return if (ret < 0) -1 else 0;
 }
@@ -302,7 +393,7 @@ fn interface_up(ifname: [*:0]const u8) c_int {
         return -1;
     }
 
-    flags |= macos.IFF_UP | macos.IFF_RUNNING;
+    flags |= IFF_UP | IFF_RUNNING;
 
     if (ioctl_set_flags(sock, ifname, flags) < 0) {
         socket_close_zig(sock);

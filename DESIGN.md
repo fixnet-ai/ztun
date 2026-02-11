@@ -663,7 +663,8 @@ uint32_t get_iface_index(const char *ifname);
 - Connects to `com.apple.net.utun_control`
 - 4-byte AF_INET/AF_INET6 header on read/write
 - MTU configuration via `SIOCSIFMTU` ioctl
-- Address configuration via `SIOCAIFADDR`/`SIOCAIFADDR_IN6` ioctls
+- **Address configuration via `SIOCSIFADDR`/`SIOCSIFDSTADDR` ioctls** (CORRECTED)
+- **Use `ifconfig` command for reliable TUN configuration** (CORRECTED)
 - **Zero-copy read**: reads directly into caller's buffer (+4 bytes for header)
 - **Unified header handling**: Router adds 4-byte header for raw fd writes
 

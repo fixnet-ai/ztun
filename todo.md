@@ -412,5 +412,202 @@ macOS utun prepends a 4-byte AF_INET header to packets. Use temporary buffer to 
 
 ---
 
-```bash
+## Phase 7: Pure Zig Migration (NEW)
 
+**Goal**: Migrate src/system C code to pure Zig, keep tun2sock.zig working
+
+### Background
+
+- test_icmp.zig: 100% Pure Zig, verified working
+- mac_tun.md: Documented common failure reasons and solutions
+- zig.codegen.md: Phase 5 complete with all techniques documented
+
+### Migration Status
+
+| Function | Current | Complexity | Plan |
+|----------|---------|------------|------|
+| `get_local_ips()` | C (getifaddrs) | **Low** | Pure Zig via `std.posix.getifaddrs` |
+| `get_primary_ip()` | C (UDP) | **Low** | Pure Zig UDP socket + getsockname |
+| `select_egress_ip_for_target()` | C (iterate) | **Medium** | Pure Zig |
+| `configure_tun_ip()` | C (ifconfig) | **Low** | `std.process.Child.run()` |
+| `configure_tun_peer()` | C (ifconfig) | **Low** | `std.process.Child.run()` |
+| `route_add()` | C (Netlink/PF_ROUTE) | **High** | Keep C (too complex) |
+| `route_delete()` | C (Netlink/PF_ROUTE) | **High** | Keep C |
+| `route_list()` | C (Netlink/PF_ROUTE) | **High** | Keep C |
+
+### Tasks
+
+#### Phase 7.1: Refactor network.zig (Pure Zig)
+
+- [ ] **Task 7.1.1**: Implement `getLocalIps()` using `std.posix.getifaddrs`
+  - File: `src/system/network.zig`
+  - Return `[]IpInfo` slice
+  - Filter loopback addresses
+  - Verify with test_icmp.zig
+
+- [ ] **Task 7.1.2**: Implement `getPrimaryIp()` using UDP probe
+  - Create UDP socket
+  - Connect to 8.8.8.8:53 (doesn't send)
+  - Call `getsockname()` for local IP
+
+- [ ] **Task 7.1.3**: Implement `selectEgressIp()` pure Zig
+  - Iterate local IP list
+  - Filter TUN devices (utun*, tun*)
+  - Select best egress IP
+
+- [ ] **Task 7.1.4**: Migrate `configureTunIp/TunPeer`
+  - Use `std.process.Child.run()` instead of `system()`
+  - Call: `ifconfig <ifname> <ip> <peer>`
+
+#### Phase 7.2: Fix device_darwin.zig Routing
+
+- [ ] **Task 7.2.1**: Implement BSD routing socket `addRouteFn()`
+  - File: `src/tun/device_darwin.zig`
+  - Create PF_ROUTE socket
+  - Build RTM_ADD message
+  - Send and wait for acknowledgment
+
+- [ ] **Task 7.2.2**: Implement BSD routing socket `deleteRouteFn()`
+  - Create PF_ROUTE socket
+  - Build RTM_DELETE message
+  - Send and wait for acknowledgment
+
+- [ ] **Task 7.2.3**: Test route add/delete
+  ```bash
+  # Verify commands work
+  route add -inet 10.0.0.2/32 -iface utun4
+  route delete -inet 10.0.0.2/32 -iface utun4
+  ```
+
+#### Phase 7.3: Complete router/mod.zig
+
+- [ ] **Task 7.3.1**: Implement `writeToLoopback()`
+  - File: `src/router/mod.zig`
+  - For local ICMP replies
+  - Write to loopback interface
+
+- [ ] **Task 7.3.2**: Fix egress.ip parsing
+  - Runtime parsing of egress interface IP
+  - Call `network.getInterfaceIp()` or `getPrimaryIp()`
+
+#### Phase 7.4: End-to-End Testing
+
+- [ ] **Task 7.4.1**: Verify test_icmp.zig works
+  ```bash
+  zig build-exe test_icmp.zig -lc -I.
+  sudo ./test_icmp &
+  ping -c 3 10.0.0.2
+  # Expected: 3/3 packets, 0% loss
+  ```
+
+- [ ] **Task 7.4.2**: Test tun2sock.zig
+  ```bash
+  zig build tun2sock
+  sudo ./zig-out/bin/macos/tun2sock --tun-ip 10.0.0.1 --egress en0
+  ```
+
+- [ ] **Task 7.4.3**: Verify routing functions
+  - Route add/delete via BSD sockets
+  - ICMP echo reply
+  - SOCKS5 proxy forwarding
+
+### Verification Checklist
+
+- [ ] test_icmp.zig: 3/3 ping packets, 0% loss
+- [ ] device_darwin.zig: route add/delete work
+- [ ] network.zig: Pure Zig functions work
+- [ ] tun2sock.zig: Starts and accepts connections
+- [ ] TCP/UDP forwarding: Working correctly
+
+### Reference Documents
+
+- **mac_tun.md**: Common failure reasons and correct patterns
+- **zig.codegen.md**: Phase 5 complete with all techniques
+- **DESIGN.md**: Project architecture and module structure
+
+### Key Files to Modify
+
+| File | Changes |
+|------|---------|
+| `src/system/network.zig` | Rewrite as pure Zig (getLocalIps, getPrimaryIp, etc.) |
+| `src/system/route.c` | KEEP (too complex for pure Zig) |
+| `src/system/route.h` | KEEP |
+| `src/tun/device_darwin.zig` | Implement addRouteFn/deleteRouteFn |
+| `src/router/mod.zig` | Implement writeToLoopback, fix egress.ip |
+| `src/tun2sock.zig` | Integrate new pure Zig API |
+
+### Known Risks
+
+1. **BSD Routing Socket**: Complex message format, may need kernel source reference
+2. **Windows Compatibility**: Different APIs for each OS, needs testing
+3. **IPv6 Support**: Currently focused on IPv4, IPv6 may need extra work
+
+---
+
+## Phase 8: Code Corrections (Based on test_icmp.zig Verification)
+
+**Date**: 2026-02-12
+
+Corrections made based on verified test_icmp.zig implementation:
+
+### 8.1 mac_tun.md Corrections
+
+| Original (WRONG) | Corrected (VERIFIED) |
+|------------------|---------------------|
+| `sc_reserved: [5]u32 = undefined` | `sc_reserved: [5]u32 = [_]u32{0} ** 5` |
+| `ctl_name: [96]u8 = undefined` | `ctl_name: [96]u8 = [_]u8{0} ** 96` |
+| `ifr_name: [16]u8 = undefined` | `ifr_name: [16]u8 = [_]u8{0} ** 16` |
+| Missing `IFF_UP`/`IFF_RUNNING` | Added constants |
+
+### 8.2 DESIGN.md Corrections
+
+| Original (WRONG) | Corrected (VERIFIED) |
+|------------------|---------------------|
+| "Address configuration via `SIOCAIFADDR`/`SIOCAIFADDR_IN6` ioctls" | "Address configuration via `SIOCSIFADDR`/`SIOCSIFDSTADDR` ioctls" |
+| No mention of ifconfig | "Use `ifconfig` command for reliable TUN configuration" |
+
+### 8.3 Key Verified Patterns
+
+**socket sockaddr_ctl (CORRECT):**
+```zig
+const sockaddr_ctl = extern struct {
+    sc_len: u8 = 0,
+    sc_family: u8 = 0,
+    ss_sysaddr: u16 = 0,    // Address family for kernel control
+    sc_id: u32 = 0,
+    sc_unit: u32 = 0,
+    sc_reserved: [5]u32 = [_]u32{0} ** 5,
+
+    pub fn init(ctl_id: u32, unit: u32) sockaddr_ctl {
+        return .{
+            .sc_len = @sizeOf(sockaddr_ctl),
+            .sc_family = AF_SYSTEM,           // = 2
+            .ss_sysaddr = AF_SYS_CONTROL,     // = 2 (NOT AF_SYS_KERNCONTROL)
+            .sc_id = ctl_id,
+            .sc_unit = unit,
+        };
+    }
+};
+```
+
+**CTLIOCGINFO Value (VERIFIED):**
+```
+CTLIOCGINFO = 0xC0644E03
+sizeof(ctl_info) = 100
+```
+
+**Use `ifconfig` for reliable TUN configuration:**
+```bash
+ifconfig <ifname> <ip> <peer>
+```
+
+### 8.4 Files Corrected
+
+- [x] `mac_tun.md` - Fixed struct definitions and added missing constants
+- [x] `DESIGN.md` - Fixed ioctl names, added ifconfig recommendation
+
+### Reference
+
+- **test_icmp.zig**: Verified working implementation
+- **mac_tun.md**: Updated with correct patterns
+- **zig.codegen.md**: Phase 5 complete with all techniques
