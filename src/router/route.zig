@@ -59,6 +59,10 @@ pub const TunConfig = struct {
     /// TUN IPv4 address (network byte order, e.g., 0x0A000001 = 10.0.0.1)
     ip: u32,
 
+    /// TUN peer/destination IPv4 address (network byte order, e.g., 0x0A000002 = 10.0.0.2)
+    /// Required for point-to-point interfaces like macOS utun
+    peer: u32 = 0,
+
     /// IPv4 prefix length (e.g., 24 for /24 network)
     prefix_len: u8,
 

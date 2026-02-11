@@ -179,6 +179,11 @@ extern fn route_has_admin_privileges() c_int;
 /// 配置 TUN 接口 IP 地址 (BSD/macOS)
 extern fn configure_tun_ip(ifname: [*:0]const u8, ip_addr: [*:0]const u8) c_int;
 
+/// 配置 TUN 接口对端地址 (BSD/macOS 点对点)
+/// 对于 macOS utun 设备，这使用 SIOCSIFDSTADDR 设置目标/对端地址
+/// 这对正确路由至关重要 - 内核需要知道对端地址才能正确路由回复包
+extern fn configure_tun_peer(ifname: [*:0]const u8, peer_addr: [*:0]const u8) c_int;
+
 // ==================== Zig 包装函数 ====================
 
 /// 获取所有本地 IP 地址
@@ -244,6 +249,14 @@ pub fn getInterfaceIp(alloc: std.mem.Allocator, iface_name: []const u8) ![]u8 {
 /// 在 macOS 上，TUN 接口需要先配置 IP 地址才能添加路由
 pub fn configureTunIp(ifname: [*:0]const u8, ip_addr: [*:0]const u8) c_int {
     return configure_tun_ip(ifname, ip_addr);
+}
+
+/// 配置 TUN 接口对端地址 (BSD/macOS)
+///
+/// 对于 macOS utun 设备，这设置目标/对端地址使用 SIOCSIFDSTADDR
+/// 这对正确路由至关重要
+pub fn configureTunPeer(ifname: [*:0]const u8, peer_addr: [*:0]const u8) c_int {
+    return configure_tun_peer(ifname, peer_addr);
 }
 
 // ==================== 系统路由管理（新 API）====================

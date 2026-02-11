@@ -48,6 +48,7 @@
     #include <net/if_dl.h>
     #include <sys/sysctl.h>
     #include <ifaddrs.h>
+    #include <sys/ioctl.h>  // For ioctl(), SIOCSIFDSTADDR
 #elif defined(PLATFORM_IOS)
     // iOS doesn't provide route management APIs
     // Define minimal types and constants needed for route_list stub
@@ -1719,6 +1720,20 @@ void route_set_timeout(int timeout_ms) {
 // TUN Interface Configuration
 // ========================================
 
+/// Strip CIDR prefix from IP address (e.g., "10.0.0.1/24" -> "10.0.0.1")
+static void strip_cidr_prefix(char* out, size_t out_size, const char* ip_addr) {
+    const char* slash = strchr(ip_addr, '/');
+    if (slash) {
+        size_t len = slash - ip_addr;
+        if (len >= out_size) len = out_size - 1;
+        strncpy(out, ip_addr, len);
+        out[len] = '\0';
+    } else {
+        strncpy(out, ip_addr, out_size - 1);
+        out[out_size - 1] = '\0';
+    }
+}
+
 /// Configure TUN interface IP address (BSD/macOS)
 int configure_tun_ip(const char* ifname, const char* ip_addr) {
     if (!ifname || !ip_addr) {
@@ -1726,10 +1741,14 @@ int configure_tun_ip(const char* ifname, const char* ip_addr) {
         return -1;
     }
 
+    // Strip CIDR prefix (e.g., "10.0.0.1/24" -> "10.0.0.1")
+    char ip_clean[32];
+    strip_cidr_prefix(ip_clean, sizeof(ip_clean), ip_addr);
+
     // Build ifconfig command: ifconfig <ifname> <ip_addr> <ip_addr>
     // For point-to-point interfaces, we set local_ip = remote_ip = ip_addr
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "ifconfig %s %s %s 2>&1", ifname, ip_addr, ip_addr);
+    snprintf(cmd, sizeof(cmd), "ifconfig %s %s %s 2>&1", ifname, ip_clean, ip_clean);
 
     ROUTE_INFO("[ROUTE] Configuring TUN IP: %s", cmd);
 
@@ -1739,8 +1758,57 @@ int configure_tun_ip(const char* ifname, const char* ip_addr) {
         return -1;
     }
 
-    ROUTE_INFO("[ROUTE] TUN interface %s configured with IP %s", ifname, ip_addr);
+    ROUTE_INFO("[ROUTE] TUN interface %s configured with IP %s", ifname, ip_clean);
     return 0;
+}
+
+/// Configure TUN interface peer address (BSD/macOS point-to-point)
+int configure_tun_peer(const char* ifname, const char* peer_addr) {
+    if (!ifname || !peer_addr) {
+        ROUTE_ERROR("[ROUTE] configure_tun_peer: NULL pointer");
+        return -1;
+    }
+
+#if defined(PLATFORM_MACOS)
+    // Use ioctl to set the peer/destination address
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        ROUTE_ERROR("[ROUTE] Failed to create socket for peer configuration: errno=%d", errno);
+        return -1;
+    }
+
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+
+    struct sockaddr_in* addr = (struct sockaddr_in*)&ifr.ifr_addr;
+    addr->sin_family = AF_INET;
+    addr->sin_len = sizeof(struct sockaddr_in);
+
+    if (inet_pton(AF_INET, peer_addr, &addr->sin_addr) != 1) {
+        ROUTE_ERROR("[ROUTE] Invalid peer address: %s", peer_addr);
+        close(sock);
+        return -1;
+    }
+
+    ROUTE_INFO("[ROUTE] Setting peer address via ioctl(SIOCSIFDSTADDR): %s", peer_addr);
+
+    if (ioctl(sock, SIOCSIFDSTADDR, &ifr) < 0) {
+        ROUTE_ERROR("[ROUTE] SIOCSIFDSTADDR failed: errno=%d (%s)", errno, strerror(errno));
+        close(sock);
+        return -1;
+    }
+
+    close(sock);
+    ROUTE_INFO("[ROUTE] TUN interface %s peer configured: %s", ifname, peer_addr);
+    return 0;
+#else
+    // Other platforms don't need peer configuration
+    (void)ifname;
+    (void)peer_addr;
+    ROUTE_DEBUG("[ROUTE] Peer configuration not needed on this platform");
+    return 0;
+#endif
 }
 
 /// Add route using system command (BSD/macOS fallback)
@@ -1751,7 +1819,7 @@ int bsd_route_add_cmd(const route_entry_t* route) {
     }
 
     // Convert IP addresses from network byte order to string
-    char dst_str[32], mask_str[32];
+    char dst_str[32], mask_str[32], gw_str[32];
     ipv4_to_str_nbo(route->ipv4.dst, dst_str, sizeof(dst_str));
     ipv4_to_str_nbo(route->ipv4.mask, mask_str, sizeof(mask_str));
 
@@ -1763,8 +1831,13 @@ int bsd_route_add_cmd(const route_entry_t* route) {
     }
 
     // Build route command using Tailscale-compatible format:
-    // route -q -n add -inet <dst>/<prefix> -iface <ifname>
-    // Note: macOS route command uses -inet instead of -net, -iface instead of -interface
+    // route -q -n add -inet <dst>/<prefix> -iface <ifname> [-gateway <gw>]
+    //
+    // For macOS utun devices (point-to-point):
+    // - Use ONLY -iface, NOT -gateway
+    // - The gateway option causes the route to be associated with the wrong interface
+    // - Point-to-point interfaces don't need a separate gateway specification
+    // - This is how xtun and Tailscale handle macOS utun routing
     char cmd[512];
 
     // First, try to delete existing route to avoid "File exists" error
@@ -1773,10 +1846,10 @@ int bsd_route_add_cmd(const route_entry_t* route) {
     ROUTE_INFO("[ROUTE] Deleting existing route: %s", cmd);
     system(cmd);
 
-    // Add the new route using -inet and -iface flags (Tailscale/macOS convention)
+    // For point-to-point interfaces (utun), use ONLY -iface without -gateway
+    // The -gateway option incorrectly associates the route with en0 instead of utun
     snprintf(cmd, sizeof(cmd), "route -q -n add -inet %s/%d -iface %s 2>&1",
              dst_str, 32, ifname);
-
     ROUTE_INFO("[ROUTE] Adding route via command: %s", cmd);
 
     int result = system(cmd);

@@ -49,6 +49,7 @@ fn isElevated() bool {
 // Command line arguments - all as strings to pass to C layer
 const Args = struct {
     tun_ip: []const u8 = "10.0.0.1",
+    tun_peer: []const u8 = "10.0.0.2",
     tun_prefix: []const u8 = "24",
     tun_mtu: []const u8 = "1500",
     proxy_addr: []const u8 = "127.0.0.1:1080",
@@ -95,6 +96,11 @@ fn parseArgs(_: std.mem.Allocator) !Args {
             if (i < std.os.argv.len) {
                 args.target_ip = std.mem.sliceTo(std.os.argv[i], 0);
             }
+        } else if (std.mem.eql(u8, arg, "--tun-peer") or std.mem.eql(u8, arg, "-P")) {
+            i += 1;
+            if (i < std.os.argv.len) {
+                args.tun_peer = std.mem.sliceTo(std.os.argv[i], 0);
+            }
         } else if (std.mem.eql(u8, arg, "--debug") or std.mem.eql(u8, arg, "-d")) {
             args.debug = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -112,11 +118,12 @@ fn printHelp() void {
         \\
         \\Options:
         \\  -i, --tun-ip IP       TUN interface IP address (default: 10.0.0.1)
+        \\  -P, --tun-peer PEER   TUN peer/destination IP (default: 10.0.0.2)
         \\  -m, --tun-mtu MTU     TUN device MTU (default: 1500)
         \\  -p, --prefix LEN      IPv4 prefix length (default: 24)
         \\  -x, --proxy ADDR      SOCKS5 proxy address (default: 127.0.0.1:1080)
         \\  -e, --egress IFACE    Egress interface name (auto-detect if empty)
-        \\  -t, --target IP      Target IP to route through TUN (default: 111.45.11.5)
+        \\  -t, --target IP       Target IP to route through TUN (default: 111.45.11.5)
         \\  -d, --debug           Enable debug logging
         \\  -h, --help            Show this help message
         \\
@@ -264,46 +271,77 @@ pub fn main() !u8 {
     const tun_ifindex = device.ifIndex() catch 0;
     std.debug.print("TUN interface index: {d} (name='{s}')\n", .{ tun_ifindex, tun_name });
 
-    // Configure TUN interface IP address (required before adding routes on macOS)
+    // Configure TUN interface IP address and peer (required before adding routes on macOS)
     if (builtin.os.tag == .macos or builtin.os.tag == .ios) {
         const tun_name_z = try allocator.dupeZ(u8, tun_name);
         defer allocator.free(tun_name_z);
         const tun_ip_z = try allocator.dupeZ(u8, args.tun_ip);
         defer allocator.free(tun_ip_z);
+        const tun_peer_z = try allocator.dupeZ(u8, args.tun_peer);
+        defer allocator.free(tun_peer_z);
         std.debug.print("Configuring TUN IP: {s} -> {s}\n", .{ tun_name, args.tun_ip });
         if (network.configureTunIp(tun_name_z, tun_ip_z) != 0) {
             std.debug.print("Warning: Failed to configure TUN IP, routes may fail\n", .{});
         }
+        std.debug.print("Configuring TUN peer: {s} -> {s}\n", .{ tun_name, args.tun_peer });
+        if (network.configureTunPeer(tun_name_z, tun_peer_z) != 0) {
+            std.debug.print("Warning: Failed to configure TUN peer, routing may not work correctly\n", .{});
+        }
     }
 
     // Configure route: target_ip/32 -> TUN (via C layer)
+    // On macOS, use peer as gateway for proper reply routing
     const target_cidr = try std.fmt.allocPrint(allocator, "{s}/32", .{args.target_ip});
     defer allocator.free(target_cidr);
+
+    const gateway_ip = if (builtin.os.tag == .macos or builtin.os.tag == .ios)
+        args.tun_peer
+    else
+        args.tun_ip;
 
     network.configSystemRoute(
         null,
         tun_name,
         target_cidr,
-        network.parseIp(args.tun_ip) catch 0,
+        network.parseIp(gateway_ip) catch 0,
     ) catch |err| {
         std.debug.print("Warning: Route configuration failed: {}, continuing...\n", .{err});
     };
-    std.debug.print("Route configured: {s} -> {s}\n", .{ target_cidr, args.tun_ip });
+    std.debug.print("Route configured: {s} -> {s} (gateway={s})\n", .{ target_cidr, args.tun_ip, gateway_ip });
 
-    // Parse TUN IP for router configuration
+    // Add route for TUN IP itself via TUN interface (symmetric routing for ICMP replies)
+    // This ensures reply packets to 10.0.0.1 can be routed back through the TUN interface
+    if (builtin.os.tag == .macos or builtin.os.tag == .ios) {
+        const tun_ip_cidr = try std.fmt.allocPrint(allocator, "{s}/32", .{args.tun_ip});
+        defer allocator.free(tun_ip_cidr);
+
+        network.configSystemRoute(
+            null,
+            tun_name,
+            tun_ip_cidr,
+            0,  // No gateway needed for direct interface route
+        ) catch |err| {
+            std.debug.print("Warning: TUN IP route configuration failed: {}, continuing...\n", .{err});
+        };
+        std.debug.print("Route configured: {s} -> {s} (local)\n", .{ tun_ip_cidr, tun_name });
+    }
+
+    // Parse TUN IP and peer for router configuration
     const tun_ip_nbo = network.parseIp(args.tun_ip) catch 0;
+    const tun_peer_nbo = network.parseIp(args.tun_peer) catch 0;
 
     // Create TUN configuration for router
     const tun_config = router.TunConfig{
         .name = try allocator.dupeZ(u8, tun_name),
         .ifindex = tun_ifindex,
         .ip = tun_ip_nbo,
+        .peer = tun_peer_nbo,
         .prefix_len = prefix_len,
         .mtu = opts.mtu orelse 1500,
         .fd = device.getFd(),
         .device_ops = null,
         .header_len = switch (builtin.os.tag) {
-            .macos, .ios => 4,
+            .macos, .ios => 4,  // macOS utun requires 4-byte header on write
             else => 0,
         },
     };

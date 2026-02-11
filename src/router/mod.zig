@@ -326,6 +326,9 @@ pub const Router = struct {
     /// Write buffer for TUN writes
     write_buf: [65536]u8,
 
+    /// ICMP reply buffer (dedicated to avoid race conditions)
+    icmp_buf: [65536]u8,
+
     /// Statistics
     _stats: RouterStats,
 
@@ -351,6 +354,8 @@ pub const Router = struct {
             const header_len = router.config.tun.header_len;
             const total_len = header_len + data.len;
 
+            std.debug.print("[TUN-WRITE] header_len={}, data.len={}, total_len={}\n", .{ header_len, data.len, total_len });
+
             if (router.write_buf.len < total_len) {
                 return error.BufferTooSmall;
             }
@@ -362,15 +367,37 @@ pub const Router = struct {
                 router.write_buf[1] = 0;
                 router.write_buf[2] = 0;
                 router.write_buf[3] = 0;
+
+                // Only copy if data is not already in the right place (avoid aliasing)
+                if (data.ptr != &router.write_buf) {
+                    @memcpy(router.write_buf[header_len..total_len], data);
+                }
             }
 
-            // Copy packet data
-            @memcpy(router.write_buf[header_len..total_len], data);
+            // Debug: dump what we're writing
+            std.debug.print("[TUN-WRITE] writing ", .{});
+            for (0..@min(total_len, 24)) |i| std.debug.print("{x:0>2} ", .{router.write_buf[i]});
+            std.debug.print("... (total={})\n", .{total_len});
 
             const tun = router.config.tun.fd;
-            const written = std.posix.write(tun, router.write_buf[0..total_len]) catch return error.WriteFailed;
-            router._stats.bytes_tx += written;
+            // Ensure we write exactly total_len bytes
+            var bytes_written: usize = 0;
+            while (bytes_written < total_len) {
+                const slice = router.write_buf[bytes_written..total_len];
+                const written = std.posix.write(tun, slice) catch return error.WriteFailed;
+                if (written == 0) return error.WriteFailed;
+                bytes_written += written;
+            }
+            std.debug.print("[TUN-WRITE] wrote {} bytes (expected {})\n", .{ bytes_written, total_len });
+            router._stats.bytes_tx += bytes_written;
         }
+    }
+
+    /// Write packet to loopback interface (for local delivery of ICMP replies)
+    fn writeToLoopback(router: *Router, data: []const u8) !void {
+        _ = router;
+        _ = data;
+        // TODO: Implement loopback write if needed
     }
 
     /// Create a new Router instance
@@ -435,6 +462,7 @@ pub const Router = struct {
             .state = .init,
             .packet_buf = undefined,
             .write_buf = undefined,
+            .icmp_buf = undefined,
             ._stats = .{},
             .allocator = allocator,
         };
@@ -490,7 +518,11 @@ pub const Router = struct {
         }
 
         // Run event loop
-        router.loop.run(.until_done) catch {};
+        std.debug.print("[ROUTER] Starting event loop...\n", .{});
+        router.loop.run(.until_done) catch {
+            std.debug.print("[ROUTER] Event loop error!\n", .{});
+        };
+        std.debug.print("[ROUTER] Event loop exited.\n", .{});
         router.state = .stopped;
     }
 
@@ -920,18 +952,17 @@ pub const Router = struct {
     }
 
     /// Handle ICMP echo request - send echo reply
-    fn handleIcmpEcho(router: *Router, ip_header_len: usize) !void {
-        // ICMP header is at ip_header_len in the packet
+    fn handleIcmpEcho(router: *Router, packet_offset: usize, packet_len: usize, ip_header_len: usize) !void {
+        // ICMP header is at ip_header_len in the packet (after packet_offset)
         // ICMP Echo Request: Type = 8, Code = 0
         // ICMP Echo Reply: Type = 0, Code = 0
 
-        const packet = router.packet_buf[0..];
-        if (packet.len < 20) {
+        if (packet_len < 20) {
             std.debug.print("[ICMP] Packet too small for IP header\n", .{});
             return;
         }
 
-        const total_len = std.mem.readInt(u16, packet[2..4], .big);
+        const packet = router.packet_buf[packet_offset..packet_offset + packet_len];
 
         if (packet.len < ip_header_len + 8) {
             std.debug.print("[ICMP] Packet too small for ICMP\n", .{});
@@ -947,8 +978,9 @@ pub const Router = struct {
 
         std.debug.print("[ICMP] Echo request received, sending reply\n", .{});
 
-        // Copy packet to write buffer
-        @memcpy(router.write_buf[0..total_len], packet);
+        // Copy packet to ICMP buffer (use actual packet length)
+        const copy_len = packet.len;
+        @memcpy(router.icmp_buf[0..copy_len], packet);
 
         // Get src/dst IPs from original packet (in network byte order)
         const src_ip = std.mem.readInt(u32, packet[12..16], .big);
@@ -957,22 +989,26 @@ pub const Router = struct {
         std.debug.print("[ICMP]   src={s} dst={s}\n", .{ fmtIp(src_ip), fmtIp(dst_ip) });
 
         // Swap IP addresses: reply goes back to original source
-        // Offset 12-16: destination IP in reply = original source IP
-        // Offset 16-20: source IP in reply = original destination IP
-        std.mem.writeInt(u32, router.write_buf[12..16], src_ip, .big);
-        std.mem.writeInt(u32, router.write_buf[16..20], dst_ip, .big);
+        // For ICMP echo reply:
+        //   Source IP = original destination (dst_ip)
+        //   Destination IP = original source (src_ip)
+        // IPv4 header offsets:
+        //   Offset 12-16: Source IP
+        //   Offset 16-20: Destination IP
+        std.mem.writeInt(u32, router.icmp_buf[12..16], dst_ip, .big);
+        std.mem.writeInt(u32, router.icmp_buf[16..20], src_ip, .big);
 
         // Change ICMP type from 8 (Echo Request) to 0 (Echo Reply)
-        router.write_buf[ip_header_len] = 0;
+        router.icmp_buf[ip_header_len] = 0;
 
         // Zero out checksum field before recalculating (MUST be 0 for correct calculation)
-        router.write_buf[ip_header_len + 2] = 0;
-        router.write_buf[ip_header_len + 3] = 0;
+        router.icmp_buf[ip_header_len + 2] = 0;
+        router.icmp_buf[ip_header_len + 3] = 0;
 
         // Recalculate ICMP checksum (includes pseudo-header)
         // ICMP checksum = one's complement of sum(pseudo-header + ICMP header + data)
         // Pseudo-header: src_ip + dst_ip + zero + protocol (1) + ICMP length
-        const icmp_len = total_len - ip_header_len;
+        const icmp_len = copy_len - ip_header_len;
 
         var sum: u32 = 0;
 
@@ -992,24 +1028,31 @@ pub const Router = struct {
 
         // Add ICMP header + data
         var i: usize = ip_header_len;
-        while (i + 1 < total_len) : (i += 2) {
-            sum += std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(&router.write_buf[i])), .big);
+        while (i + 1 < copy_len) : (i += 2) {
+            sum += std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(&router.icmp_buf[i])), .big);
         }
-        if (i < total_len) {
-            sum += @as(u16, router.write_buf[i]) << 8;
+        if (i < copy_len) {
+            // Add last odd byte in high byte position
+            sum += @as(u16, router.icmp_buf[i]) << 8;
         }
 
-        // Fold and complement
+        // Fold 32-bit sum to 16-bit
         while (sum >> 16 != 0) {
             sum = (sum & 0xFFFF) + (sum >> 16);
         }
+        // Take one's complement (checksum = ~sum), then truncate to u16
         const checksum = @as(u16, @truncate(~sum));
 
         // Write checksum
-        std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(&router.write_buf[ip_header_len + 2])), checksum, .big);
+        std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(&router.icmp_buf[ip_header_len + 2])), checksum, .big);
 
-        // Write reply back to TUN
-        try router.writeToTunBuf(router.write_buf[0..total_len]);
+        // Debug: verify IPs in icmp_buf
+        std.debug.print("[ICMP-DBG] icmp_buf[12..20]=", .{});
+        for (12..20) |j| std.debug.print("{x:0>2} ", .{router.icmp_buf[j]});
+        std.debug.print("\n", .{});
+
+        // Write reply back to TUN using dedicated ICMP buffer
+        try router.writeToTunBuf(router.icmp_buf[0..copy_len]);
         std.debug.print("[ICMP] Reply sent successfully\n", .{});
     }
 
@@ -1068,6 +1111,7 @@ fn onTunReadable(
     _ = completion;
 
     const router = @as(*Router, @ptrCast(@alignCast(userdata orelse return .disarm)));
+    std.debug.print("[TUN-CB] onTunReadable called, result={any}\n", .{result});
 
     // Check for read result (result.read is error union !usize)
     const n = result.read catch {
@@ -1081,43 +1125,49 @@ fn onTunReadable(
         router.submitTunRead();
         return .disarm;
     }
+    std.debug.print("[TUN] Read {} bytes from TUN\n", .{n});
 
     router._stats.bytes_rx += n;
 
-    // Platform-specific headers are handled by device_darwin.zig readFn
-    // The 4-byte AF_INET header has been stripped and IP packet copied to offset 0
-    if (n < 20) {
-        std.debug.print("[TUN] Packet too small ({})\n", .{n});
+    // Check for macOS utun 4-byte AF_INET header
+    // Observed: first 4 bytes are 0x00000002 (AF_INET family)
+    // Byte 3 contains AF_INET=2 (bytes 0-2 are zero padding)
+    // IP header starts at byte 4: 0x45 = IPv4 with 20-byte header
+    var packet_offset: usize = 0;
+    if (n >= 4 and router.packet_buf[3] == 2) {
+        // UTUN header detected, skip 4 bytes
+        packet_offset = 4;
+    }
+
+    if (n - packet_offset < 20) {
         router.submitTunRead();
         return .disarm;
     }
 
-    // Packet data starts at offset 0 (headers already stripped by platform layer)
-    const packet_data = router.packet_buf[0..n];
-    const src_ip = std.mem.readInt(u32, packet_data[12..16], .big);
-    const dst_ip = std.mem.readInt(u32, packet_data[16..20], .big);
-    const protocol = packet_data[9];
-    std.debug.print("\n[TUN] READ: {} bytes from TUN\n", .{n});
-    std.debug.print("[TUN]   src={s} dst={s} proto={}\n", .{ fmtIp(src_ip), fmtIp(dst_ip), protocol });
-    dumpPacket("[TUN]   packet", packet_data);
+    // Packet data starts at packet_offset
+    const packet_data = router.packet_buf[packet_offset..n];
 
-    // Check if this is an ICMP packet - handle echo request immediately
-    const ver_ihl = packet_data[0];
-    const ihl = ver_ihl & 0x0F;
-    const ip_header_len = @as(usize, ihl) * 4;
+    // Debug: dump the first 8 bytes after offset
+    std.debug.print("[TUN-DBG] n={}, offset={}, data[0..8]=", .{n, packet_offset});
+    for (0..@min(8, packet_data.len)) |i| std.debug.print("{x:0>2} ", .{packet_data[i]});
+    std.debug.print("\n", .{});
+
+    const protocol = packet_data[9];
 
     // ICMP protocol = 1
     if (protocol == 1) {
-        std.debug.print("[TUN]   -> ICMP packet, handling echo\n", .{});
-        // Handle ICMP echo request (ping) - pass ip_header_len to skip IP header
-        router.handleIcmpEcho(ip_header_len) catch {};
+        const ver_ihl = packet_data[0];
+        const ip_header_len = @as(usize, ver_ihl & 0x0F) * 4;
+        router.handleIcmpEcho(packet_offset, n - packet_offset, ip_header_len) catch {};
         router.submitTunRead();
         return .disarm;
     }
 
     // Parse and forward packet
-    const packet = router.parsePacket(packet_data) catch {
-        std.debug.print("[TUN]   -> Failed to parse packet\n", .{});
+    const packet = router.parsePacket(packet_data) catch |err| {
+        std.debug.print("[TUN]   -> Failed to parse packet (err={}, proto={}, dump=)", .{err, protocol});
+        for (0..@min(20, packet_data.len)) |i| std.debug.print("{x:0>2} ", .{packet_data[i]});
+        std.debug.print("\n", .{});
         router.submitTunRead();
         return .disarm;
     };

@@ -194,6 +194,20 @@ void route_ipv6_prefix_to_mask(uint8_t prefix_len, uint8_t* mask_out);
 ///   0 on success, -1 on error
 int configure_tun_ip(const char* ifname, const char* ip_addr);
 
+/// Configure TUN interface peer address (BSD/macOS point-to-point)
+///
+/// For macOS utun devices, this sets the destination/peer address using SIOCSIFDSTADDR.
+/// This is critical for proper routing - the kernel needs to know the peer address
+/// to correctly route reply packets.
+///
+/// Parameters:
+///   ifname: Interface name (e.g., "utun0")
+///   peer_addr: Peer/destination IP address in dotted-decimal format (e.g., "10.0.0.2")
+///
+/// Returns:
+///   0 on success, -1 on error
+int configure_tun_peer(const char* ifname, const char* peer_addr);
+
 // ==================== Platform-Specific API ====================
 
 #ifdef PLATFORM_LINUX
