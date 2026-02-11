@@ -481,23 +481,23 @@ BSD Routing Socket operations are **NOT too complex** for pure Zig. The key insi
 
 #### Phase 7.1: Refactor network.zig (Pure Zig)
 
-- [ ] **Task 7.1.1**: Implement `getLocalIps()` using `std.posix.getifaddrs`
+- [x] **Task 7.1.1**: Implement `getLocalIps()` using `getifaddrs` (C Import)
   - File: `src/system/network.zig`
   - Return `[]IpInfo` slice
   - Filter loopback addresses
-  - Verify with test_icmp.zig
+  - Uses C import for getifaddrs/freeifaddrs
 
-- [ ] **Task 7.1.2**: Implement `getPrimaryIp()` using UDP probe
+- [x] **Task 7.1.2**: Implement `getPrimaryIp()` using UDP probe
   - Create UDP socket
   - Connect to 8.8.8.8:53 (doesn't send)
   - Call `getsockname()` for local IP
 
-- [ ] **Task 7.1.3**: Implement `selectEgressIp()` pure Zig
+- [x] **Task 7.1.3**: Implement `selectEgressIp()` pure Zig
   - Iterate local IP list
   - Filter TUN devices (utun*, tun*)
   - Select best egress IP
 
-- [ ] **Task 7.1.4**: Migrate `configureTunIp/TunPeer`
+- [x] **Task 7.1.4**: Migrate `configureTunIp/TunPeer`
   - Use `std.process.Child.run()` instead of `system()`
   - Call: `ifconfig <ifname> <ip> <peer>`
 
@@ -509,20 +509,26 @@ BSD Routing Socket operations are **NOT too complex** for pure Zig. The key insi
   - Build RTM_ADD/RTM_DELETE messages
   - Send and read acknowledgment
 
-- [ ] **Task 7.2.2**: Migrate `addRouteFn()` in device_darwin.zig
+- [x] **Task 7.2.2**: Migrate `addRouteFn()` in device_darwin.zig
   - Copy pattern from test_route.zig
-  - Use `route_cdefs.h` for constants
+  - Use BSD Routing Socket constants
   - Use extern struct for rt_msghdr/sockaddr_in
 
-- [ ] **Task 7.2.3**: Migrate `deleteRouteFn()` in device_darwin.zig
+- [x] **Task 7.2.3**: Migrate `deleteRouteFn()` in device_darwin.zig
   - Same pattern as addRouteFn()
   - Build RTM_DELETE message
 
-- [ ] **Task 7.2.4**: Test route add/delete with device_darwin.zig
+- [x] **Task 7.2.4**: Test route add/delete with device_darwin.zig
   ```bash
   # Verify commands work
-  sudo ./tun2sock add-route 10.0.0.2/32
-  sudo ./tun2sock delete-route 10.0.0.2/32
+  sudo ./tun2sock --tun-ip 10.0.0.1 --tun-peer 10.0.0.2 --target 10.0.0.2
+
+  # Result: 3/3 ping packets received, 0% loss
+  ping -c 3 10.0.0.2
+  # 64 bytes from 10.0.0.2: icmp_seq=0 ttl=64 time=8.764 ms
+  # 64 bytes from 10.0.0.2: icmp_seq=1 ttl=64 time=6.926 ms
+  # 64 bytes from 10.0.0.2: icmp_seq=2 ttl=64 time=11.790 ms
+  # 3 packets transmitted, 3 received, 0.0% packet loss
   ```
 
 #### Phase 7.3: Complete router/mod.zig

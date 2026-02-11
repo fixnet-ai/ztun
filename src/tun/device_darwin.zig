@@ -91,6 +91,63 @@ const sockaddr_in6 = extern struct {
     sin6_scope_id: u32,
 };
 
+// ==================== BSD Routing Socket Constants (VERIFIED) ====================
+//
+// BSD Routing Socket (PF_ROUTE/AF_ROUTE) for routing table manipulation.
+// Message format: [rt_msghdr (92 bytes)][sockaddr_in dst][sockaddr_in gateway]
+//
+// Key points:
+//   - sizeof(rt_msghdr) = 92 bytes (NOT 64 as commonly documented!)
+//   - RTM_VERSION = 5 (NOT 3 as Linux uses!)
+//   - rtm_addrs bitmask tells kernel which addresses follow
+
+const RTM_VERSION = @as(u8, 5);    // macOS uses version 5 (NOT 3 as Linux!)
+const RTM_ADD = @as(u8, 0x1);      // Add route message type
+const RTM_DELETE = @as(u8, 0x2);  // Delete route message type
+const RTF_UP = @as(i32, 0x1);     // Route is up
+const RTF_STATIC = @as(i32, 0x800); // Route is static
+
+// Address flags in rtm_addrs bitmask
+const RTA_DST = @as(i32, 0x1);      // Destination address present
+const RTA_GATEWAY = @as(i32, 0x2);  // Gateway/next-hop address present
+
+// BSD Routing Socket address family
+const AF_ROUTE = @as(c_int, 17);    // AF_ROUTE = 17 (routing socket family)
+const SOCK_RAW = @as(c_int, 3);    // SOCK_RAW = 3 (raw socket type)
+
+// ==================== BSD Routing Socket Structures (VERIFIED) ====================
+//
+// rt_metrics - Route metrics structure (embedded in rt_msghdr, 56 bytes)
+const rt_metrics = extern struct {
+    rmx_locks: u32,       // Kernel locks on this route
+    rmx_mtu: u32,         // Maximum transmission unit
+    rmx_hopcount: u32,    // Hop count (not used)
+    rmx_expire: i32,      // Expiration time (relative, seconds)
+    rmx_recvpipe: u32,    // Receive pipeline size
+    rmx_sendpipe: u32,    // Send pipeline size
+    rmx_ssthresh: u32,    // Slow start threshold
+    rmx_rtt: u32,         // Round-trip time (microseconds)
+    rmx_rttvar: u32,      // RTT variance
+    rmx_pksent: u32,      // Packets sent
+    rmx_filler: [4]u32,   // Reserved for future use (16 bytes)
+};
+
+// rt_msghdr - Routing message header (92 bytes on macOS)
+const rt_msghdr = extern struct {
+    rtm_msglen: u16,      // Message length in bytes
+    rtm_version: u8,      // RTM_VERSION (5 on macOS)
+    rtm_type: u8,         // Message type (RTM_ADD, RTM_DELETE, etc.)
+    rtm_index: u16,       // Interface index (from if_nametoindex)
+    rtm_flags: i32,        // Route flags (RTF_UP, RTF_STATIC, etc.)
+    rtm_addrs: i32,       // Bitmask of addresses following (RTA_DST|RTA_GATEWAY)
+    rtm_pid: i32,         // Process ID of sender
+    rtm_seq: u32,         // Sequence number (kernel echoes in response)
+    rtm_errno: i32,       // Error number (0 = success in response)
+    rtm_use: i32,         // Use count
+    rtm_inits: u32,       // Which metrics are being initialized
+    rmx: rt_metrics,       // Route metrics (56 bytes, offset 36)
+};
+
 // ==================== Device State ====================
 
 /// Darwin device internal state
@@ -298,16 +355,99 @@ fn closeFn(ctx: *anyopaque) void {
 }
 
 fn addRouteFn(ctx: *anyopaque, route: *const RouteEntry) TunError!void {
-    _ = ctx;
-    _ = route;
-    // TODO: Implement BSD routing socket route addition
-    return error.NotSupported;
+    const state = @as(*DarwinDeviceState, @ptrCast(@alignCast(ctx)));
+    const ifname = state.name;
+
+    // Build route add message via BSD Routing Socket
+    const iface_idx = if_nametoindex(@as([*:0]const u8, @ptrCast(ifname.ptr)));
+    if (iface_idx == 0) return error.NotFound;
+
+    // Build message: rt_msghdr + 2 * sockaddr_in (dst, gateway)
+    const msg_size = @sizeOf(rt_msghdr) + 2 * @sizeOf(sockaddr_in);
+    var buf: [256]u8 align(8) = undefined;
+    @memset(&buf, 0);
+
+    const rtm = @as(*rt_msghdr, @alignCast(@ptrCast(&buf)));
+    rtm.rtm_msglen = @as(u16, @intCast(msg_size));
+    rtm.rtm_version = RTM_VERSION;
+    rtm.rtm_type = RTM_ADD;
+    rtm.rtm_index = @as(u16, @intCast(iface_idx));
+    rtm.rtm_flags = RTF_UP | RTF_STATIC;
+    rtm.rtm_addrs = RTA_DST | RTA_GATEWAY;
+    rtm.rtm_pid = getpid();
+    rtm.rtm_seq = 1;
+
+    // Destination address
+    var offset: usize = @sizeOf(rt_msghdr);
+    const dst = @as(*sockaddr_in, @alignCast(@ptrCast(buf[offset..].ptr)));
+    dst.sin_len = @sizeOf(sockaddr_in);
+    dst.sin_family = AF_INET;
+    dst.sin_addr = route.destination.address;
+
+    // Gateway address
+    offset += @sizeOf(sockaddr_in);
+    const gw = @as(*sockaddr_in, @alignCast(@ptrCast(buf[offset..].ptr)));
+    gw.sin_len = @sizeOf(sockaddr_in);
+    gw.sin_family = AF_INET;
+    if (route.gateway) |gw_addr| {
+        gw.sin_addr = gw_addr;
+    }
+
+    // Create routing socket and send message
+    const fd = std.posix.socket(AF_ROUTE, SOCK_RAW, 0) catch return error.IoError;
+    defer std.posix.close(fd);
+
+    _ = std.posix.write(fd, buf[0..msg_size]) catch {
+        return error.IoError;
+    };
 }
 
 fn deleteRouteFn(ctx: *anyopaque, route: *const RouteEntry) TunError!void {
-    _ = ctx;
-    _ = route;
-    return error.NotSupported;
+    const state = @as(*DarwinDeviceState, @ptrCast(@alignCast(ctx)));
+    const ifname = state.name;
+
+    // Build route delete message via BSD Routing Socket
+    const iface_idx = if_nametoindex(@as([*:0]const u8, @ptrCast(ifname.ptr)));
+    if (iface_idx == 0) return error.NotFound;
+
+    // Build message: rt_msghdr + 2 * sockaddr_in (dst, gateway)
+    const msg_size = @sizeOf(rt_msghdr) + 2 * @sizeOf(sockaddr_in);
+    var buf: [256]u8 align(8) = undefined;
+    @memset(&buf, 0);
+
+    const rtm = @as(*rt_msghdr, @alignCast(@ptrCast(&buf)));
+    rtm.rtm_msglen = @as(u16, @intCast(msg_size));
+    rtm.rtm_version = RTM_VERSION;
+    rtm.rtm_type = RTM_DELETE;
+    rtm.rtm_index = @as(u16, @intCast(iface_idx));
+    rtm.rtm_flags = RTF_UP | RTF_STATIC;
+    rtm.rtm_addrs = RTA_DST | RTA_GATEWAY;
+    rtm.rtm_pid = getpid();
+    rtm.rtm_seq = 1;
+
+    // Destination address
+    var offset: usize = @sizeOf(rt_msghdr);
+    const dst = @as(*sockaddr_in, @alignCast(@ptrCast(buf[offset..].ptr)));
+    dst.sin_len = @sizeOf(sockaddr_in);
+    dst.sin_family = AF_INET;
+    dst.sin_addr = route.destination.address;
+
+    // Gateway address
+    offset += @sizeOf(sockaddr_in);
+    const gw = @as(*sockaddr_in, @alignCast(@ptrCast(buf[offset..].ptr)));
+    gw.sin_len = @sizeOf(sockaddr_in);
+    gw.sin_family = AF_INET;
+    if (route.gateway) |gw_addr| {
+        gw.sin_addr = gw_addr;
+    }
+
+    // Create routing socket and send message
+    const fd = std.posix.socket(AF_ROUTE, SOCK_RAW, 0) catch return error.IoError;
+    defer std.posix.close(fd);
+
+    _ = std.posix.write(fd, buf[0..msg_size]) catch {
+        return error.IoError;
+    };
 }
 
 // ==================== Helper Functions ====================

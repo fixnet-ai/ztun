@@ -27,20 +27,237 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const c = @cImport(@cInclude("sys/types.h"));
+const c_ifaddrs = @cImport(@cInclude("ifaddrs.h"));
 
-// ==================== C 外部函数声明 ====================
+// 地址族常量（定义在 netinet/in.h 中）
+const AF_INET: u8 = 2;  // IPv4
+const AF_INET6: u8 = 30; // IPv6
+const IFF_LOOPBACK: c_int = 0x8;
+
+/// 最大接口数量（用于临时缓冲区）
+const MAX_INTERFACES: usize = 32;
+
+/// IP 地址字符串缓冲区大小
+const IP_STR_LEN: usize = 64;
+
+// ==================== 类型定义 ====================
 
 /// 本地 IP 地址信息
 pub const IpInfo = extern struct {
-    ip: [64]u8, // IP 地址字符串（IPv4 或 IPv6）
+    ip: [IP_STR_LEN]u8, // IP 地址字符串（IPv4 或 IPv6）
     is_ipv6: c_int, // 是否为 IPv6
     is_loopback: c_int, // 是否为回环地址
 };
 
+/// 纯 Zig 接口信息（内部使用）
+const InterfaceInfo = struct {
+    name: [64]u8,
+    name_len: usize,
+    addr: std.net.Address,
+    is_loopback: bool,
+    is_up: bool,
+};
+
 // ==================== network.c 外部函数 ====================
 
-/// 获取所有本地 IP 地址（跨平台）
+/// 获取所有本地 IP 地址（跨平台，原始 C 实现）
 extern fn get_local_ips(ips: [*]IpInfo, max_count: c_int) c_int;
+
+// ==================== Pure Zig 实现（7.1 迁移）====================
+
+/// 使用 getifaddrs 获取所有本地 IP 地址（纯 Zig + C Import 实现）
+///
+/// 返回的切片需要调用者释放内存
+fn getLocalIpsPureZig(alloc: std.mem.Allocator) ![]IpInfo {
+    // 使用 C import 调用 getifaddrs
+    var ifaddrs_ptr: [*c]c_ifaddrs.ifaddrs = undefined;
+
+    // POSIX getifaddrs - 跨平台获取所有网络接口
+    const err = c_ifaddrs.getifaddrs(&ifaddrs_ptr);
+    if (err != 0) {
+        return error.GetIfAddrsFailed;
+    }
+    defer {
+        c_ifaddrs.freeifaddrs(ifaddrs_ptr);
+    }
+
+    // 收集所有接口信息到临时数组
+    var interfaces: [MAX_INTERFACES]InterfaceInfo = undefined;
+    var count: usize = 0;
+
+    var ifaddr: [*c]c_ifaddrs.ifaddrs = ifaddrs_ptr;
+    while (true) {
+        if (count >= MAX_INTERFACES) break;
+
+        // 跳过无地址的接口
+        if (ifaddr.ifa_addr == null) {
+            if (ifaddr.ifa_next == null) break;
+            ifaddr = ifaddr.ifa_next.?;
+            continue;
+        }
+
+        // 使用 @as 进行安全的指针转换
+        const iface = @as(*c_ifaddrs.ifaddrs, @ptrCast(ifaddr));
+        const sockaddr_ptr = iface.ifa_addr.?;
+
+        // sa_family 在 sockaddr 开头第 2 字节
+        const family_bytes = @as(*const [2]u8, @ptrCast(sockaddr_ptr)).*;
+
+        // 只处理 IPv4
+        if (family_bytes[1] != AF_INET) {
+            if (iface.ifa_next == null) break;
+            ifaddr = iface.ifa_next.?;
+            continue;
+        }
+
+        // 检查接口标志（IFF_LOOPBACK = 8）
+        const flags = iface.ifa_flags;
+        const is_loopback = (flags & IFF_LOOPBACK) != 0;
+
+        // 检查接口是否运行（IFF_UP | IFF_RUNNING）
+        const is_up = (flags & 0x1) != 0 and (flags & 0x40) != 0; // IFF_UP | IFF_RUNNING
+        if (!is_up) {
+            if (iface.ifa_next == null) break;
+            ifaddr = iface.ifa_next.?;
+            continue;
+        }
+
+        // sockaddr_in 的 sin_addr 在偏移 4 处，共 4 字节
+        const addr_int = @intFromPtr(sockaddr_ptr);
+        const ip_ptr = @as(*const [4]u8, @ptrCast(@as(*const u8, @ptrFromInt(addr_int + 4))));
+        const ip_bytes = ip_ptr.*;
+
+        // 复制接口名称
+        var name_buf: [64]u8 = undefined;
+        const name_len = std.mem.len(@as([*:0]const u8, @ptrCast(iface.ifa_name)));
+        const copy_len = @min(name_len, 63);
+        @memcpy(name_buf[0..copy_len], iface.ifa_name[0..copy_len]);
+        name_buf[copy_len] = 0;
+
+        // 构建 Address
+        const net_addr = std.net.Address.initIp4(ip_bytes, 0);
+
+        interfaces[count] = .{
+            .name = name_buf,
+            .name_len = copy_len,
+            .addr = net_addr,
+            .is_loopback = is_loopback,
+            .is_up = is_up,
+        };
+        count += 1;
+
+        if (iface.ifa_next == null) break;
+        ifaddr = iface.ifa_next.?;
+    }
+
+    if (count == 0) {
+        return error.NoLocalIps;
+    }
+
+    // 分配合适大小的数组
+    const ips = try alloc.alloc(IpInfo, count);
+    errdefer alloc.free(ips);
+
+    // 转换为 IpInfo 格式
+    for (interfaces[0..count], 0..count) |iface, i| {
+        const octets = iface.addr.in.sa.addr;
+        const ip_str = std.fmt.bufPrint(&ips[i].ip, "{}.{}.{}.{}", .{ octets[0], octets[1], octets[2], octets[3] }) catch {
+            ips[i].ip = [_]u8{0} ** IP_STR_LEN;
+            ips[i].is_ipv6 = 0;
+            ips[i].is_loopback = if (iface.is_loopback) 1 else 0;
+            continue;
+        };
+        // 确保字符串以 null 结尾
+        ips[i].ip[ip_str.len] = 0;
+
+        ips[i].is_ipv6 = 0; // 只处理 IPv4
+        ips[i].is_loopback = if (iface.is_loopback) 1 else 0;
+    }
+
+    return ips;
+}
+
+/// 使用 UDP socket 探测获取主出口 IP（纯 Zig 实现）
+///
+/// 通过创建 UDP socket 并尝试连接到外部地址（不发包），
+/// 然后使用 getsockname() 获取实际使用的本地地址
+fn getPrimaryIpPureZig(alloc: std.mem.Allocator) ![]u8 {
+    // 创建 UDP socket
+    const sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
+    defer std.posix.close(sock);
+
+    // 尝试连接到公共 DNS 服务器（不发包，只是为了探测路由）
+    const dns_addr = try std.net.Address.parseIp4("8.8.8.8", 53);
+    std.posix.connect(sock, &dns_addr.any, @sizeOf(std.posix.sockaddr_in)) catch {
+        // 连接失败也无所谓，我们仍然可以获取本地地址
+    };
+
+    // 获取本地地址
+    var local_addr: std.posix.sockaddr = undefined;
+    var local_addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+    try std.posix.getsockname(sock, &local_addr, &local_addr_len);
+
+    // 转换为 std.net.Address
+    const local_net_addr = std.posix.sockaddrToAddress(local_addr) catch {
+        return error.InvalidSockaddr;
+    };
+
+    // 转换为字符串
+    var ip_buf: [IP_STR_LEN]u8 = undefined;
+    const ip_str = local_net_addr.toString(&ip_buf) catch {
+        return error.InvalidAddress;
+    };
+
+    return try alloc.dupe(u8, ip_str);
+}
+
+/// 根据目标 IP 选择最佳出口 IP（纯 Zig 实现）
+///
+/// 通过创建 UDP socket 连接到目标地址来探测实际使用的出口 IP
+fn selectEgressIpPureZig(alloc: std.mem.Allocator, target_ip: []const u8) ![]u8 {
+    // 解析目标 IP
+    const target_addr = std.net.Address.parseIp4(target_ip, 0) catch {
+        // 尝试解析为主机名
+        const target = try std.net.resolveIpName(
+            alloc,
+            target_ip,
+            std.net.Address.Port{ .port = 0 },
+            .{},
+        );
+        defer target.deinit();
+        // 使用第一个地址
+        if (target.getPort() == 0) {
+            return error.InvalidTargetIp;
+        }
+    };
+
+    // 创建 UDP socket
+    const sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
+    defer std.posix.close(sock);
+
+    // 连接到目标地址
+    std.posix.connect(sock, &target_addr.any, @sizeOf(std.posix.sockaddr_in)) catch {
+        return error.ConnectionFailed;
+    };
+
+    // 获取本地地址（出口 IP）
+    var local_addr: std.posix.sockaddr = undefined;
+    var local_addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+    try std.posix.getsockname(sock, &local_addr, &local_addr_len);
+
+    const local_net_addr = std.posix.sockaddrToAddress(local_addr) catch {
+        return error.InvalidSockaddr;
+    };
+
+    // 转换为字符串
+    var ip_buf: [IP_STR_LEN]u8 = undefined;
+    const ip_str = local_net_addr.toString(&ip_buf) catch {
+        return error.InvalidAddress;
+    };
+
+    return try alloc.dupe(u8, ip_str);
+}
 
 /// 获取主出口 IP（通过创建 UDP socket 连接到外部地址探测）
 extern fn get_primary_ip(ip_buf: [*]u8, buf_len: usize) c_int;
@@ -186,77 +403,215 @@ extern fn configure_tun_peer(ifname: [*:0]const u8, peer_addr: [*:0]const u8) c_
 
 // ==================== Zig 包装函数 ====================
 
-/// 获取所有本地 IP 地址
+/// 获取所有本地 IP 地址（纯 Zig 实现）
 ///
 /// 返回需要调用者释放内存
 pub fn getLocalIps(alloc: std.mem.Allocator) ![]IpInfo {
-    // 使用临时数组获取 IP 数量
-    var temp_ips: [16]IpInfo = undefined;
-    const count = get_local_ips(&temp_ips, 16);
-    if (count <= 0) return error.NoLocalIps;
-
-    // 分配合适大小的数组
-    const ips = try alloc.alloc(IpInfo, @intCast(count));
-    errdefer alloc.free(ips);
-
-    // 复制临时数组的数据
-    @memcpy(ips, temp_ips[0..@intCast(count)]);
-
-    return ips[0..@intCast(count)];
+    // 使用纯 Zig 实现
+    return getLocalIpsPureZig(alloc);
 }
 
-/// 获取主出口 IP（通过 UDP 探测获取系统默认出口）
+/// 获取主出口 IP（通过 UDP 探测获取系统默认出口，纯 Zig 实现）
 ///
 /// 返回需要调用者释放内存
 pub fn getPrimaryIp(alloc: std.mem.Allocator) ![]u8 {
-    var buf: [64]u8 = undefined;
-    if (get_primary_ip(&buf, buf.len) != 0) {
-        return error.GetPrimaryIpFailed;
-    }
-    // 使用 sliceTo 获取以 null 结尾的字符串长度
-    const len = std.mem.sliceTo(buf[0..], 0).len;
-    return try alloc.dupe(u8, buf[0..len]);
+    return getPrimaryIpPureZig(alloc);
 }
 
-/// 根据目标 IP 选择最佳出口 IP
+/// 根据目标 IP 选择最佳出口 IP（纯 Zig 实现）
 ///
 /// 通过连接到目标地址探测实际使用的出口 IP
 pub fn selectEgressIp(alloc: std.mem.Allocator, target_ip: []const u8) ![]u8 {
-    // 将 target_ip 转换为 sentinel-terminated 字符串
-    const target_z = try alloc.dupeZ(u8, target_ip);
-    defer alloc.free(target_z);
-
-    var buf: [64]u8 = undefined;
-    if (select_egress_ip_for_target(target_z, &buf, buf.len) != 0) {
-        return error.SelectEgressIpFailed;
-    }
-    const len = std.mem.sliceTo(buf[0..], 0).len;
-    return try alloc.dupe(u8, buf[0..len]);
+    return selectEgressIpPureZig(alloc, target_ip);
 }
 
-/// 获取指定网络接口的 IP
+/// 获取指定网络接口的 IP（纯 Zig 实现）
 ///
 /// iface_name: 接口名称（如 "eth0", "en0"）
 pub fn getInterfaceIp(alloc: std.mem.Allocator, iface_name: []const u8) ![]u8 {
-    _ = iface_name;
-    _ = alloc;
-    // TODO: 需要在 C 层实现按接口名获取 IP
-    return error.NotImplemented;
+    // 使用 C import 获取接口地址
+    var ifaddrs_ptr: [*c]c_ifaddrs.ifaddrs = undefined;
+
+    const err = c_ifaddrs.getifaddrs(&ifaddrs_ptr);
+    if (err != 0) {
+        return error.GetIfAddrsFailed;
+    }
+    defer {
+        c_ifaddrs.freeifaddrs(ifaddrs_ptr);
+    }
+
+    var ifaddr: [*c]c_ifaddrs.ifaddrs = ifaddrs_ptr;
+    while (true) {
+        // 使用 @as 进行安全的指针转换
+        const iface = @as(*c_ifaddrs.ifaddrs, @ptrCast(ifaddr));
+
+        // 比较接口名称
+        const addr_name = @as([*:0]const u8, @ptrCast(iface.ifa_name));
+        if (std.mem.span(addr_name).len == iface_name.len and
+            std.mem.eql(u8, iface.ifa_name[0..iface_name.len], iface_name)) {
+
+            // 跳过无地址的接口
+            if (iface.ifa_addr) |sockaddr_ptr| {
+                // 只处理 IPv4 - sa_family 在 sockaddr 开头第 2 字节
+                const family_bytes = @as(*const [2]u8, @ptrCast(sockaddr_ptr)).*;
+                if (family_bytes[1] == AF_INET) {
+                    // sockaddr_in 的 sin_addr 在偏移 4 处，共 4 字节
+                    const addr_int = @intFromPtr(sockaddr_ptr);
+                    const ip_ptr = @as(*const [4]u8, @ptrCast(@as(*const u8, @ptrFromInt(addr_int + 4))));
+                    const ip_bytes = ip_ptr.*;
+
+                    // 转换为字符串
+                    var ip_buf: [IP_STR_LEN]u8 = undefined;
+                    const ip_str = std.fmt.bufPrint(&ip_buf, "{}.{}.{}.{}", .{
+                        ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3],
+                    }) catch {
+                        return error.InvalidAddress;
+                    };
+
+                    return try alloc.dupe(u8, ip_str);
+                }
+            }
+        }
+
+        if (iface.ifa_next == null) break;
+        ifaddr = iface.ifa_next.?;
+    }
+
+    return error.InterfaceNotFound;
 }
 
-/// 配置 TUN 接口 IP 地址
+/// 配置 TUN 接口 IP 地址（纯 Zig 实现）
 ///
-/// 在 macOS 上，TUN 接口需要先配置 IP 地址才能添加路由
+/// 在 macOS 上，使用 ifconfig 命令配置 TUN 接口 IP 地址
+/// 格式: ifconfig <ifname> <ip> <peer>
 pub fn configureTunIp(ifname: [*:0]const u8, ip_addr: [*:0]const u8) c_int {
-    return configure_tun_ip(ifname, ip_addr);
+    return configureTunIpPureZig(ifname, ip_addr);
 }
 
-/// 配置 TUN 接口对端地址 (BSD/macOS)
+/// 配置 TUN 接口对端地址 (BSD/macOS，纯 Zig 实现)
 ///
-/// 对于 macOS utun 设备，这设置目标/对端地址使用 SIOCSIFDSTADDR
-/// 这对正确路由至关重要
+/// 对于 macOS utun 设备，这设置目标/对端地址使用 ifconfig
+/// 格式: ifconfig <ifname> <ip> <peer>
 pub fn configureTunPeer(ifname: [*:0]const u8, peer_addr: [*:0]const u8) c_int {
-    return configure_tun_peer(ifname, peer_addr);
+    return configureTunPeerPureZig(ifname, peer_addr);
+}
+
+// ==================== Pure Zig TUN 配置实现 ====================
+
+/// 使用 ifconfig 配置 TUN 接口 IP 地址
+fn configureTunIpPureZig(ifname: [*:0]const u8, ip_addr: [*:0]const u8) c_int {
+    // 获取接口名称字符串
+    const ifname_str = std.mem.span(ifname);
+    const ip_str = std.mem.span(ip_addr);
+
+    // 执行 ifconfig 命令
+    const result = std.process.Child.run(.{
+        .allocator = std.heap.page_allocator,
+        .argv = &[_][]const u8{ "ifconfig", ifname_str, ip_str, ip_str },
+    }) catch {
+        return -1;
+    };
+    defer {
+        if (result.term == .Exited) {
+            std.heap.page_allocator.free(result.stdout);
+            std.heap.page_allocator.free(result.stderr);
+        }
+    }
+
+    // 检查命令是否成功执行
+    if (result.term != .Exited or result.term.Exited != 0) {
+        // 静默失败（某些系统可能不需要显式配置）
+        return -1;
+    }
+
+    return 0;
+}
+
+/// 使用 ifconfig 配置 TUN 接口对端地址
+fn configureTunPeerPureZig(ifname: [*:0]const u8, peer_addr: [*:0]const u8) c_int {
+    // 获取接口和对端地址字符串
+    const ifname_str = std.mem.span(ifname);
+    const peer_str = std.mem.span(peer_addr);
+
+    // 获取当前接口的 IP 地址（用于 ifconfig 命令）
+    const ip_addr = getInterfaceIpByNamePureZig(ifname_str) catch {
+        // 如果无法获取，使用 0.0.0.0 作为本地地址
+        return configureTunIpPureZig(ifname, "0.0.0.0");
+    };
+    defer std.heap.page_allocator.free(ip_addr);
+
+    // 执行 ifconfig 命令
+    const result = std.process.Child.run(.{
+        .allocator = std.heap.page_allocator,
+        .argv = &[_][]const u8{ "ifconfig", ifname_str, ip_addr, peer_str },
+    }) catch {
+        return -1;
+    };
+    defer {
+        if (result.term == .Exited) {
+            std.heap.page_allocator.free(result.stdout);
+            std.heap.page_allocator.free(result.stderr);
+        }
+    }
+
+    // 检查命令是否成功执行
+    if (result.term != .Exited or result.term.Exited != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+/// 纯 Zig 获取指定接口名称的 IP 地址（内部使用）
+fn getInterfaceIpByNamePureZig(ifname: []const u8) ![]u8 {
+    // 使用 C import 获取接口地址
+    var ifaddrs_ptr: [*c]c_ifaddrs.ifaddrs = undefined;
+
+    const err = c_ifaddrs.getifaddrs(&ifaddrs_ptr);
+    if (err != 0) {
+        return error.GetIfAddrsFailed;
+    }
+    defer {
+        c_ifaddrs.freeifaddrs(ifaddrs_ptr);
+    }
+
+    var ifaddr: [*c]c_ifaddrs.ifaddrs = ifaddrs_ptr;
+    while (true) {
+        // 使用 @as 进行安全的指针转换
+        const iface = @as(*c_ifaddrs.ifaddrs, @ptrCast(ifaddr));
+
+        // 比较接口名称
+        const addr_name = @as([*:0]const u8, @ptrCast(iface.ifa_name));
+        if (std.mem.span(addr_name).len == ifname.len and
+            std.mem.eql(u8, iface.ifa_name[0..ifname.len], ifname)) {
+
+            // 跳过无地址的接口
+            if (iface.ifa_addr) |sockaddr_ptr| {
+                // 只处理 IPv4 - sa_family 在 sockaddr 开头第 2 字节
+                const family_bytes = @as(*const [2]u8, @ptrCast(sockaddr_ptr)).*;
+                if (family_bytes[1] == AF_INET) {
+                    // sockaddr_in 的 sin_addr 在偏移 4 处，共 4 字节
+                    const addr_int = @intFromPtr(sockaddr_ptr);
+                    const ip_ptr = @as(*const [4]u8, @ptrCast(@as(*const u8, @ptrFromInt(addr_int + 4))));
+                    const ip_bytes = ip_ptr.*;
+
+                    var ip_buf: [IP_STR_LEN]u8 = undefined;
+                    const ip_str = std.fmt.bufPrint(&ip_buf, "{}.{}.{}.{}", .{
+                        ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3],
+                    }) catch {
+                        continue;
+                    };
+
+                    return try std.heap.page_allocator.dupe(u8, ip_str);
+                }
+            }
+        }
+
+        if (iface.ifa_next == null) break;
+        ifaddr = iface.ifa_next.?;
+    }
+
+    return error.InterfaceNotFound;
 }
 
 // ==================== 系统路由管理（新 API）====================
@@ -473,15 +828,15 @@ pub fn parseIp(ip_str: []const u8) !u32 {
     var part_idx: usize = 0;
     var current: u16 = 0;
 
-    for (ip_str) |c| {
-        if (c == '.') {
+    for (ip_str) |ch| {
+        if (ch == '.') {
             if (part_idx >= 4) return error.InvalidIpAddress;
             if (current > 255) return error.InvalidIpAddress;
             parts[part_idx] = @intCast(current);
             part_idx += 1;
             current = 0;
-        } else if (c >= '0' and c <= '9') {
-            current = current * 10 + (c - '0');
+        } else if (ch >= '0' and ch <= '9') {
+            current = current * 10 + (ch - '0');
         } else {
             return error.InvalidIpAddress;
         }
