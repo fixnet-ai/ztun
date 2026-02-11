@@ -361,11 +361,15 @@ fn route_add(ifname: [*:0]const u8, dst_ip: u32) void {
     defer socket_close(fd);
 
     // Ignore write errors (route may already exist)
-    _ = std.posix.write(fd, buf[0..msg_size]) catch {};
+    _ = std.posix.write(fd, buf[0..msg_size]) catch |e| {
+        std.debug.print("  Route write error (ignored): {}\n", .{e});
+    };
 
     // Read response (non-blocking)
     var resp: [256]u8 = undefined;
-    _ = std.posix.read(fd, &resp) catch {};
+    _ = std.posix.read(fd, &resp) catch |e| {
+        std.debug.print("  Route read error (ignored): {}\n", .{e});
+    };
 
     std.debug.print("  Route configured: {s} -> {s}\n", .{ ip2str(dst_ip), ifname });
 }
@@ -406,11 +410,15 @@ fn route_delete(ifname: [*:0]const u8, dst_ip: u32) void {
     defer socket_close(fd);
 
     // Ignore write errors
-    _ = std.posix.write(fd, buf[0..msg_size]) catch {};
+    _ = std.posix.write(fd, buf[0..msg_size]) catch |e| {
+        std.debug.print("  Route write error (ignored): {}\n", .{e});
+    };
 
     // Read response (non-blocking)
     var resp: [256]u8 = undefined;
-    _ = std.posix.read(fd, &resp) catch {};
+    _ = std.posix.read(fd, &resp) catch |e| {
+        std.debug.print("  Route read error (ignored): {}\n", .{e});
+    };
 
     std.debug.print("  Route deleted: {s}\n", .{ip2str(dst_ip)});
 }
