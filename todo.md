@@ -419,21 +419,63 @@ macOS utun prepends a 4-byte AF_INET header to packets. Use temporary buffer to 
 ### Background
 
 - test_icmp.zig: 100% Pure Zig, verified working
+- test_route.zig: 100% Pure Zig, **BSD Routing Socket VERIFIED WORKING** (2026-02-12)
 - mac_tun.md: Documented common failure reasons and solutions
 - zig.codegen.md: Phase 5 complete with all techniques documented
 
 ### Migration Status
 
-| Function | Current | Complexity | Plan |
-|----------|---------|------------|------|
-| `get_local_ips()` | C (getifaddrs) | **Low** | Pure Zig via `std.posix.getifaddrs` |
-| `get_primary_ip()` | C (UDP) | **Low** | Pure Zig UDP socket + getsockname |
-| `select_egress_ip_for_target()` | C (iterate) | **Medium** | Pure Zig |
-| `configure_tun_ip()` | C (ifconfig) | **Low** | `std.process.Child.run()` |
-| `configure_tun_peer()` | C (ifconfig) | **Low** | `std.process.Child.run()` |
-| `route_add()` | C (Netlink/PF_ROUTE) | **High** | Keep C (too complex) |
-| `route_delete()` | C (Netlink/PF_ROUTE) | **High** | Keep C |
-| `route_list()` | C (Netlink/PF_ROUTE) | **High** | Keep C |
+| Function | Current | Complexity | Plan | Status |
+|----------|---------|------------|------|--------|
+| `get_local_ips()` | C (getifaddrs) | **Low** | Pure Zig via `std.posix.getifaddrs` | Pending |
+| `get_primary_ip()` | C (UDP) | **Low** | Pure Zig UDP socket + getsockname | Pending |
+| `select_egress_ip_for_target()` | C (iterate) | **Medium** | Pure Zig | Pending |
+| `configure_tun_ip()` | C (ifconfig) | **Low** | `std.process.Child.run()` | Pending |
+| `configure_tun_peer()` | C (ifconfig) | **Low** | `std.process.Child.run()` | Pending |
+| `route_add()` | C (PF_ROUTE) | **Medium** | **Pure Zig NOW VERIFIED** | Verified |
+| `route_delete()` | C (PF_ROUTE) | **Medium** | **Pure Zig NOW VERIFIED** | Verified |
+| `route_list()` | C (sysctl) | **Medium** | Pure Zig (sysctl) | Pending |
+
+### KEY FINDING: BSD Routing Socket CAN be Pure Zig
+
+BSD Routing Socket operations are **NOT too complex** for pure Zig. The key insights:
+
+1. **Structure Alignment**: Use C compiler to verify struct sizes and offsets
+   ```bash
+   gcc -o check_types check_types.c && ./check_types
+   ```
+
+2. **Critical macOS rt_msghdr Layout**:
+   - `sizeof(rt_msghdr) = 92` (NOT 64 as initially assumed!)
+   - `sizeof(sockaddr_in) = 16`
+   - `RTM_VERSION = 5` (NOT 3!)
+   - `rt_metrics` has different field names than expected
+
+3. **rt_metrics Structure** (56 bytes):
+   ```
+   rmx_locks: u32       // offset 0
+   rmx_mtu: u32         // offset 4
+   rmx_hopcount: u32    // offset 8
+   rmx_expire: i32      // offset 12
+   rmx_recvpipe: u32    // offset 16
+   rmx_sendpipe: u32    // offset 20
+   rmx_ssthresh: u32    // offset 24
+   rmx_rtt: u32         // offset 28
+   rmx_rttvar: u32      // offset 32
+   rmx_pksent: u32      // offset 36
+   rmx_filler: [4]u32  // offset 40 (16 bytes)
+   ```
+
+4. **Test Results**:
+   ```bash
+   zig build-exe test_route.zig -lc -I.
+   sudo ./test_route add en0 192.168.1.100
+   # Output: Response: type=1, errno=0 (SUCCESS)
+   netstat -nr | grep 192.168.1.100
+   # Shows route was added
+   sudo ./test_route delete en0 192.168.1.100
+   # Output: Route deleted
+   ```
 
 ### Tasks
 
@@ -459,24 +501,28 @@ macOS utun prepends a 4-byte AF_INET header to packets. Use temporary buffer to 
   - Use `std.process.Child.run()` instead of `system()`
   - Call: `ifconfig <ifname> <ip> <peer>`
 
-#### Phase 7.2: Fix device_darwin.zig Routing
+#### Phase 7.2: Migrate device_darwin.zig Routing to Pure Zig
 
-- [ ] **Task 7.2.1**: Implement BSD routing socket `addRouteFn()`
-  - File: `src/tun/device_darwin.zig`
-  - Create PF_ROUTE socket
-  - Build RTM_ADD message
-  - Send and wait for acknowledgment
+- [x] **Task 7.2.1**: Verify BSD routing socket works in pure Zig (DONE)
+  - File: `test_route.zig` (verified working)
+  - Create PF_ROUTE socket: `std.posix.socket(c.AF_ROUTE, c.SOCK_RAW, 0)`
+  - Build RTM_ADD/RTM_DELETE messages
+  - Send and read acknowledgment
 
-- [ ] **Task 7.2.2**: Implement BSD routing socket `deleteRouteFn()`
-  - Create PF_ROUTE socket
+- [ ] **Task 7.2.2**: Migrate `addRouteFn()` in device_darwin.zig
+  - Copy pattern from test_route.zig
+  - Use `route_cdefs.h` for constants
+  - Use extern struct for rt_msghdr/sockaddr_in
+
+- [ ] **Task 7.2.3**: Migrate `deleteRouteFn()` in device_darwin.zig
+  - Same pattern as addRouteFn()
   - Build RTM_DELETE message
-  - Send and wait for acknowledgment
 
-- [ ] **Task 7.2.3**: Test route add/delete
+- [ ] **Task 7.2.4**: Test route add/delete with device_darwin.zig
   ```bash
   # Verify commands work
-  route add -inet 10.0.0.2/32 -iface utun4
-  route delete -inet 10.0.0.2/32 -iface utun4
+  sudo ./tun2sock add-route 10.0.0.2/32
+  sudo ./tun2sock delete-route 10.0.0.2/32
   ```
 
 #### Phase 7.3: Complete router/mod.zig

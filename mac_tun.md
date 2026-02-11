@@ -406,8 +406,179 @@ Before claiming functionality works:
 
 ---
 
-## References
+---
+
+## BSD Routing Socket (Verified 2026-02-12)
+
+### Overview
+
+BSD Routing Socket (PF_ROUTE/AF_ROUTE) allows direct manipulation of the routing table from user space. This is used to add/delete routes for TUN interfaces.
+
+### Key Findings
+
+**CRITICAL: Structure sizes and constants are DIFFERENT from what documentation suggests:**
+
+| Item | Documented | Actual (Verified) |
+|------|------------|-------------------|
+| `sizeof(rt_msghdr)` | 64 | **92** |
+| `RTM_VERSION` | 3 | **5** |
+| `rt_metrics` fields | rmx_refcnt, rmx_hops | **rmx_locks, rmx_mtu, rmx_hopcount** |
+
+**Always verify with C compiler:**
+```c
+#include <stdio.h>
+#include <sys/socket.h>
+#include <net/route.h>
+
+int main() {
+    printf("sizeof(rt_msghdr) = %zu\n", sizeof(struct rt_msghdr));
+    printf("sizeof(sockaddr_in) = %zu\n", sizeof(struct sockaddr_in));
+    printf("RTM_VERSION = %d\n", RTM_VERSION);
+    return 0;
+}
+```
+
+Output on macOS:
+```
+sizeof(rt_msghdr) = 92
+sizeof(sockaddr_in) = 16
+RTM_VERSION = 5
+```
+
+### Verified Structure Layout
+
+```zig
+// rt_metrics - embedded in rt_msghdr (56 bytes)
+const rt_metrics = extern struct {
+    rmx_locks: u32,       // offset 0
+    rmx_mtu: u32,         // offset 4
+    rmx_hopcount: u32,   // offset 8
+    rmx_expire: i32,      // offset 12
+    rmx_recvpipe: u32,    // offset 16
+    rmx_sendpipe: u32,   // offset 20
+    rmx_ssthresh: u32,   // offset 24
+    rmx_rtt: u32,        // offset 28
+    rmx_rttvar: u32,     // offset 32
+    rmx_pksent: u32,     // offset 36
+    rmx_filler: [4]u32,  // offset 40 (16 bytes)
+};
+
+// rt_msghdr - routing message header (92 bytes)
+const rt_msghdr = extern struct {
+    rtm_msglen: u16,      // offset 0
+    rtm_version: u8,      // offset 2
+    rtm_type: u8,         // offset 3
+    rtm_index: u16,       // offset 4
+    rtm_flags: i32,        // offset 8
+    rtm_addrs: i32,       // offset 12
+    rtm_pid: i32,         // offset 16
+    rtm_seq: i32,         // offset 20
+    rtm_errno: i32,       // offset 24
+    rtm_use: i32,         // offset 28
+    rtm_inits: u32,       // offset 32
+    rmx: rt_metrics,      // offset 36 (56 bytes)
+};
+```
+
+### Verified Constants
+
+```zig
+const AF_ROUTE = @as(c_int, 17);
+const SOCK_RAW = @as(c_int, 3);
+
+const RTM_VERSION = @as(u8, 5);  // NOT 3!
+const RTM_ADD = @as(u8, 0x1);
+const RTM_DELETE = @as(u8, 0x2);
+
+const RTF_UP = @as(i32, 0x1);
+const RTF_STATIC = @as(i32, 0x800);
+
+const RTA_DST = @as(i32, 0x1);
+const RTA_GATEWAY = @as(i32, 0x2);
+```
+
+### Route Add Implementation
+
+```zig
+fn routeAdd(ifname: [*:0]const u8, dst_ip_str: [*:0]const u8) !void {
+    // Get interface index
+    const iface_idx = c.if_nametoindex(ifname);
+
+    // Build message: rt_msghdr + 2 * sockaddr_in (dst, gateway)
+    const msg_size = @sizeOf(rt_msghdr) + 2 * @sizeOf(sockaddr_in);
+    var buf: [256]u8 align(8) = undefined;
+    @memset(&buf, 0);
+
+    const rtm = @as(*rt_msghdr, @alignCast(@ptrCast(&buf)));
+    rtm.rtm_msglen = @as(u16, @intCast(msg_size));
+    rtm.rtm_version = RTM_VERSION;
+    rtm.rtm_type = RTM_ADD;
+    rtm.rtm_index = @as(u16, @intCast(iface_idx));
+    rtm.rtm_flags = RTF_UP | RTF_STATIC;
+    rtm.rtm_addrs = RTA_DST | RTA_GATEWAY;
+    rtm.rtm_pid = c.getpid();
+    rtm.rtm_seq = 1;
+
+    // Destination address
+    var offset: usize = @sizeOf(rt_msghdr);
+    const dst = @as(*sockaddr_in, @alignCast(@ptrCast(buf[offset..].ptr)));
+    dst.sin_len = @sizeOf(sockaddr_in);
+    dst.sin_family = c.AF_INET;
+    _ = c.inet_pton(c.AF_INET, dst_ip_str, &dst.sin_addr);
+
+    // Gateway address (same as dst for direct route)
+    offset += @sizeOf(sockaddr_in);
+    const gw = @as(*sockaddr_in, @alignCast(@ptrCast(buf[offset..].ptr)));
+    gw.sin_len = @sizeOf(sockaddr_in);
+    gw.sin_family = c.AF_INET;
+    gw.sin_addr = dst.sin_addr;
+
+    // Send message
+    const fd = try std.posix.socket(AF_ROUTE, SOCK_RAW, 0);
+    defer std.posix.close(fd);
+
+    const n = try std.posix.write(fd, buf[0..msg_size]);
+
+    // Read response
+    var resp: [256]u8 = undefined;
+    _ = std.posix.read(fd, &resp);
+
+    const resp_rtm = @as(*rt_msghdr, @alignCast(@ptrCast(&resp)));
+    // errno=0 means success
+}
+```
+
+### Testing
+
+```bash
+# Build
+zig build-exe test_route.zig -lc -I.
+
+# Add route
+sudo ./test_route add en0 192.168.1.100
+# Expected: Response: type=1, errno=0
+
+# Verify
+netstat -nr | grep "192.168.1.100"
+# Output: 192.168.1.100 192.168.1.100 USc en0
+
+# Delete route
+sudo ./test_route delete en0 192.168.1.100
+```
+
+### Common Pitfalls
+
+1. **Wrong struct size**: Leads to `EINVAL` on write. Always verify with C compiler.
+
+2. **Wrong RTM_VERSION**: macOS uses version 5, not 3.
+
+3. **Missing rtm_addrs**: The kernel uses this to know what sockaddr types follow.
+
+4. **Byte order**: sockaddr_in.sin_addr must be in network byte order. Use `inet_pton()`.
+
+### References
 
 - `/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/kern_control.h`
 - `/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/sockio.h`
 - `/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/net/if.h`
+- `/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/net/route.h`
