@@ -104,11 +104,50 @@ int create_utun_socket(char *ifname, size_t max_len) {
     return sock;
 }
 
-// Configure interface IP
-int configure_ip(const char *ifname, const char *ip) {
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) return -1;
+// ============================================================================
+// POSIX Wrapper Functions (for Zig interoperability)
+// ============================================================================
 
+// Create a datagram socket for ioctl operations
+int socket_create(void) {
+    return socket(AF_INET, SOCK_DGRAM, 0);
+}
+
+// Close socket
+int socket_close(int sock) {
+    return close(sock);
+}
+
+// Get interface flags via ioctl
+int ioctl_get_flags(int sock, const char *ifname, int *flags) {
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ-1);
+
+    if (ioctl(sock, SIOCGIFFLAGS, &ifr) < 0) {
+        return -1;
+    }
+
+    *flags = ifr.ifr_flags;
+    return 0;
+}
+
+// Set interface flags via ioctl
+int ioctl_set_flags(int sock, const char *ifname, int flags) {
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ-1);
+    ifr.ifr_flags = flags;
+
+    if (ioctl(sock, SIOCSIFFLAGS, &ifr) < 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+// Set interface IP address via ioctl
+int ioctl_set_ip(int sock, const char *ifname, const char *ip) {
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
     strncpy(ifr.ifr_name, ifname, IFNAMSIZ-1);
@@ -118,23 +157,16 @@ int configure_ip(const char *ifname, const char *ip) {
     addr->sin_len = sizeof(struct sockaddr_in);
     inet_pton(AF_INET, ip, &addr->sin_addr);
 
-    int ret = ioctl(sock, SIOCSIFADDR, &ifr);
-    close(sock);
-
-    if (ret < 0) {
+    if (ioctl(sock, SIOCSIFADDR, &ifr) < 0) {
         fprintf(stderr, "SIOCSIFADDR failed: %s\n", strerror(errno));
         return -1;
     }
 
-    printf("Set IP: %s\n", ip);
     return 0;
 }
 
-// Configure peer (destination) address
-int configure_peer(const char *ifname, const char *peer) {
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) return -1;
-
+// Set interface peer address via ioctl
+int ioctl_set_peer(int sock, const char *ifname, const char *peer) {
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
     strncpy(ifr.ifr_name, ifname, IFNAMSIZ-1);
@@ -144,40 +176,65 @@ int configure_peer(const char *ifname, const char *peer) {
     addr->sin_len = sizeof(struct sockaddr_in);
     inet_pton(AF_INET, peer, &addr->sin_addr);
 
-    int ret = ioctl(sock, SIOCSIFDSTADDR, &ifr);
-    close(sock);
-
-    if (ret < 0) {
+    if (ioctl(sock, SIOCSIFDSTADDR, &ifr) < 0) {
         fprintf(stderr, "SIOCSIFDSTADDR failed: %s\n", strerror(errno));
         return -1;
     }
 
-    printf("Set peer: %s\n", peer);
     return 0;
 }
 
-// Bring interface up
-int interface_up(const char *ifname) {
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+// ============================================================================
+// High-level Configuration Functions
+// ============================================================================
+
+// Configure interface IP (uses ioctl wrappers)
+int configure_ip(const char *ifname, const char *ip) {
+    int sock = socket_create();
     if (sock < 0) return -1;
 
-    struct ifreq ifr;
-    memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, ifname, IFNAMSIZ-1);
+    int ret = ioctl_set_ip(sock, ifname, ip);
+    socket_close(sock);
 
-    if (ioctl(sock, SIOCGIFFLAGS, &ifr) < 0) {
-        close(sock);
+    if (ret == 0) {
+        printf("Set IP: %s\n", ip);
+    }
+    return ret;
+}
+
+// Configure peer (destination) address (uses ioctl wrappers)
+int configure_peer(const char *ifname, const char *peer) {
+    int sock = socket_create();
+    if (sock < 0) return -1;
+
+    int ret = ioctl_set_peer(sock, ifname, peer);
+    socket_close(sock);
+
+    if (ret == 0) {
+        printf("Set peer: %s\n", peer);
+    }
+    return ret;
+}
+
+// Bring interface up (uses ioctl wrappers)
+int interface_up(const char *ifname) {
+    int sock = socket_create();
+    if (sock < 0) return -1;
+
+    int flags;
+    if (ioctl_get_flags(sock, ifname, &flags) < 0) {
+        socket_close(sock);
         return -1;
     }
 
-    ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
+    flags |= IFF_UP | IFF_RUNNING;
 
-    if (ioctl(sock, SIOCSIFFLAGS, &ifr) < 0) {
-        close(sock);
+    if (ioctl_set_flags(sock, ifname, flags) < 0) {
+        socket_close(sock);
         return -1;
     }
 
-    close(sock);
+    socket_close(sock);
     printf("Interface up\n");
     return 0;
 }

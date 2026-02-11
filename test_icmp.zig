@@ -12,17 +12,24 @@ const std = @import("std");
 // ============================================================================
 
 // ============================================================================
-// C Function Declarations (to be migrated)
+// C Function Declarations (POSIX wrappers for ioctl operations)
 // ============================================================================
 
+extern "c" fn socket_create() c_int;
+extern "c" fn socket_close(sock: c_int) c_int;
+extern "c" fn ioctl_get_flags(sock: c_int, ifname: [*:0]const u8, flags: *c_int) c_int;
+extern "c" fn ioctl_set_flags(sock: c_int, ifname: [*:0]const u8, flags: c_int) c_int;
+extern "c" fn ioctl_set_ip(sock: c_int, ifname: [*:0]const u8, ip: [*:0]const u8) c_int;
+extern "c" fn ioctl_set_peer(sock: c_int, ifname: [*:0]const u8, peer: [*:0]const u8) c_int;
+
+// High-level functions (still use C implementation)
 extern "c" fn create_utun_socket(ifname: [*]u8, max_len: usize) c_int;
 extern "c" fn configure_ip(ifname: [*:0]const u8, ip: [*:0]const u8) c_int;
 extern "c" fn configure_peer(ifname: [*:0]const u8, peer: [*:0]const u8) c_int;
-extern "c" fn interface_up(ifname: [*:0]const u8) c_int;  // Keep C version
-extern "c" fn calc_sum(addr: [*]u16, len: c_int) u16;  // Keep C version (used by process_packet_c)
-extern "c" fn ip2str(ip: u32) [*:0]const u8;  // Keep C version (used by process_packet_c)
+extern "c" fn interface_up(ifname: [*:0]const u8) c_int;
+extern "c" fn calc_sum(addr: [*]u16, len: c_int) u16;
+extern "c" fn ip2str(ip: u32) [*:0]const u8;
 extern "c" fn get_buffer() [*]u8;
-// extern "c" fn set_nonblocking(fd: c_int) c_int;  // Migrated to set_nonblocking_zig
 extern "c" fn tun_read(fd: c_int, error_code: *c_int) c_int;
 extern "c" fn tun_write(fd: c_int, len: c_int, error_code: *c_int) c_int;
 extern "c" fn tun_close(fd: c_int) c_int;
@@ -74,6 +81,91 @@ fn set_nonblocking_zig(fd: c_int) c_int {
     const flags = std.posix.fcntl(fd, std.posix.F.GETFL, 0) catch return -1;
     // O_NONBLOCK on macOS is 0x0004
     _ = std.posix.fcntl(fd, std.posix.F.SETFL, flags | 0x0004) catch return -1;
+    return 0;
+}
+
+// ============================================================================
+// POSIX Wrapper Functions (migrated from C)
+// ============================================================================
+
+// Create datagram socket for ioctl operations (wraps C socket_create)
+fn socket_create_zig() c_int {
+    return socket_create();
+}
+
+// Close socket (wraps C socket_close)
+fn socket_close_zig(sock: c_int) c_int {
+    return socket_close(sock);
+}
+
+// Get interface flags via ioctl (wraps C ioctl_get_flags)
+fn ioctl_get_flags_zig(sock: c_int, ifname: [*:0]const u8, flags: *c_int) c_int {
+    return ioctl_get_flags(sock, ifname, flags);
+}
+
+// Set interface flags via ioctl (wraps C ioctl_set_flags)
+fn ioctl_set_flags_zig(sock: c_int, ifname: [*:0]const u8, flags: c_int) c_int {
+    return ioctl_set_flags(sock, ifname, flags);
+}
+
+// Set interface IP via ioctl (wraps C ioctl_set_ip)
+fn ioctl_set_ip_zig(sock: c_int, ifname: [*:0]const u8, ip: [*:0]const u8) c_int {
+    return ioctl_set_ip(sock, ifname, ip);
+}
+
+// Set interface peer via ioctl (wraps C ioctl_set_peer)
+fn ioctl_set_peer_zig(sock: c_int, ifname: [*:0]const u8, peer: [*:0]const u8) c_int {
+    return ioctl_set_peer(sock, ifname, peer);
+}
+
+// High-level: Configure interface IP (uses Zig ioctl wrappers)
+fn configure_ip_zig(ifname: [*:0]const u8, ip: [*:0]const u8) c_int {
+    const sock = socket_create_zig();
+    if (sock < 0) return -1;
+
+    const ret = ioctl_set_ip_zig(sock, ifname, ip);
+    _ = socket_close_zig(sock);
+
+    if (ret == 0) {
+        std.debug.print("Set IP: {s}\n", .{ip});
+    }
+    return ret;
+}
+
+// High-level: Configure peer address (uses Zig ioctl wrappers)
+fn configure_peer_zig(ifname: [*:0]const u8, peer: [*:0]const u8) c_int {
+    const sock = socket_create_zig();
+    if (sock < 0) return -1;
+
+    const ret = ioctl_set_peer_zig(sock, ifname, peer);
+    _ = socket_close_zig(sock);
+
+    if (ret == 0) {
+        std.debug.print("Set peer: {s}\n", .{peer});
+    }
+    return ret;
+}
+
+// High-level: Bring interface up (uses Zig ioctl wrappers)
+fn interface_up_zig(ifname: [*:0]const u8) c_int {
+    const sock = socket_create_zig();
+    if (sock < 0) return -1;
+
+    var flags: c_int = 0;
+    if (ioctl_get_flags_zig(sock, ifname, &flags) < 0) {
+        _ = socket_close_zig(sock);
+        return -1;
+    }
+
+    flags |= 0x0100 | 0x0040;  // IFF_UP | IFF_RUNNING on macOS (same as BSD)
+
+    if (ioctl_set_flags_zig(sock, ifname, flags) < 0) {
+        _ = socket_close_zig(sock);
+        return -1;
+    }
+
+    _ = socket_close_zig(sock);
+    std.debug.print("Interface up\n", .{});
     return 0;
 }
 
@@ -198,10 +290,10 @@ pub fn main() !void {
     const tun_name_z: [*:0]const u8 = @ptrCast(&tun_name);
     std.debug.print("Interface: {s}\n", .{tun_name_z});
 
-    // Configure IP and peer
-    _ = configure_ip(tun_name_z, "10.0.0.1");
-    _ = configure_peer(tun_name_z, "10.0.0.2");
-    _ = interface_up(tun_name_z);
+    // Configure IP and peer (using Zig wrappers for POSIX ioctl)
+    _ = configure_ip_zig(tun_name_z, "10.0.0.1");
+    _ = configure_peer_zig(tun_name_z, "10.0.0.2");
+    _ = interface_up_zig(tun_name_z);
 
     // Add route
     _ = add_route_zig(tun_name_z);
