@@ -3,43 +3,61 @@
 // Run: sudo ./test_icmp
 //
 // This version uses pure Zig for all logic, with only minimal C helpers
-// for POSIX ioctl operations that Zig 0.13.0 doesn't support.
+// for getsockopt and utun control info that Zig 0.13.0 doesn't support.
 
 const std = @import("std");
+const c = @import("std").c;
 const BUF_SIZE = 4096;
 
 // ============================================================================
-// C Function Declarations (ioctl - cannot be replaced in Zig 0.13.0)
+// C Function Declarations (still required in Zig 0.13.0)
 // ============================================================================
 
-extern "c" fn ioctl_get_flags(sock: c_int, ifname: [*:0]const u8, flags: *c_int) c_int;
-extern "c" fn ioctl_set_flags(sock: c_int, ifname: [*:0]const u8, flags: c_int) c_int;
-extern "c" fn ioctl_set_ip(sock: c_int, ifname: [*:0]const u8, ip: [*:0]const u8) c_int;
-extern "c" fn ioctl_set_peer(sock: c_int, ifname: [*:0]const u8, peer: [*:0]const u8) c_int;
-
-// ioctl for utun control info
+// ioctl for utun control info (CTLIOCGINFO)
 extern "c" fn ioctl_get_ctl_info(sock: c_int, ctl_name: [*:0]const u8, name_len: usize, ctl_id: *u32) c_int;
 
 // getsockopt for utun interface name
 extern "c" fn getsockopt_ifname(sock: c_int, ifname: [*]u8, max_len: usize) c_int;
 
+// System command for routing
+extern "c" fn system(command: [*:0]const u8) c_int;
+
+// C read/write for file descriptors
+extern "c" fn read(fd: c_int, buf: *anyopaque, nbytes: usize) c_int;
+extern "c" fn write(fd: c_int, buf: *const anyopaque, nbytes: usize) c_int;
+extern "c" var errno: c_int;
+
+// ============================================================================
+// macOS ioctl Constants (Pure Zig)
+// ============================================================================
+
+// From /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/sockio.h
+const SIOCGIFFLAGS: u32 = 0xC0206914;   // _IOWR('i', 17, struct ifreq) - get flags
+const SIOCSIFFLAGS: u32 = 0x80206910;    // _IOW('i', 16, struct ifreq) - set flags
+const SIOCSIFADDR: u32 = 0x8020690C;     // _IOW('i', 12, struct ifreq) - set address
+const SIOCSIFDSTADDR: u32 = 0x80206914;  // _IOW('i', 14, struct ifreq) - set peer
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const IFNAMSIZ = 16;
+const IFR_SIZE = 32;
+
 // ============================================================================
 // Socket Functions (Pure Zig using std.posix)
 // ============================================================================
 
-// Create datagram socket for ioctl operations
 fn socket_create() c_int {
     const fd = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0) catch return -1;
     return fd;
 }
 
-// Create PF_SYSTEM socket for utun
 fn socket_create_sys() c_int {
     const fd = std.posix.socket(std.posix.AF.SYSTEM, std.posix.SOCK.DGRAM, 2) catch return -1;
     return fd;
 }
 
-// Close socket
 fn socket_close_zig(sock: c_int) void {
     std.posix.close(sock);
 }
@@ -48,41 +66,22 @@ fn socket_close_zig(sock: c_int) void {
 // Connect Function (Pure Zig using std.posix.connect)
 // ============================================================================
 
-// Connect to utun with control id
 fn connect_utun(sock: c_int, ctl_id: u32) c_int {
-    // Build sockaddr_ctl structure
     var addr: [32]u8 = undefined;
     @memset(&addr, 0);
 
-    // sc_len = 32 for sockaddr_ctl
-    addr[0] = 32;
-
-    // sc_family = AF_SYSTEM (2)
-    addr[1] = 2;
-
-    // ss_sysaddr = AF_SYS_CONTROL (2)
-    addr[2] = 2;
-
-    // sc_id = ctl_id (little-endian for x86_64, but network order for portability)
+    addr[0] = 32;   // sc_len
+    addr[1] = 2;    // sc_family = AF_SYSTEM
+    addr[2] = 2;    // ss_sysaddr = AF_SYS_CONTROL
     @memcpy(addr[4..8], std.mem.asBytes(&ctl_id));
-
-    // sc_unit = 0 (auto-assign)
-    addr[8] = 0;
+    addr[8] = 0;    // sc_unit = 0 (auto-assign)
 
     std.posix.connect(sock, @as(*const std.posix.sockaddr, @ptrCast(&addr)), 32) catch return -1;
     return 0;
 }
 
-// System command for routing (must use C - Zig 0.13.0 has no process.run())
-extern "c" fn system(command: [*:0]const u8) c_int;
-
-// C read/write for file descriptors created by C
-extern "c" fn read(fd: c_int, buf: *anyopaque, nbytes: usize) c_int;
-extern "c" fn write(fd: c_int, buf: *const anyopaque, nbytes: usize) c_int;
-extern "c" var errno: c_int;
-
 // ============================================================================
-// Global Buffer (replaces C's g_buf)
+// Global Buffer
 // ============================================================================
 
 var packet_buf: [BUF_SIZE]u8 = undefined;
@@ -96,7 +95,6 @@ var ip2str_buf2: [16]u8 = undefined;
 var ip2str_use_first = true;
 
 pub fn ip2str(ip: u32) [*:0]const u8 {
-    // Network byte order: big-endian, so first byte is highest
     const b0 = (ip >> 24) & 0xFF;
     const b1 = (ip >> 16) & 0xFF;
     const b2 = (ip >> 8) & 0xFF;
@@ -111,11 +109,8 @@ pub fn ip2str(ip: u32) [*:0]const u8 {
 }
 
 // ============================================================================
-// Route Operations (Pure Zig using std.process.run)
+// Route Operations (must use C system())
 // ============================================================================
-
-// Note: Zig 0.13.0 has no std.process.run(), only execv/execve which replace
-// the current process. We must use C system() for route commands.
 
 fn delete_route() c_int {
     return system("route -q -n delete -inet 10.0.0.2 2>/dev/null");
@@ -132,12 +127,11 @@ fn add_route(tun_name: [*:0]const u8) c_int {
 }
 
 // ============================================================================
-// Socket I/O (Pure Zig using std.posix)
+// Socket I/O (Pure Zig using C read/write)
 // ============================================================================
 
 fn set_nonblocking(fd: c_int) c_int {
     const flags = std.posix.fcntl(fd, std.posix.F.GETFL, 0) catch return -1;
-    // O_NONBLOCK on macOS is 0x0004
     _ = std.posix.fcntl(fd, std.posix.F.SETFL, flags | 0x0004) catch return -1;
     return 0;
 }
@@ -167,23 +161,107 @@ fn tun_close(fd: c_int) void {
 }
 
 // ============================================================================
-// POSIX Wrapper Functions (wraps C ioctl)
+// ioctl Functions (Pure Zig using std.c.ioctl)
 // ============================================================================
 
-fn ioctl_get_flags_zig(sock: c_int, ifname: [*:0]const u8, flags: *c_int) c_int {
-    return ioctl_get_flags(sock, ifname, flags);
+fn ioctl_get_flags(sock: c_int, ifname: [*:0]const u8, flags: *c_int) c_int {
+    var ifr: [IFR_SIZE]u8 = undefined;
+    @memset(&ifr, 0);
+
+    @memcpy(ifr[0..IFNAMSIZ], ifname[0..IFNAMSIZ]);
+
+    const req = @as(c_int, @bitCast(SIOCGIFFLAGS));
+    const ret = c.ioctl(sock, req, &ifr);
+    if (ret < 0) return -1;
+
+    flags.* = std.mem.readInt(c_int, ifr[24..28], .little);
+    return 0;
 }
 
-fn ioctl_set_flags_zig(sock: c_int, ifname: [*:0]const u8, flags: c_int) c_int {
-    return ioctl_set_flags(sock, ifname, flags);
+fn ioctl_set_flags(sock: c_int, ifname: [*:0]const u8, flags: c_int) c_int {
+    var ifr: [IFR_SIZE]u8 = undefined;
+    @memset(&ifr, 0);
+
+    @memcpy(ifr[0..IFNAMSIZ], ifname[0..IFNAMSIZ]);
+    std.mem.writeInt(c_int, ifr[24..28], flags, .little);
+
+    const req = @as(c_int, @bitCast(SIOCSIFFLAGS));
+    const ret = c.ioctl(sock, req, &ifr);
+    return if (ret < 0) -1 else 0;
 }
 
-fn ioctl_set_ip_zig(sock: c_int, ifname: [*:0]const u8, ip: [*:0]const u8) c_int {
-    return ioctl_set_ip(sock, ifname, ip);
+fn ioctl_set_ip(sock: c_int, ifname: [*:0]const u8, ip: [*:0]const u8) c_int {
+    var ifr: [IFR_SIZE]u8 = undefined;
+    @memset(&ifr, 0);
+
+    @memcpy(ifr[0..IFNAMSIZ], ifname[0..IFNAMSIZ]);
+
+    // Parse IP string
+    var parts: [4]u8 = undefined;
+    var val: u32 = 0;
+    var count: usize = 0;
+
+    var i: usize = 0;
+    while (ip[i] != 0) {
+        const ch = ip[i];
+        if (ch == '.') {
+            parts[count] = @as(u8, @intCast(val));
+            val = 0;
+            count += 1;
+        } else {
+            val = val * 10 + (ch - '0');
+        }
+        i += 1;
+    }
+    if (count == 3) {
+        parts[3] = @as(u8, @intCast(val));
+        const ip_addr = @as(u32, @intCast(parts[0])) << 24 |
+                       @as(u32, @intCast(parts[1])) << 16 |
+                       @as(u32, @intCast(parts[2])) << 8 |
+                       @as(u32, @intCast(parts[3]));
+        std.mem.writeInt(u32, ifr[24..28], ip_addr, .big);
+    }
+
+    const req = @as(c_int, @bitCast(SIOCSIFADDR));
+    const ret = c.ioctl(sock, req, &ifr);
+    return if (ret < 0) -1 else 0;
 }
 
-fn ioctl_set_peer_zig(sock: c_int, ifname: [*:0]const u8, peer: [*:0]const u8) c_int {
-    return ioctl_set_peer(sock, ifname, peer);
+fn ioctl_set_peer(sock: c_int, ifname: [*:0]const u8, peer: [*:0]const u8) c_int {
+    var ifr: [IFR_SIZE]u8 = undefined;
+    @memset(&ifr, 0);
+
+    @memcpy(ifr[0..IFNAMSIZ], ifname[0..IFNAMSIZ]);
+
+    // Parse IP string
+    var parts: [4]u8 = undefined;
+    var val: u32 = 0;
+    var count: usize = 0;
+    var i: usize = 0;
+
+    while (peer[i] != 0) {
+        const ch = peer[i];
+        if (ch == '.') {
+            parts[count] = @as(u8, @intCast(val));
+            val = 0;
+            count += 1;
+        } else {
+            val = val * 10 + (ch - '0');
+        }
+        i += 1;
+    }
+    if (count == 3) {
+        parts[3] = @as(u8, @intCast(val));
+        const ip_addr = @as(u32, @intCast(parts[0])) << 24 |
+                       @as(u32, @intCast(parts[1])) << 16 |
+                       @as(u32, @intCast(parts[2])) << 8 |
+                       @as(u32, @intCast(parts[3]));
+        std.mem.writeInt(u32, ifr[24..28], ip_addr, .big);
+    }
+
+    const req = @as(c_int, @bitCast(SIOCSIFDSTADDR));
+    const ret = c.ioctl(sock, req, &ifr);
+    return if (ret < 0) -1 else 0;
 }
 
 // ioctl for utun control info (C wrapper)
@@ -199,7 +277,7 @@ fn configure_ip(ifname: [*:0]const u8, ip: [*:0]const u8) c_int {
     const sock = socket_create();
     if (sock < 0) return -1;
 
-    const ret = ioctl_set_ip_zig(sock, ifname, ip);
+    const ret = ioctl_set_ip(sock, ifname, ip);
     socket_close_zig(sock);
 
     if (ret == 0) {
@@ -212,11 +290,22 @@ fn configure_peer(ifname: [*:0]const u8, peer: [*:0]const u8) c_int {
     const sock = socket_create();
     if (sock < 0) return -1;
 
-    const ret = ioctl_set_peer_zig(sock, ifname, peer);
+    const ret = ioctl_set_peer(sock, ifname, peer);
     socket_close_zig(sock);
 
     if (ret == 0) {
         std.debug.print("Set peer: {s}\n", .{peer});
+    }
+    return ret;
+}
+
+// Configure interface using ifconfig (more reliable on macOS)
+fn configure_interface(ifname: [*:0]const u8, ip: [*:0]const u8, peer: [*:0]const u8) c_int {
+    var buf: [256]u8 = undefined;
+    const cmd = std.fmt.bufPrintZ(&buf, "ifconfig {s} {s} {s} 2>&1", .{ ifname, ip, peer }) catch unreachable;
+    const ret = system(cmd);
+    if (ret == 0) {
+        std.debug.print("Configured: {s} = {s} -> {s}\n", .{ ifname, ip, peer });
     }
     return ret;
 }
@@ -226,14 +315,14 @@ fn interface_up(ifname: [*:0]const u8) c_int {
     if (sock < 0) return -1;
 
     var flags: c_int = 0;
-    if (ioctl_get_flags_zig(sock, ifname, &flags) < 0) {
+    if (ioctl_get_flags(sock, ifname, &flags) < 0) {
         socket_close_zig(sock);
         return -1;
     }
 
     flags |= 0x0100 | 0x0040;  // IFF_UP | IFF_RUNNING on macOS
 
-    if (ioctl_set_flags_zig(sock, ifname, flags) < 0) {
+    if (ioctl_set_flags(sock, ifname, flags) < 0) {
         socket_close_zig(sock);
         return -1;
     }
@@ -297,7 +386,6 @@ pub fn calc_sum(addr: [*]u16, len: c_int) u16 {
 pub fn process_packet(n: isize) !isize {
     const buf = &packet_buf;
 
-    // Skip macOS utun 4-byte header if present
     var offset: usize = 0;
     if (n >= 4 and buf[0] == 0 and buf[1] == 0) {
         offset = 4;
@@ -309,7 +397,6 @@ pub fn process_packet(n: isize) !isize {
         return 0;
     }
 
-    // Parse IP header directly
     const vhl = buf[offset];
     const ip_hlen = (@as(usize, vhl) & 0x0F) * 4;
     const ip_len = std.mem.readInt(u16, buf[offset + 2..][0..2], .big);
@@ -320,16 +407,15 @@ pub fn process_packet(n: isize) !isize {
     std.debug.print("IP: {s} -> {s}\n", .{ ip2str(src_ip), ip2str(dst_ip) });
     std.debug.print("Proto: {d} (ICMP=1)\n", .{proto});
 
-    if (proto != 1) {  // IPPROTO_ICMP
+    if (proto != 1) {
         std.debug.print("Not ICMP, skipping\n\n", .{});
         return 0;
     }
 
-    // Parse ICMP header
     const icmp_type = buf[offset + ip_hlen];
     std.debug.print("ICMP Type: {d} (8=echo, 0=reply)\n", .{icmp_type});
 
-    if (icmp_type != 8) {  // ICMP_ECHO
+    if (icmp_type != 8) {
         std.debug.print("Not echo request, skipping\n\n", .{});
         return 0;
     }
@@ -338,12 +424,10 @@ pub fn process_packet(n: isize) !isize {
     const icmp_seq = std.mem.readInt(u16, buf[offset + ip_hlen + 6..][0..2], .big);
     std.debug.print("Echo Request! ID=0x{X:0>4} Seq={d}\n", .{ icmp_id, icmp_seq });
 
-    // Build reply: swap IPs, change type to 0
     std.mem.writeInt(u32, buf[offset + 12..][0..4], dst_ip, .big);
     std.mem.writeInt(u32, buf[offset + 16..][0..4], src_ip, .big);
     buf[offset + ip_hlen] = 0;  // ICMP_ECHOREPLY
 
-    // Recalculate checksums
     // IP checksum
     buf[offset + 10] = 0;
     buf[offset + 11] = 0;
@@ -395,10 +479,8 @@ pub fn main() !void {
 
     std.debug.print("=== TUN ICMP Echo Reply Test (Pure Zig) ===\n\n", .{});
 
-    // Clean up routes
     _ = delete_route();
 
-    // Create utun socket
     const tun_name_ptr: [*]u8 = &tun_name;
     tun_fd = create_utun_socket(tun_name_ptr, tun_name.len);
     if (tun_fd < 0) {
@@ -408,28 +490,21 @@ pub fn main() !void {
 
     const tun_name_z: [*:0]const u8 = @ptrCast(&tun_name);
 
-    // Configure IP and peer
-    _ = configure_ip(tun_name_z, "10.0.0.1");
-    _ = configure_peer(tun_name_z, "10.0.0.2");
-    _ = interface_up(tun_name_z);
+    _ = configure_interface(tun_name_z, "10.0.0.1", "10.0.0.2");
 
-    // Add route
     _ = add_route(tun_name_z);
 
-    // Verify route
     _ = verify_route();
 
-    // Set non-blocking
     _ = set_nonblocking(tun_fd);
 
     std.debug.print("\nListening for ICMP...\n", .{});
     std.debug.print("(Press Ctrl+C to stop)\n\n", .{});
 
-    // Main loop
     while (true) {
         n = tun_read(tun_fd, &err);
         if (n < 0) {
-            if (err == 35) {  // EAGAIN
+            if (err == 35) {
                 std.time.sleep(10 * std.time.ns_per_ms);
                 continue;
             }
@@ -439,7 +514,6 @@ pub fn main() !void {
 
         std.debug.print("=== Received {d} bytes ===\n", .{n});
 
-        // Process packet in Zig layer
         const result = process_packet(n) catch {
             std.debug.print("Process error\n", .{});
             break;
