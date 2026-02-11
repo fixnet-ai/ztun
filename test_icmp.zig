@@ -1,48 +1,114 @@
-// test_icmp.zig - TUN ICMP Echo Reply Test (Pure Zig)
-// Build: zig build-exe test_icmp.zig test_icmp_help.c -lc -I.
+// test_icmp.zig - TUN ICMP Echo Reply Test (100% Pure Zig)
+// Build: zig build-exe test_icmp.zig macos_types.zig -lc -I.
 // Run: sudo ./test_icmp
 //
-// This version uses pure Zig for all logic, with only minimal C helpers
-// for getsockopt and utun control info that Zig 0.13.0 doesn't support.
+// This version uses 100% pure Zig for all logic, including macOS-specific
+// types and structures for UTUN operations.
 
 const std = @import("std");
 const c = @import("std").c;
+const macos = @import("macos_types.zig");
+
 const BUF_SIZE = 4096;
 
 // ============================================================================
-// C Function Declarations (still required in Zig 0.13.0)
+// Minimal C Declarations (still required for getsockopt)
 // ============================================================================
 
-// ioctl for utun control info (CTLIOCGINFO)
-extern "c" fn ioctl_get_ctl_info(sock: c_int, ctl_name: [*:0]const u8, name_len: usize, ctl_id: *u32) c_int;
+// getsockopt for utun interface name (Zig 0.13.0 doesn't expose this in std.posix)
+extern "c" fn getsockopt(
+    sock: c_int,
+    level: c_int,
+    optname: c_int,
+    optval: ?*anyopaque,
+    optlen: *c_uint,
+) c_int;
 
-// getsockopt for utun interface name
-extern "c" fn getsockopt_ifname(sock: c_int, ifname: [*]u8, max_len: usize) c_int;
-
-// System command for routing
-extern "c" fn system(command: [*:0]const u8) c_int;
-
-// C read/write for file descriptors
+// C read/write for file descriptors (required for C-created fd compatibility)
 extern "c" fn read(fd: c_int, buf: *anyopaque, nbytes: usize) c_int;
 extern "c" fn write(fd: c_int, buf: *const anyopaque, nbytes: usize) c_int;
 extern "c" var errno: c_int;
 
 // ============================================================================
-// macOS ioctl Constants (Pure Zig)
-// ============================================================================
-
-// From /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/sockio.h
-const SIOCGIFFLAGS: u32 = 0xC0206914;   // _IOWR('i', 17, struct ifreq) - get flags
-const SIOCSIFFLAGS: u32 = 0x80206910;    // _IOW('i', 16, struct ifreq) - set flags
-const SIOCSIFADDR: u32 = 0x8020690C;     // _IOW('i', 12, struct ifreq) - set address
-const SIOCSIFDSTADDR: u32 = 0x80206914;  // _IOW('i', 14, struct ifreq) - set peer
-
-// ============================================================================
 // Constants
 // ============================================================================
 
-const IFNAMSIZ = 16;
-const IFR_SIZE = 32;
+const UTUN_OPT_IFNAME = macos.UTUN_OPT_IFNAME;
+const SYSPROTO_CONTROL = macos.SYSPROTO_CONTROL;
+
+// ============================================================================
+// UTUN Control Info (Pure Zig using c.ioctl)
+// ============================================================================
+
+fn ioctl_get_ctl_info(sock: c_int, ctl_name: [*:0]const u8, ctl_id: *u32) c_int {
+    var info: macos.ctl_info = .{};
+    info.setName(ctl_name);
+
+    const req = @as(c_int, @bitCast(macos.CTLIOCGINFO));
+    const ret = c.ioctl(sock, req, &info);
+    if (ret < 0) return -1;
+
+    ctl_id.* = info.ctl_id;
+    return 0;
+}
+
+// ============================================================================
+// Get Interface Name via getsockopt (Pure Zig)
+// ============================================================================
+
+fn getsockopt_ifname(sock: c_int, ifname: [*]u8, max_len: usize) c_int {
+    var name_buf: [64]u8 = undefined;
+    var name_len: c_uint = 64;
+
+    const ret = getsockopt(sock, SYSPROTO_CONTROL, UTUN_OPT_IFNAME, &name_buf, &name_len);
+    if (ret < 0) return -1;
+
+    const copy_len = @min(@as(usize, @intCast(name_len)), max_len - 1);
+    @memcpy(ifname[0..copy_len], name_buf[0..copy_len]);
+    ifname[copy_len] = 0;
+
+    return 0;
+}
+
+// ============================================================================
+// System Command Execution using std.process.Child (Pure Zig)
+// ============================================================================
+
+var allocator: std.mem.Allocator = undefined;
+
+fn run_command(argv: []const []const u8) !c_int {
+    var child = std.process.Child.init(argv, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+
+    const term = try child.spawnAndWait();
+    switch (term) {
+        .Exited => |code| return code,
+        else => return -1,
+    }
+}
+
+fn delete_route() c_int {
+    return run_command(&[_][]const u8{ "route", "-q", "-n", "delete", "-inet", "10.0.0.2" }) catch return -1;
+}
+
+fn verify_route() c_int {
+    return run_command(&[_][]const u8{ "route", "-n", "get", "10.0.0.2" }) catch return -1;
+}
+
+fn add_route(tun_name: [*:0]const u8) c_int {
+    const tun_name_z: [*:0]const u8 = @ptrCast(tun_name);
+    return run_command(&[_][]const u8{ "route", "-q", "-n", "add", "-inet", "10.0.0.2/32", "-iface", std.mem.sliceTo(tun_name_z, 0) }) catch return -1;
+}
+
+// Configure interface using ifconfig
+fn configure_interface(ifname: [*:0]const u8, ip: [*:0]const u8, peer: [*:0]const u8) c_int {
+    const ifname_str = std.mem.sliceTo(ifname, 0);
+    const ip_str = std.mem.sliceTo(ip, 0);
+    const peer_str = std.mem.sliceTo(peer, 0);
+
+    return run_command(&[_][]const u8{ "ifconfig", ifname_str, ip_str, peer_str }) catch return -1;
+}
 
 // ============================================================================
 // Socket Functions (Pure Zig using std.posix)
@@ -54,7 +120,7 @@ fn socket_create() c_int {
 }
 
 fn socket_create_sys() c_int {
-    const fd = std.posix.socket(std.posix.AF.SYSTEM, std.posix.SOCK.DGRAM, 2) catch return -1;
+    const fd = std.posix.socket(macos.PF_SYSTEM, macos.SOCK_DGRAM, macos.SYSPROTO_CONTROL) catch return -1;
     return fd;
 }
 
@@ -67,16 +133,8 @@ fn socket_close_zig(sock: c_int) void {
 // ============================================================================
 
 fn connect_utun(sock: c_int, ctl_id: u32) c_int {
-    var addr: [32]u8 = undefined;
-    @memset(&addr, 0);
-
-    addr[0] = 32;   // sc_len
-    addr[1] = 2;    // sc_family = AF_SYSTEM
-    addr[2] = 2;    // ss_sysaddr = AF_SYS_CONTROL
-    @memcpy(addr[4..8], std.mem.asBytes(&ctl_id));
-    addr[8] = 0;    // sc_unit = 0 (auto-assign)
-
-    std.posix.connect(sock, @as(*const std.posix.sockaddr, @ptrCast(&addr)), 32) catch return -1;
+    const addr = macos.sockaddr_ctl.init(ctl_id, 0); // sc_unit = 0 (auto-assign)
+    std.posix.connect(sock, @as(*const std.posix.sockaddr, @ptrCast(&addr)), @sizeOf(macos.sockaddr_ctl)) catch return -1;
     return 0;
 }
 
@@ -106,24 +164,6 @@ pub fn ip2str(ip: u32) [*:0]const u8 {
     const len = std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ b0, b1, b2, b3 }) catch unreachable;
     buf[len.len] = 0;
     return @as([*:0]const u8, @ptrCast(buf));
-}
-
-// ============================================================================
-// Route Operations (must use C system())
-// ============================================================================
-
-fn delete_route() c_int {
-    return system("route -q -n delete -inet 10.0.0.2 2>/dev/null");
-}
-
-fn verify_route() c_int {
-    return system("route -n get 10.0.0.2 2>&1");
-}
-
-fn add_route(tun_name: [*:0]const u8) c_int {
-    var buf: [256]u8 = undefined;
-    const cmd = std.fmt.bufPrintZ(&buf, "route -q -n add -inet 10.0.0.2/32 -iface {s} 2>&1", .{tun_name}) catch unreachable;
-    return system(cmd);
 }
 
 // ============================================================================
@@ -161,40 +201,34 @@ fn tun_close(fd: c_int) void {
 }
 
 // ============================================================================
-// ioctl Functions (Pure Zig using std.c.ioctl)
+// ioctl Functions (Pure Zig using c.ioctl)
 // ============================================================================
 
 fn ioctl_get_flags(sock: c_int, ifname: [*:0]const u8, flags: *c_int) c_int {
-    var ifr: [IFR_SIZE]u8 = undefined;
-    @memset(&ifr, 0);
+    var ifr: macos.ifreq = .{};
+    ifr.setName(ifname);
 
-    @memcpy(ifr[0..IFNAMSIZ], ifname[0..IFNAMSIZ]);
-
-    const req = @as(c_int, @bitCast(SIOCGIFFLAGS));
+    const req = @as(c_int, @bitCast(macos.SIOCGIFFLAGS));
     const ret = c.ioctl(sock, req, &ifr);
     if (ret < 0) return -1;
 
-    flags.* = std.mem.readInt(c_int, ifr[24..28], .little);
+    flags.* = ifr.ifr_flags;
     return 0;
 }
 
 fn ioctl_set_flags(sock: c_int, ifname: [*:0]const u8, flags: c_int) c_int {
-    var ifr: [IFR_SIZE]u8 = undefined;
-    @memset(&ifr, 0);
+    var ifr: macos.ifreq = .{};
+    ifr.setName(ifname);
+    ifr.ifr_flags = flags;
 
-    @memcpy(ifr[0..IFNAMSIZ], ifname[0..IFNAMSIZ]);
-    std.mem.writeInt(c_int, ifr[24..28], flags, .little);
-
-    const req = @as(c_int, @bitCast(SIOCSIFFLAGS));
+    const req = @as(c_int, @bitCast(macos.SIOCSIFFLAGS));
     const ret = c.ioctl(sock, req, &ifr);
     return if (ret < 0) -1 else 0;
 }
 
 fn ioctl_set_ip(sock: c_int, ifname: [*:0]const u8, ip: [*:0]const u8) c_int {
-    var ifr: [IFR_SIZE]u8 = undefined;
-    @memset(&ifr, 0);
-
-    @memcpy(ifr[0..IFNAMSIZ], ifname[0..IFNAMSIZ]);
+    var ifr: macos.ifreq = .{};
+    ifr.setName(ifname);
 
     // Parse IP string
     var parts: [4]u8 = undefined;
@@ -215,30 +249,26 @@ fn ioctl_set_ip(sock: c_int, ifname: [*:0]const u8, ip: [*:0]const u8) c_int {
     }
     if (count == 3) {
         parts[3] = @as(u8, @intCast(val));
-        const ip_addr = @as(u32, @intCast(parts[0])) << 24 |
-                       @as(u32, @intCast(parts[1])) << 16 |
-                       @as(u32, @intCast(parts[2])) << 8 |
-                       @as(u32, @intCast(parts[3]));
-        std.mem.writeInt(u32, ifr[24..28], ip_addr, .big);
+        ifr.ifr_addr.sin_family = @as(u8, @intCast(std.posix.AF.INET));
+        ifr.ifr_addr.sin_len = @sizeOf(macos.sockaddr_in);
+        ifr.ifr_addr.sin_addr = parts;
     }
 
-    const req = @as(c_int, @bitCast(SIOCSIFADDR));
+    const req = @as(c_int, @bitCast(macos.SIOCSIFADDR));
     const ret = c.ioctl(sock, req, &ifr);
     return if (ret < 0) -1 else 0;
 }
 
 fn ioctl_set_peer(sock: c_int, ifname: [*:0]const u8, peer: [*:0]const u8) c_int {
-    var ifr: [IFR_SIZE]u8 = undefined;
-    @memset(&ifr, 0);
-
-    @memcpy(ifr[0..IFNAMSIZ], ifname[0..IFNAMSIZ]);
+    var ifr: macos.ifreq = .{};
+    ifr.setName(ifname);
 
     // Parse IP string
     var parts: [4]u8 = undefined;
     var val: u32 = 0;
     var count: usize = 0;
-    var i: usize = 0;
 
+    var i: usize = 0;
     while (peer[i] != 0) {
         const ch = peer[i];
         if (ch == '.') {
@@ -252,62 +282,14 @@ fn ioctl_set_peer(sock: c_int, ifname: [*:0]const u8, peer: [*:0]const u8) c_int
     }
     if (count == 3) {
         parts[3] = @as(u8, @intCast(val));
-        const ip_addr = @as(u32, @intCast(parts[0])) << 24 |
-                       @as(u32, @intCast(parts[1])) << 16 |
-                       @as(u32, @intCast(parts[2])) << 8 |
-                       @as(u32, @intCast(parts[3]));
-        std.mem.writeInt(u32, ifr[24..28], ip_addr, .big);
+        ifr.ifr_dstaddr.sin_family = @as(u8, @intCast(std.posix.AF.INET));
+        ifr.ifr_dstaddr.sin_len = @sizeOf(macos.sockaddr_in);
+        ifr.ifr_dstaddr.sin_addr = parts;
     }
 
-    const req = @as(c_int, @bitCast(SIOCSIFDSTADDR));
+    const req = @as(c_int, @bitCast(macos.SIOCSIFDSTADDR));
     const ret = c.ioctl(sock, req, &ifr);
     return if (ret < 0) -1 else 0;
-}
-
-// ioctl for utun control info (C wrapper)
-fn ioctl_get_ctl_info_zig(sock: c_int, ctl_name: [*:0]const u8, ctl_id: *u32) c_int {
-    return ioctl_get_ctl_info(sock, ctl_name, 0, ctl_id);
-}
-
-// ============================================================================
-// High-level Interface Configuration
-// ============================================================================
-
-fn configure_ip(ifname: [*:0]const u8, ip: [*:0]const u8) c_int {
-    const sock = socket_create();
-    if (sock < 0) return -1;
-
-    const ret = ioctl_set_ip(sock, ifname, ip);
-    socket_close_zig(sock);
-
-    if (ret == 0) {
-        std.debug.print("Set IP: {s}\n", .{ip});
-    }
-    return ret;
-}
-
-fn configure_peer(ifname: [*:0]const u8, peer: [*:0]const u8) c_int {
-    const sock = socket_create();
-    if (sock < 0) return -1;
-
-    const ret = ioctl_set_peer(sock, ifname, peer);
-    socket_close_zig(sock);
-
-    if (ret == 0) {
-        std.debug.print("Set peer: {s}\n", .{peer});
-    }
-    return ret;
-}
-
-// Configure interface using ifconfig (more reliable on macOS)
-fn configure_interface(ifname: [*:0]const u8, ip: [*:0]const u8, peer: [*:0]const u8) c_int {
-    var buf: [256]u8 = undefined;
-    const cmd = std.fmt.bufPrintZ(&buf, "ifconfig {s} {s} {s} 2>&1", .{ ifname, ip, peer }) catch unreachable;
-    const ret = system(cmd);
-    if (ret == 0) {
-        std.debug.print("Configured: {s} = {s} -> {s}\n", .{ ifname, ip, peer });
-    }
-    return ret;
 }
 
 fn interface_up(ifname: [*:0]const u8) c_int {
@@ -320,7 +302,7 @@ fn interface_up(ifname: [*:0]const u8) c_int {
         return -1;
     }
 
-    flags |= 0x0100 | 0x0040;  // IFF_UP | IFF_RUNNING on macOS
+    flags |= macos.IFF_UP | macos.IFF_RUNNING;
 
     if (ioctl_set_flags(sock, ifname, flags) < 0) {
         socket_close_zig(sock);
@@ -332,12 +314,16 @@ fn interface_up(ifname: [*:0]const u8) c_int {
     return 0;
 }
 
+// ============================================================================
+// Create UTUN Socket
+// ============================================================================
+
 fn create_utun_socket(ifname: [*]u8, max_len: usize) c_int {
     const sock = socket_create_sys();
     if (sock < 0) return -1;
 
     var ctl_id: u32 = 0;
-    if (ioctl_get_ctl_info_zig(sock, "com.apple.net.utun_control", &ctl_id) < 0) {
+    if (ioctl_get_ctl_info(sock, "com.apple.net.utun_control", &ctl_id) < 0) {
         socket_close_zig(sock);
         return -1;
     }
@@ -426,7 +412,7 @@ pub fn process_packet(n: isize) !isize {
 
     std.mem.writeInt(u32, buf[offset + 12..][0..4], dst_ip, .big);
     std.mem.writeInt(u32, buf[offset + 16..][0..4], src_ip, .big);
-    buf[offset + ip_hlen] = 0;  // ICMP_ECHOREPLY
+    buf[offset + ip_hlen] = 0; // ICMP_ECHOREPLY
 
     // IP checksum
     buf[offset + 10] = 0;
@@ -472,12 +458,14 @@ pub fn process_packet(n: isize) !isize {
 // ============================================================================
 
 pub fn main() !void {
+    allocator = std.heap.page_allocator;
+
     var tun_fd: c_int = undefined;
     var tun_name: [64]u8 = undefined;
     var n: isize = undefined;
     var err: c_int = undefined;
 
-    std.debug.print("=== TUN ICMP Echo Reply Test (Pure Zig) ===\n\n", .{});
+    std.debug.print("=== TUN ICMP Echo Reply Test (100% Pure Zig) ===\n\n", .{});
 
     _ = delete_route();
 
