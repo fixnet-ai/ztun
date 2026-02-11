@@ -56,50 +56,84 @@ typedef struct {
 static unsigned char g_buf[BUF_SIZE];
 static int g_buf_len = 0;
 
-// Create utun socket and get actual interface name
-int create_utun_socket(char *ifname, size_t max_len) {
-    struct sockaddr_ctl addr;
-    int sock;
+// Forward declaration for socket_close (used by utun wrappers)
+int socket_close(int sock);
 
-    // Create control socket
-    sock = socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
-    if (sock < 0) {
-        return -1;
-    }
+// ============================================================================
+// UTUN Wrapper Functions (for Zig interoperability)
+// ============================================================================
 
-    // Get control info
+// Create PF_SYSTEM socket for utun (returns fd or -1)
+int socket_create_sys(void) {
+    return socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
+}
+
+// Get control info via ioctl (returns 0 on success)
+int ioctl_get_ctl_info(int sock, char *ctl_name, size_t name_len, uint32_t *ctl_id) {
     struct ctl_info info;
     memset(&info, 0, sizeof(info));
-    strlcpy(info.ctl_name, "com.apple.net.utun_control", sizeof(info.ctl_name));
+    strlcpy(info.ctl_name, ctl_name, sizeof(info.ctl_name));
 
     if (ioctl(sock, CTLIOCGINFO, &info) < 0) {
-        close(sock);
         return -1;
     }
 
-    // Connect to utun
+    *ctl_id = info.ctl_id;
+    return 0;
+}
+
+// Connect to utun with control id (returns 0 on success)
+int connect_utun(int sock, uint32_t ctl_id) {
+    struct sockaddr_ctl addr;
     memset(&addr, 0, sizeof(addr));
     addr.sc_len = sizeof(addr);
     addr.sc_family = AF_SYSTEM;
     addr.ss_sysaddr = AF_SYS_CONTROL;
-    addr.sc_id = info.ctl_id;
+    addr.sc_id = ctl_id;
     addr.sc_unit = 0;  // Auto-assign
 
     if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        close(sock);
         return -1;
     }
 
-    // Get kernel-assigned interface name
+    return 0;
+}
+
+// Get interface name from kernel via getsockopt (returns 0 on success)
+int getsockopt_ifname(int sock, char *ifname, size_t max_len) {
     char assigned_name[IFNAMSIZ];
     socklen_t name_len = sizeof(assigned_name);
+
     if (getsockopt(sock, SYSPROTO_CONTROL, UTUN_OPT_IFNAME,
                    assigned_name, &name_len) < 0) {
-        close(sock);
         return -1;
     }
 
     strlcpy(ifname, assigned_name, max_len);
+    return 0;
+}
+
+// High-level: Create utun socket (wrapper for Zig)
+int create_utun_socket(char *ifname, size_t max_len) {
+    int sock = socket_create_sys();
+    if (sock < 0) return -1;
+
+    uint32_t ctl_id;
+    if (ioctl_get_ctl_info(sock, "com.apple.net.utun_control", 0, &ctl_id) < 0) {
+        socket_close(sock);
+        return -1;
+    }
+
+    if (connect_utun(sock, ctl_id) < 0) {
+        socket_close(sock);
+        return -1;
+    }
+
+    if (getsockopt_ifname(sock, ifname, max_len) < 0) {
+        socket_close(sock);
+        return -1;
+    }
+
     printf("Created utun socket: %s\n", ifname);
     return sock;
 }

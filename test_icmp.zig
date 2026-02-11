@@ -12,6 +12,15 @@ const std = @import("std");
 // ============================================================================
 
 // ============================================================================
+// C Function Declarations (UTUN wrappers)
+// ============================================================================
+
+extern "c" fn socket_create_sys() c_int;
+extern "c" fn ioctl_get_ctl_info(sock: c_int, ctl_name: [*:0]const u8, name_len: usize, ctl_id: *u32) c_int;
+extern "c" fn connect_utun(sock: c_int, ctl_id: u32) c_int;
+extern "c" fn getsockopt_ifname(sock: c_int, ifname: [*]u8, max_len: usize) c_int;
+
+// ============================================================================
 // C Function Declarations (POSIX wrappers for ioctl operations)
 // ============================================================================
 
@@ -23,7 +32,6 @@ extern "c" fn ioctl_set_ip(sock: c_int, ifname: [*:0]const u8, ip: [*:0]const u8
 extern "c" fn ioctl_set_peer(sock: c_int, ifname: [*:0]const u8, peer: [*:0]const u8) c_int;
 
 // High-level functions (still use C implementation)
-extern "c" fn create_utun_socket(ifname: [*]u8, max_len: usize) c_int;
 extern "c" fn configure_ip(ifname: [*:0]const u8, ip: [*:0]const u8) c_int;
 extern "c" fn configure_peer(ifname: [*:0]const u8, peer: [*:0]const u8) c_int;
 extern "c" fn interface_up(ifname: [*:0]const u8) c_int;
@@ -194,6 +202,57 @@ fn tun_close_zig(fd: c_int) c_int {
 }
 
 // ============================================================================
+// UTUN Wrapper Functions (migrated from C)
+// ============================================================================
+
+// Create PF_SYSTEM socket for utun (wraps C socket_create_sys)
+fn socket_create_sys_zig() c_int {
+    return socket_create_sys();
+}
+
+// Get control info via ioctl (wraps C ioctl_get_ctl_info)
+fn ioctl_get_ctl_info_zig(sock: c_int, ctl_name: [*:0]const u8, ctl_id: *u32) c_int {
+    return ioctl_get_ctl_info(sock, ctl_name, 0, ctl_id);
+}
+
+// Connect to utun (wraps C connect_utun)
+fn connect_utun_zig(sock: c_int, ctl_id: u32) c_int {
+    return connect_utun(sock, ctl_id);
+}
+
+// Get interface name (wraps C getsockopt_ifname)
+fn getsockopt_ifname_zig(sock: c_int, ifname: [*]u8, max_len: usize) c_int {
+    return getsockopt_ifname(sock, ifname, max_len);
+}
+
+// Create utun socket - high-level function using Zig wrappers
+fn create_utun_socket_zig(ifname: [*]u8, max_len: usize) c_int {
+    const sock = socket_create_sys_zig();
+    if (sock < 0) return -1;
+
+    var ctl_id: u32 = 0;
+    if (ioctl_get_ctl_info_zig(sock, "com.apple.net.utun_control", &ctl_id) < 0) {
+        _ = tun_close_zig(sock);
+        return -1;
+    }
+
+    if (connect_utun_zig(sock, ctl_id) < 0) {
+        _ = tun_close_zig(sock);
+        return -1;
+    }
+
+    if (getsockopt_ifname_zig(sock, ifname, max_len) < 0) {
+        _ = tun_close_zig(sock);
+        return -1;
+    }
+
+    // Print interface name (convert [*]u8 to [*:0]const u8)
+    const ifname_z: [*:0]const u8 = @ptrCast(@as([*]u8, @alignCast(ifname)));
+    std.debug.print("Created utun socket: {s}\n", .{ifname_z});
+    return sock;
+}
+
+// ============================================================================
 // Packet Processing (migrated from C)
 // ============================================================================
 
@@ -302,17 +361,15 @@ pub fn main() !void {
     // Clean up routes
     _ = delete_route_zig();
 
-    // Create utun socket
-    std.debug.print("Creating utun socket...\n", .{});
+    // Create utun socket (using Zig wrappers for UTUN operations)
     const tun_name_ptr: [*]u8 = &tun_name;
-    tun_fd = create_utun_socket(tun_name_ptr, tun_name.len);
+    tun_fd = create_utun_socket_zig(tun_name_ptr, tun_name.len);
     if (tun_fd < 0) {
         std.debug.print("Failed to create utun\n", .{});
         return error.FailedToCreateUtun;
     }
 
     const tun_name_z: [*:0]const u8 = @ptrCast(&tun_name);
-    std.debug.print("Interface: {s}\n", .{tun_name_z});
 
     // Configure IP and peer (using Zig wrappers for POSIX ioctl)
     _ = configure_ip_zig(tun_name_z, "10.0.0.1");
