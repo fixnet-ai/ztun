@@ -108,6 +108,9 @@ int create_utun_socket(char *ifname, size_t max_len) {
 // POSIX Wrapper Functions (for Zig interoperability)
 // ============================================================================
 
+// Forward declaration for calc_sum (used by process_packet_c)
+static uint16_t calc_sum(uint16_t *addr, int len);
+
 // Create a datagram socket for ioctl operations
 int socket_create(void) {
     return socket(AF_INET, SOCK_DGRAM, 0);
@@ -239,24 +242,6 @@ int interface_up(const char *ifname) {
     return 0;
 }
 
-// Calculate checksum
-uint16_t calc_sum(uint16_t *addr, int len) {
-    int nleft = len;
-    uint32_t sum = 0;
-    uint16_t *w = addr;
-
-    while (nleft > 1) {
-        sum += *w++;
-        nleft -= 2;
-    }
-    if (nleft == 1) {
-        sum += *(uint8_t *)w;
-    }
-    sum = (sum >> 16) + (sum & 0xFFFF);
-    sum += (sum >> 16);
-    return (uint16_t)(~sum);
-}
-
 // Convert IP to string
 const char *ip2str(uint32_t ip) {
     static char buf[16];
@@ -321,11 +306,6 @@ int tun_write(int fd, int len, int *error_code) {
         *error_code = 0;
     }
     return n;
-}
-
-// Close socket
-int tun_close(int fd) {
-    return close(fd);
 }
 
 // Process packet in C layer (complete processing, returns 0 if handled)

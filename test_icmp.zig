@@ -27,12 +27,10 @@ extern "c" fn create_utun_socket(ifname: [*]u8, max_len: usize) c_int;
 extern "c" fn configure_ip(ifname: [*:0]const u8, ip: [*:0]const u8) c_int;
 extern "c" fn configure_peer(ifname: [*:0]const u8, peer: [*:0]const u8) c_int;
 extern "c" fn interface_up(ifname: [*:0]const u8) c_int;
-extern "c" fn calc_sum(addr: [*]u16, len: c_int) u16;
 extern "c" fn ip2str(ip: u32) [*:0]const u8;
 extern "c" fn get_buffer() [*]u8;
 extern "c" fn tun_read(fd: c_int, error_code: *c_int) c_int;
 extern "c" fn tun_write(fd: c_int, len: c_int, error_code: *c_int) c_int;
-extern "c" fn tun_close(fd: c_int) c_int;
 
 // ============================================================================
 // Migrated Functions
@@ -166,6 +164,32 @@ fn interface_up_zig(ifname: [*:0]const u8) c_int {
 
     _ = socket_close_zig(sock);
     std.debug.print("Interface up\n", .{});
+    return 0;
+}
+
+// Calculate checksum (migrated from C)
+// Used for IP/ICMP checksum calculation in network packets
+pub fn calc_sum(addr: [*]u16, len: c_int) u16 {
+    var nleft = len;
+    var sum: u32 = 0;
+    var w = addr;
+
+    while (nleft > 1) {
+        sum += w.*;
+        w += 1;
+        nleft -= 2;
+    }
+    if (nleft == 1) {
+        sum += @as(u32, w[0] & 0xFF);
+    }
+    sum = (sum >> 16) + (sum & 0xFFFF);
+    sum += (sum >> 16);
+    return @as(u16, @truncate(~sum));
+}
+
+// Close file descriptor (migrated from C, uses std.posix.close)
+fn tun_close_zig(fd: c_int) c_int {
+    std.posix.close(fd);
     return 0;
 }
 
@@ -336,5 +360,5 @@ pub fn main() !void {
         }
     }
 
-    _ = tun_close(tun_fd);
+    _ = tun_close_zig(tun_fd);
 }
