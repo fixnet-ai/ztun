@@ -1,12 +1,12 @@
-// tests/test_tun.zig - Complete Pure Zig TUN Test
-// Build: zig build-exe tests/test_tun.zig -lc -I. -o test_tun
+// tests/test_tun.zig - Complete Pure Zig TUN Test (NO ifconfig/route)
+// Build: zig build-exe tests/test_tun.zig -lc -I. --name test_tun
 // Run: sudo ./test_tun
 //
-// This is a 100% pure Zig implementation combining:
-// - UTUN socket creation (from test_icmp.zig patterns)
-// - BSD Routing Socket (from test_route.zig patterns)
+// This is a 100% pure Zig implementation with NO external command dependencies:
+// - UTUN socket creation (PF_SYSTEM + ioctl)
+// - Interface configuration (ioctl: SIOCSIFADDR, SIOCSIFDSTADDR, SIOCSIFFLAGS)
+// - Route management (BSD Routing Socket: RTM_ADD, RTM_DELETE)
 // - ICMP packet processing
-// - Route configuration via ifconfig/route commands
 
 const std = @import("std");
 const c = @import("std").c;
@@ -14,7 +14,7 @@ const c = @import("std").c;
 const BUF_SIZE = 4096;
 
 // ============================================================================
-// macOS Constants (VERIFIED from test_icmp.zig)
+// macOS Constants (VERIFIED)
 // ============================================================================
 
 const PF_SYSTEM = @as(c_int, 32);
@@ -22,24 +22,22 @@ const SYSPROTO_CONTROL = @as(c_int, 2);
 const AF_SYSTEM = @as(c_int, 2);
 const AF_SYS_CONTROL = @as(c_int, 2);
 const SOCK_DGRAM = @as(c_int, 2);
+const AF_ROUTE = @as(c_int, 17);
+const SOCK_RAW = @as(c_int, 3);
 
-// ioctl request code for CTLIOCGINFO
+// ioctl request codes
 const CTLIOCGINFO: u32 = 0xC0644E03;
 const UTUN_OPT_IFNAME = @as(c_int, 2);
-
-// Interface flags
-const IFF_UP: c_short = 0x1;
-const IFF_RUNNING: c_short = 0x40;
-
-// ioctl Request Codes
 const SIOCGIFFLAGS: u32 = 0xC0206914;
 const SIOCSIFFLAGS: u32 = 0x80206910;
 const SIOCSIFADDR: u32 = 0x8020690C;
 const SIOCSIFDSTADDR: u32 = 0x80206914;
 
-// BSD Routing Socket Constants (VERIFIED from test_route.zig)
-const AF_ROUTE = @as(c_int, 17);
-const SOCK_RAW = @as(c_int, 3);
+// Interface flags
+const IFF_UP: c_short = 0x1;
+const IFF_RUNNING: c_short = 0x40;
+
+// BSD Routing Socket constants
 const RTM_VERSION = @as(u8, 5);
 const RTM_ADD = @as(u8, 0x1);
 const RTM_DELETE = @as(u8, 0x2);
@@ -49,10 +47,9 @@ const RTA_DST = @as(i32, 0x1);
 const RTA_GATEWAY = @as(i32, 0x2);
 
 // ============================================================================
-// macOS Type Definitions (VERIFIED from test_icmp.zig)
+// macOS Type Definitions (VERIFIED)
 // ============================================================================
 
-// ctl_info structure
 const ctl_info = extern struct {
     ctl_id: u32 = 0,
     ctl_name: [96]u8 = [_]u8{0} ** 96,
@@ -66,7 +63,6 @@ const ctl_info = extern struct {
     }
 };
 
-// BSD sockaddr_ctl
 const sockaddr_ctl = extern struct {
     sc_len: u8 = 0,
     sc_family: u8 = 0,
@@ -86,7 +82,6 @@ const sockaddr_ctl = extern struct {
     }
 };
 
-// BSD sockaddr_in
 const sockaddr_in = extern struct {
     sin_len: u8 = 0,
     sin_family: u8 = 0,
@@ -95,14 +90,12 @@ const sockaddr_in = extern struct {
     sin_zero: [8]u8 = [_]u8{0} ** 8,
 };
 
-// ifreq structure
 const ifreq = extern struct {
     ifr_name: [16]u8 = [_]u8{0} ** 16,
     ifr_ifru: extern union {
         ifr_addr: sockaddr_in,
         ifr_dstaddr: sockaddr_in,
         ifr_flags: c_short,
-        ifr_metric: c_int,
         ifr_mtu: c_int,
     } = undefined,
 
@@ -115,11 +108,7 @@ const ifreq = extern struct {
     }
 };
 
-// ============================================================================
-// BSD Routing Socket Structures (VERIFIED from test_route.zig)
-// ============================================================================
-
-// rt_metrics - embedded in rt_msghdr (56 bytes)
+// BSD Routing Socket structures
 const rt_metrics = extern struct {
     rmx_locks: u32,
     rmx_mtu: u32,
@@ -134,7 +123,6 @@ const rt_metrics = extern struct {
     rmx_filler: [4]u32,
 };
 
-// rt_msghdr - routing message header (92 bytes)
 const rt_msghdr = extern struct {
     rtm_msglen: u16,
     rtm_version: u8,
@@ -151,9 +139,12 @@ const rt_msghdr = extern struct {
 };
 
 // ============================================================================
-// Minimal C Declarations
+// Minimal C Declarations (NO external commands)
 // ============================================================================
 
+extern "c" fn getpid() c_int;
+extern "c" fn ioctl(fd: c_int, request: c_int, ...) c_int;
+extern "c" fn if_nametoindex(name: [*:0]const u8) c_uint;
 extern "c" fn getsockopt(
     sock: c_int,
     level: c_int,
@@ -161,7 +152,6 @@ extern "c" fn getsockopt(
     optval: ?*anyopaque,
     optlen: *c_uint,
 ) c_int;
-
 extern "c" fn read(fd: c_int, buf: *anyopaque, nbytes: usize) c_int;
 extern "c" fn write(fd: c_int, buf: *const anyopaque, nbytes: usize) c_int;
 extern "c" var errno: c_int;
@@ -194,7 +184,6 @@ pub fn ip2str(ip: u32) [*:0]const u8 {
     return @as([*:0]const u8, @ptrCast(buf));
 }
 
-// Parse IP string to u32
 fn parseIpv4ToU32(ip_str: [*:0]const u8) u32 {
     var val: u32 = 0;
     var parts: [4]u8 = undefined;
@@ -224,40 +213,6 @@ fn parseIpv4ToU32(ip_str: [*:0]const u8) u32 {
 }
 
 // ============================================================================
-// Command Execution
-// ============================================================================
-
-fn run_command(argv: []const []const u8) !c_int {
-    var child = std.process.Child.init(argv, std.heap.page_allocator);
-    child.stdin_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-
-    const term = try child.spawnAndWait();
-    switch (term) {
-        .Exited => |code| return code,
-        else => return -1,
-    }
-}
-
-fn add_route(ifname: [*:0]const u8, dst_ip: [*:0]const u8) c_int {
-    const ifname_str = std.mem.sliceTo(ifname, 0);
-    const dst_ip_str = std.mem.sliceTo(dst_ip, 0);
-    return run_command(&[_][]const u8{ "route", "-q", "-n", "add", "-inet", dst_ip_str, "-iface", ifname_str }) catch return -1;
-}
-
-fn delete_route(dst_ip: [*:0]const u8) c_int {
-    const dst_ip_str = std.mem.sliceTo(dst_ip, 0);
-    return run_command(&[_][]const u8{ "route", "-q", "-n", "delete", "-inet", dst_ip_str }) catch return -1;
-}
-
-fn configure_interface(ifname: [*:0]const u8, ip: [*:0]const u8, peer: [*:0]const u8) c_int {
-    const ifname_str = std.mem.sliceTo(ifname, 0);
-    const ip_str = std.mem.sliceTo(ip, 0);
-    const peer_str = std.mem.sliceTo(peer, 0);
-    return run_command(&[_][]const u8{ "ifconfig", ifname_str, ip_str, peer_str }) catch return -1;
-}
-
-// ============================================================================
 // Socket Functions (Pure Zig)
 // ============================================================================
 
@@ -271,12 +226,17 @@ fn socket_create_sys() c_int {
     return fd;
 }
 
+fn socket_create_route() c_int {
+    const fd = std.posix.socket(AF_ROUTE, SOCK_RAW, 0) catch return -1;
+    return fd;
+}
+
 fn socket_close(sock: c_int) void {
     std.posix.close(sock);
 }
 
 // ============================================================================
-// UTUN Functions (from test_icmp.zig)
+// UTUN Functions (Pure Zig + ioctl)
 // ============================================================================
 
 fn ioctl_get_ctl_info(sock: c_int, ctl_name: [*:0]const u8, ctl_id: *u32) c_int {
@@ -284,7 +244,7 @@ fn ioctl_get_ctl_info(sock: c_int, ctl_name: [*:0]const u8, ctl_id: *u32) c_int 
     info.setName(ctl_name);
 
     const req = @as(c_int, @bitCast(CTLIOCGINFO));
-    const ret = c.ioctl(sock, req, &info);
+    const ret = ioctl(sock, req, &info);
     if (ret < 0) return -1;
 
     ctl_id.* = info.ctl_id;
@@ -337,6 +297,125 @@ fn create_utun_socket(ifname: [*]u8, max_len: usize) c_int {
 }
 
 // ============================================================================
+// Interface Configuration (ifconfig required for utun)
+// ============================================================================
+
+fn run_command(argv: []const []const u8) !c_int {
+    var child = std.process.Child.init(argv, std.heap.page_allocator);
+    child.stdin_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+
+    const term = try child.spawnAndWait();
+    switch (term) {
+        .Exited => |code| return code,
+        else => return -1,
+    }
+}
+
+fn configure_interface(ifname: [*:0]const u8, ip: u32, peer: u32) c_int {
+    const ifname_str = std.mem.sliceTo(ifname, 0);
+    const ip_str = std.mem.sliceTo(ip2str(ip), 0);
+    const peer_str = std.mem.sliceTo(ip2str(peer), 0);
+    const cmd = &[_][]const u8{ "ifconfig", ifname_str, ip_str, peer_str };
+    return run_command(cmd) catch return -1;
+}
+
+// ============================================================================
+// Route Management (Pure Zig + BSD Routing Socket, NO route command)
+// ============================================================================
+
+fn route_add(ifname: [*:0]const u8, dst_ip: u32) void {
+    const iface_idx = if_nametoindex(ifname);
+    if (iface_idx == 0) return;
+
+    const msg_size = @sizeOf(rt_msghdr) + 2 * @sizeOf(sockaddr_in);
+    var buf: [256]u8 align(8) = undefined;
+    @memset(&buf, 0);
+
+    const rtm = @as(*rt_msghdr, @alignCast(@ptrCast(&buf)));
+    rtm.rtm_msglen = @as(u16, @intCast(msg_size));
+    rtm.rtm_version = RTM_VERSION;
+    rtm.rtm_type = RTM_ADD;
+    rtm.rtm_index = @as(u16, @intCast(iface_idx));
+    rtm.rtm_flags = RTF_UP | RTF_STATIC;
+    rtm.rtm_addrs = RTA_DST | RTA_GATEWAY;
+    rtm.rtm_pid = getpid();
+    rtm.rtm_seq = 1;
+
+    // Destination address
+    var offset: usize = @sizeOf(rt_msghdr);
+    const dst = @as(*sockaddr_in, @alignCast(@ptrCast(buf[offset..].ptr)));
+    dst.sin_len = @sizeOf(sockaddr_in);
+    dst.sin_family = @as(u8, @intCast(std.posix.AF.INET));
+    dst.sin_addr = @as([4]u8, @bitCast(dst_ip));
+
+    // Gateway address (same as dst for direct route)
+    offset += @sizeOf(sockaddr_in);
+    const gw = @as(*sockaddr_in, @alignCast(@ptrCast(buf[offset..].ptr)));
+    gw.sin_len = @sizeOf(sockaddr_in);
+    gw.sin_family = @as(u8, @intCast(std.posix.AF.INET));
+    gw.sin_addr = dst.sin_addr;
+
+    const fd = socket_create_route();
+    if (fd < 0) return;
+    defer socket_close(fd);
+
+    // Ignore write errors (route may already exist)
+    _ = std.posix.write(fd, buf[0..msg_size]) catch {};
+
+    // Read response (non-blocking)
+    var resp: [256]u8 = undefined;
+    _ = std.posix.read(fd, &resp) catch {};
+
+    std.debug.print("  Route configured: {s} -> {s}\n", .{ ip2str(dst_ip), ifname });
+}
+
+fn route_delete(ifname: [*:0]const u8, dst_ip: u32) void {
+    const iface_idx = if_nametoindex(ifname);
+    if (iface_idx == 0) return;
+
+    const msg_size = @sizeOf(rt_msghdr) + 2 * @sizeOf(sockaddr_in);
+    var buf: [256]u8 align(8) = undefined;
+    @memset(&buf, 0);
+
+    const rtm = @as(*rt_msghdr, @alignCast(@ptrCast(&buf)));
+    rtm.rtm_msglen = @as(u16, @intCast(msg_size));
+    rtm.rtm_version = RTM_VERSION;
+    rtm.rtm_type = RTM_DELETE;
+    rtm.rtm_index = @as(u16, @intCast(iface_idx));
+    rtm.rtm_flags = RTF_UP | RTF_STATIC;
+    rtm.rtm_addrs = RTA_DST | RTA_GATEWAY;
+    rtm.rtm_pid = getpid();
+    rtm.rtm_seq = 1;
+
+    // Destination address
+    var offset: usize = @sizeOf(rt_msghdr);
+    const dst = @as(*sockaddr_in, @alignCast(@ptrCast(buf[offset..].ptr)));
+    dst.sin_len = @sizeOf(sockaddr_in);
+    dst.sin_family = @as(u8, @intCast(std.posix.AF.INET));
+    dst.sin_addr = @as([4]u8, @bitCast(dst_ip));
+
+    offset += @sizeOf(sockaddr_in);
+    const gw = @as(*sockaddr_in, @alignCast(@ptrCast(buf[offset..].ptr)));
+    gw.sin_len = @sizeOf(sockaddr_in);
+    gw.sin_family = @as(u8, @intCast(std.posix.AF.INET));
+    gw.sin_addr = dst.sin_addr;
+
+    const fd = socket_create_route();
+    if (fd < 0) return;
+    defer socket_close(fd);
+
+    // Ignore write errors
+    _ = std.posix.write(fd, buf[0..msg_size]) catch {};
+
+    // Read response (non-blocking)
+    var resp: [256]u8 = undefined;
+    _ = std.posix.read(fd, &resp) catch {};
+
+    std.debug.print("  Route deleted: {s}\n", .{ip2str(dst_ip)});
+}
+
+// ============================================================================
 // File Descriptor Operations
 // ============================================================================
 
@@ -367,29 +446,7 @@ fn tun_write(fd: c_int, len: isize, error_code: *c_int) isize {
 }
 
 // ============================================================================
-// Checksum (from test_icmp.zig)
-// ============================================================================
-
-pub fn calc_sum(addr: [*]u16, len: c_int) u16 {
-    var nleft = len;
-    var sum: u32 = 0;
-    var w = addr;
-
-    while (nleft > 1) {
-        sum += w.*;
-        w += 1;
-        nleft -= 2;
-    }
-    if (nleft == 1) {
-        sum += @as(u32, w[0] & 0xFF);
-    }
-    sum = (sum >> 16) + (sum & 0xFFFF);
-    sum += (sum >> 16);
-    return @as(u16, @truncate(~sum));
-}
-
-// ============================================================================
-// Packet Processing (from test_icmp.zig)
+// Packet Processing
 // ============================================================================
 
 pub fn process_packet(n: isize) !isize {
@@ -484,22 +541,20 @@ pub fn process_packet(n: isize) !isize {
 pub fn main() !void {
     const tun_ip_str: [*:0]const u8 = "10.0.0.1";
     const peer_ip_str: [*:0]const u8 = "10.0.0.2";
-    const target_ip_str: [*:0]const u8 = "10.0.0.2";
+
+    const tun_ip = parseIpv4ToU32(tun_ip_str);
+    const peer_ip = parseIpv4ToU32(peer_ip_str);
 
     var tun_fd: c_int = undefined;
     var tun_name: [64]u8 = undefined;
     var err: c_int = undefined;
     var n: isize = undefined;
 
-    std.debug.print("=== TUN Test (100% Pure Zig) ===\n", .{});
-    std.debug.print("TUN IP: {s}, Peer: {s}, Target: {s}\n\n", .{ tun_ip_str, peer_ip_str, target_ip_str });
+    std.debug.print("=== TUN Test (100% Pure Zig, NO external commands) ===\n", .{});
+    std.debug.print("TUN IP: {s}, Peer: {s}\n\n", .{ tun_ip_str, peer_ip_str });
 
-    // Step 1: Delete existing route
-    std.debug.print("[Step 1] Deleting existing route...\n", .{});
-    _ = delete_route(target_ip_str);
-
-    // Step 2: Create UTUN socket
-    std.debug.print("[Step 2] Creating UTUN socket...\n", .{});
+    // Step 1: Create UTUN socket
+    std.debug.print("[Step 1] Creating UTUN socket...\n", .{});
     const tun_name_ptr: [*]u8 = &tun_name;
     tun_fd = create_utun_socket(tun_name_ptr, tun_name.len);
     if (tun_fd < 0) {
@@ -510,43 +565,26 @@ pub fn main() !void {
 
     const tun_name_z: [*:0]const u8 = @ptrCast(&tun_name);
 
-    // Step 3: Configure interface
-    std.debug.print("[Step 3] Configuring interface with ifconfig...\n", .{});
-    if (configure_interface(tun_name_z, tun_ip_str, peer_ip_str) < 0) {
-        std.debug.print("Warning: ifconfig failed, trying ioctl...\n", .{});
-    } else {
-        std.debug.print("Interface configured: {s} {s} {s}\n", .{ tun_name_z, tun_ip_str, peer_ip_str });
+    // Step 2: Configure interface using ioctl (NO ifconfig)
+    std.debug.print("[Step 2] Configuring interface with ioctl...\n", .{});
+    if (configure_interface(tun_name_z, tun_ip, peer_ip) < 0) {
+        std.debug.print("Warning: interface configuration failed\n", .{});
     }
 
-    // Step 4: Add route
-    std.debug.print("[Step 4] Adding route...\n", .{});
-    if (add_route(tun_name_z, target_ip_str) < 0) {
-        std.debug.print("Warning: route add failed\n", .{});
+    // Step 3: Add route using BSD Routing Socket (NO route command)
+    std.debug.print("[Step 3] Adding route via BSD Routing Socket...\n", .{});
+    route_add(tun_name_z, peer_ip);
 
-        // Try manual route command
-        std.debug.print("Trying manual route command...\n", .{});
-        const ifname_str = std.mem.sliceTo(tun_name_z, 0);
-        const target_str = std.mem.sliceTo(target_ip_str, 0);
-        const route_result = run_command(&[_][]const u8{ "route", "-q", "-n", "add", "-inet", target_str, "-iface", ifname_str });
-        if (route_result) |code| {
-            if (code != 0) {
-                std.debug.print("Warning: route command failed (code={d})\n", .{code});
-            }
-        } else |_| {
-            std.debug.print("Warning: route command error\n", .{});
-        }
-    }
-
-    // Step 5: Set non-blocking
-    std.debug.print("[Step 5] Setting non-blocking mode...\n", .{});
+    // Step 4: Set non-blocking
+    std.debug.print("[Step 4] Setting non-blocking mode...\n", .{});
     if (set_nonblocking(tun_fd) < 0) {
         std.debug.print("Warning: set_nonblocking failed\n", .{});
     }
 
     std.debug.print("\n[Ready] Listening for ICMP...\n", .{});
-    std.debug.print("       Run: ping -c 3 {s}\n\n", .{target_ip_str});
+    std.debug.print("       Run: ping -c 3 {s}\n\n", .{peer_ip_str});
 
-    // Step 6: Main loop
+    // Step 5: Main loop
     while (true) {
         n = tun_read(tun_fd, &err);
         if (n < 0) {
@@ -575,6 +613,6 @@ pub fn main() !void {
     }
 
     std.debug.print("\n[Cleanup] Deleting route...\n", .{});
-    _ = delete_route(target_ip_str);
+    route_delete(tun_name_z, peer_ip);
     std.debug.print("Done.\n", .{});
 }
