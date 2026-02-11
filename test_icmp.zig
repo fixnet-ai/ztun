@@ -1,27 +1,15 @@
-// test_icmp.zig - TUN ICMP Echo Reply Test using C Helper
+// test_icmp.zig - TUN ICMP Echo Reply Test (Pure Zig)
 // Build: zig build-exe test_icmp.zig test_icmp_help.c -lc -I.
 // Run: sudo ./test_icmp
 //
-// This version wraps test_icmp.c completely in C helper,
-// Zig only calls C functions via extern declarations.
+// This version uses pure Zig for all logic, with only minimal C helpers
+// for POSIX ioctl operations that Zig 0.13.0 doesn't support.
 
 const std = @import("std");
+const BUF_SIZE = 4096;
 
 // ============================================================================
-// C Function Declarations (extern, no header)
-// ============================================================================
-
-// ============================================================================
-// C Function Declarations (UTUN wrappers)
-// ============================================================================
-
-extern "c" fn socket_create_sys() c_int;
-extern "c" fn ioctl_get_ctl_info(sock: c_int, ctl_name: [*:0]const u8, name_len: usize, ctl_id: *u32) c_int;
-extern "c" fn connect_utun(sock: c_int, ctl_id: u32) c_int;
-extern "c" fn getsockopt_ifname(sock: c_int, ifname: [*]u8, max_len: usize) c_int;
-
-// ============================================================================
-// C Function Declarations (POSIX wrappers for ioctl operations)
+// C Function Declarations (POSIX wrappers - required for ioctl)
 // ============================================================================
 
 extern "c" fn socket_create() c_int;
@@ -31,24 +19,35 @@ extern "c" fn ioctl_set_flags(sock: c_int, ifname: [*:0]const u8, flags: c_int) 
 extern "c" fn ioctl_set_ip(sock: c_int, ifname: [*:0]const u8, ip: [*:0]const u8) c_int;
 extern "c" fn ioctl_set_peer(sock: c_int, ifname: [*:0]const u8, peer: [*:0]const u8) c_int;
 
-// High-level functions (still use C implementation)
-extern "c" fn configure_ip(ifname: [*:0]const u8, ip: [*:0]const u8) c_int;
-extern "c" fn configure_peer(ifname: [*:0]const u8, peer: [*:0]const u8) c_int;
-extern "c" fn interface_up(ifname: [*:0]const u8) c_int;
-extern "c" fn ip2str(ip: u32) [*:0]const u8;
-extern "c" fn get_buffer() [*]u8;
-extern "c" fn tun_read(fd: c_int, error_code: *c_int) c_int;
-extern "c" fn tun_write(fd: c_int, len: c_int, error_code: *c_int) c_int;
+// UTUN wrapper (PF_SYSTEM socket)
+extern "c" fn socket_create_sys() c_int;
+extern "c" fn ioctl_get_ctl_info(sock: c_int, ctl_name: [*:0]const u8, name_len: usize, ctl_id: *u32) c_int;
+extern "c" fn connect_utun(sock: c_int, ctl_id: u32) c_int;
+extern "c" fn getsockopt_ifname(sock: c_int, ifname: [*]u8, max_len: usize) c_int;
+
+// System command for routing
+extern "c" fn system(command: [*:0]const u8) c_int;
+
+// C read/write for file descriptors created by C
+extern "c" fn read(fd: c_int, buf: *anyopaque, nbytes: usize) c_int;
+extern "c" fn write(fd: c_int, buf: *const anyopaque, nbytes: usize) c_int;
+extern "c" var errno: c_int;
 
 // ============================================================================
-// Migrated Functions
+// Global Buffer (replaces C's g_buf)
 // ============================================================================
 
-// Convert IP to string (migrated from C, also available in C layer)
+var packet_buf: [BUF_SIZE]u8 = undefined;
+
+// ============================================================================
+// IP to String (Pure Zig)
+// ============================================================================
+
 var ip2str_buf1: [16]u8 = undefined;
 var ip2str_buf2: [16]u8 = undefined;
 var ip2str_use_first = true;
-pub fn ip2str_zig(ip: u32) [*:0]const u8 {
+
+pub fn ip2str(ip: u32) [*:0]const u8 {
     // Network byte order: big-endian, so first byte is highest
     const b0 = (ip >> 24) & 0xFF;
     const b1 = (ip >> 16) & 0xFF;
@@ -63,69 +62,112 @@ pub fn ip2str_zig(ip: u32) [*:0]const u8 {
     return @as([*:0]const u8, @ptrCast(buf));
 }
 
+// ============================================================================
+// Route Operations (Pure Zig)
+// ============================================================================
 
-// Delete route (migrated from C)
-extern "c" fn system(command: [*:0]const u8) c_int;
-fn delete_route_zig() c_int {
+fn delete_route() c_int {
     return system("route -q -n delete -inet 10.0.0.2 2>/dev/null");
 }
 
-// Verify route (migrated from C)
-fn verify_route_zig() c_int {
+fn verify_route() c_int {
     return system("route -n get 10.0.0.2 2>&1");
 }
 
-// Add route (migrated from C)
-fn add_route_zig(tun_name: [*:0]const u8) c_int {
+fn add_route(tun_name: [*:0]const u8) c_int {
     var buf: [256]u8 = undefined;
     const cmd = std.fmt.bufPrintZ(&buf, "route -q -n add -inet 10.0.0.2/32 -iface {s} 2>&1", .{tun_name}) catch unreachable;
     return system(cmd);
 }
 
-// Set non-blocking on socket (migrated from C)
-fn set_nonblocking_zig(fd: c_int) c_int {
+// ============================================================================
+// Socket I/O (Pure Zig using std.posix)
+// ============================================================================
+
+fn set_nonblocking(fd: c_int) c_int {
     const flags = std.posix.fcntl(fd, std.posix.F.GETFL, 0) catch return -1;
     // O_NONBLOCK on macOS is 0x0004
     _ = std.posix.fcntl(fd, std.posix.F.SETFL, flags | 0x0004) catch return -1;
     return 0;
 }
 
+fn tun_read(fd: c_int, error_code: *c_int) isize {
+    const n = read(fd, &packet_buf, BUF_SIZE);
+    if (n < 0) {
+        error_code.* = errno;
+        return -1;
+    }
+    error_code.* = 0;
+    return @as(isize, @intCast(n));
+}
+
+fn tun_write(fd: c_int, len: isize, error_code: *c_int) isize {
+    const n = write(fd, &packet_buf, @as(usize, @intCast(len)));
+    if (n < 0) {
+        error_code.* = errno;
+        return -1;
+    }
+    error_code.* = 0;
+    return @as(isize, @intCast(n));
+}
+
+fn tun_close(fd: c_int) void {
+    std.posix.close(fd);
+}
+
 // ============================================================================
-// POSIX Wrapper Functions (migrated from C)
+// POSIX Wrapper Functions (wraps C ioctl)
 // ============================================================================
 
-// Create datagram socket for ioctl operations (wraps C socket_create)
 fn socket_create_zig() c_int {
     return socket_create();
 }
 
-// Close socket (wraps C socket_close)
 fn socket_close_zig(sock: c_int) c_int {
     return socket_close(sock);
 }
 
-// Get interface flags via ioctl (wraps C ioctl_get_flags)
 fn ioctl_get_flags_zig(sock: c_int, ifname: [*:0]const u8, flags: *c_int) c_int {
     return ioctl_get_flags(sock, ifname, flags);
 }
 
-// Set interface flags via ioctl (wraps C ioctl_set_flags)
 fn ioctl_set_flags_zig(sock: c_int, ifname: [*:0]const u8, flags: c_int) c_int {
     return ioctl_set_flags(sock, ifname, flags);
 }
 
-// Set interface IP via ioctl (wraps C ioctl_set_ip)
 fn ioctl_set_ip_zig(sock: c_int, ifname: [*:0]const u8, ip: [*:0]const u8) c_int {
     return ioctl_set_ip(sock, ifname, ip);
 }
 
-// Set interface peer via ioctl (wraps C ioctl_set_peer)
 fn ioctl_set_peer_zig(sock: c_int, ifname: [*:0]const u8, peer: [*:0]const u8) c_int {
     return ioctl_set_peer(sock, ifname, peer);
 }
 
-// High-level: Configure interface IP (uses Zig ioctl wrappers)
-fn configure_ip_zig(ifname: [*:0]const u8, ip: [*:0]const u8) c_int {
+// ============================================================================
+// UTUN Wrapper Functions (wraps C helpers)
+// ============================================================================
+
+fn socket_create_sys_zig() c_int {
+    return socket_create_sys();
+}
+
+fn ioctl_get_ctl_info_zig(sock: c_int, ctl_name: [*:0]const u8, ctl_id: *u32) c_int {
+    return ioctl_get_ctl_info(sock, ctl_name, 0, ctl_id);
+}
+
+fn connect_utun_zig(sock: c_int, ctl_id: u32) c_int {
+    return connect_utun(sock, ctl_id);
+}
+
+fn getsockopt_ifname_zig(sock: c_int, ifname: [*]u8, max_len: usize) c_int {
+    return getsockopt_ifname(sock, ifname, max_len);
+}
+
+// ============================================================================
+// High-level Interface Configuration
+// ============================================================================
+
+fn configure_ip(ifname: [*:0]const u8, ip: [*:0]const u8) c_int {
     const sock = socket_create_zig();
     if (sock < 0) return -1;
 
@@ -138,8 +180,7 @@ fn configure_ip_zig(ifname: [*:0]const u8, ip: [*:0]const u8) c_int {
     return ret;
 }
 
-// High-level: Configure peer address (uses Zig ioctl wrappers)
-fn configure_peer_zig(ifname: [*:0]const u8, peer: [*:0]const u8) c_int {
+fn configure_peer(ifname: [*:0]const u8, peer: [*:0]const u8) c_int {
     const sock = socket_create_zig();
     if (sock < 0) return -1;
 
@@ -152,8 +193,7 @@ fn configure_peer_zig(ifname: [*:0]const u8, peer: [*:0]const u8) c_int {
     return ret;
 }
 
-// High-level: Bring interface up (uses Zig ioctl wrappers)
-fn interface_up_zig(ifname: [*:0]const u8) c_int {
+fn interface_up(ifname: [*:0]const u8) c_int {
     const sock = socket_create_zig();
     if (sock < 0) return -1;
 
@@ -163,7 +203,7 @@ fn interface_up_zig(ifname: [*:0]const u8) c_int {
         return -1;
     }
 
-    flags |= 0x0100 | 0x0040;  // IFF_UP | IFF_RUNNING on macOS (same as BSD)
+    flags |= 0x0100 | 0x0040;  // IFF_UP | IFF_RUNNING on macOS
 
     if (ioctl_set_flags_zig(sock, ifname, flags) < 0) {
         _ = socket_close_zig(sock);
@@ -175,8 +215,35 @@ fn interface_up_zig(ifname: [*:0]const u8) c_int {
     return 0;
 }
 
-// Calculate checksum (migrated from C)
-// Used for IP/ICMP checksum calculation in network packets
+fn create_utun_socket(ifname: [*]u8, max_len: usize) c_int {
+    const sock = socket_create_sys_zig();
+    if (sock < 0) return -1;
+
+    var ctl_id: u32 = 0;
+    if (ioctl_get_ctl_info_zig(sock, "com.apple.net.utun_control", &ctl_id) < 0) {
+        tun_close(sock);
+        return -1;
+    }
+
+    if (connect_utun_zig(sock, ctl_id) < 0) {
+        tun_close(sock);
+        return -1;
+    }
+
+    if (getsockopt_ifname_zig(sock, ifname, max_len) < 0) {
+        tun_close(sock);
+        return -1;
+    }
+
+    const ifname_z: [*:0]const u8 = @ptrCast(@as([*]u8, @alignCast(ifname)));
+    std.debug.print("Created utun socket: {s}\n", .{ifname_z});
+    return sock;
+}
+
+// ============================================================================
+// Checksum (Pure Zig)
+// ============================================================================
+
 pub fn calc_sum(addr: [*]u16, len: c_int) u16 {
     var nleft = len;
     var sum: u32 = 0;
@@ -195,69 +262,12 @@ pub fn calc_sum(addr: [*]u16, len: c_int) u16 {
     return @as(u16, @truncate(~sum));
 }
 
-// Close file descriptor (migrated from C, uses std.posix.close)
-fn tun_close_zig(fd: c_int) c_int {
-    std.posix.close(fd);
-    return 0;
-}
-
 // ============================================================================
-// UTUN Wrapper Functions (migrated from C)
+// Packet Processing (Pure Zig)
 // ============================================================================
 
-// Create PF_SYSTEM socket for utun (wraps C socket_create_sys)
-fn socket_create_sys_zig() c_int {
-    return socket_create_sys();
-}
-
-// Get control info via ioctl (wraps C ioctl_get_ctl_info)
-fn ioctl_get_ctl_info_zig(sock: c_int, ctl_name: [*:0]const u8, ctl_id: *u32) c_int {
-    return ioctl_get_ctl_info(sock, ctl_name, 0, ctl_id);
-}
-
-// Connect to utun (wraps C connect_utun)
-fn connect_utun_zig(sock: c_int, ctl_id: u32) c_int {
-    return connect_utun(sock, ctl_id);
-}
-
-// Get interface name (wraps C getsockopt_ifname)
-fn getsockopt_ifname_zig(sock: c_int, ifname: [*]u8, max_len: usize) c_int {
-    return getsockopt_ifname(sock, ifname, max_len);
-}
-
-// Create utun socket - high-level function using Zig wrappers
-fn create_utun_socket_zig(ifname: [*]u8, max_len: usize) c_int {
-    const sock = socket_create_sys_zig();
-    if (sock < 0) return -1;
-
-    var ctl_id: u32 = 0;
-    if (ioctl_get_ctl_info_zig(sock, "com.apple.net.utun_control", &ctl_id) < 0) {
-        _ = tun_close_zig(sock);
-        return -1;
-    }
-
-    if (connect_utun_zig(sock, ctl_id) < 0) {
-        _ = tun_close_zig(sock);
-        return -1;
-    }
-
-    if (getsockopt_ifname_zig(sock, ifname, max_len) < 0) {
-        _ = tun_close_zig(sock);
-        return -1;
-    }
-
-    // Print interface name (convert [*]u8 to [*:0]const u8)
-    const ifname_z: [*:0]const u8 = @ptrCast(@as([*]u8, @alignCast(ifname)));
-    std.debug.print("Created utun socket: {s}\n", .{ifname_z});
-    return sock;
-}
-
-// ============================================================================
-// Packet Processing (migrated from C)
-// ============================================================================
-
-pub fn process_packet(buf: []u8) !usize {
-    const n = @as(isize, @intCast(buf.len));
+pub fn process_packet(n: isize) !isize {
+    const buf = &packet_buf;
 
     // Skip macOS utun 4-byte header if present
     var offset: usize = 0;
@@ -271,7 +281,7 @@ pub fn process_packet(buf: []u8) !usize {
         return 0;
     }
 
-    // Parse IP header directly (no struct casting for alignment)
+    // Parse IP header directly
     const vhl = buf[offset];
     const ip_hlen = (@as(usize, vhl) & 0x0F) * 4;
     const ip_len = std.mem.readInt(u16, buf[offset + 2..][0..2], .big);
@@ -279,7 +289,7 @@ pub fn process_packet(buf: []u8) !usize {
     const src_ip = std.mem.readInt(u32, buf[offset + 12..][0..4], .big);
     const dst_ip = std.mem.readInt(u32, buf[offset + 16..][0..4], .big);
 
-    std.debug.print("IP: {s} -> {s}\n", .{ ip2str_zig(src_ip), ip2str_zig(dst_ip) });
+    std.debug.print("IP: {s} -> {s}\n", .{ ip2str(src_ip), ip2str(dst_ip) });
     std.debug.print("Proto: {d} (ICMP=1)\n", .{proto});
 
     if (proto != 1) {  // IPPROTO_ICMP
@@ -306,7 +316,7 @@ pub fn process_packet(buf: []u8) !usize {
     buf[offset + ip_hlen] = 0;  // ICMP_ECHOREPLY
 
     // Recalculate checksums
-    // IP checksum (set to 0 first)
+    // IP checksum
     buf[offset + 10] = 0;
     buf[offset + 11] = 0;
     var sum: u32 = 0;
@@ -340,9 +350,9 @@ pub fn process_packet(buf: []u8) !usize {
     buf[offset + ip_hlen + 2] = @as(u8, @truncate(icmp_checksum >> 8));
     buf[offset + ip_hlen + 3] = @as(u8, @truncate(icmp_checksum & 0xFF));
 
-    std.debug.print("Reply: {s} -> {s}\n\n", .{ ip2str_zig(dst_ip), ip2str_zig(src_ip) });
+    std.debug.print("Reply: {s} -> {s}\n\n", .{ ip2str(dst_ip), ip2str(src_ip) });
 
-    return @as(usize, @intCast(n));
+    return n;
 }
 
 // ============================================================================
@@ -352,18 +362,17 @@ pub fn process_packet(buf: []u8) !usize {
 pub fn main() !void {
     var tun_fd: c_int = undefined;
     var tun_name: [64]u8 = undefined;
-    var buf = get_buffer();  // Use C global buffer
-    var n: c_int = undefined;
+    var n: isize = undefined;
     var err: c_int = undefined;
 
-    std.debug.print("=== TUN ICMP Echo Reply Test (Zig + C Helper) ===\n\n", .{});
+    std.debug.print("=== TUN ICMP Echo Reply Test (Pure Zig) ===\n\n", .{});
 
     // Clean up routes
-    _ = delete_route_zig();
+    _ = delete_route();
 
-    // Create utun socket (using Zig wrappers for UTUN operations)
+    // Create utun socket
     const tun_name_ptr: [*]u8 = &tun_name;
-    tun_fd = create_utun_socket_zig(tun_name_ptr, tun_name.len);
+    tun_fd = create_utun_socket(tun_name_ptr, tun_name.len);
     if (tun_fd < 0) {
         std.debug.print("Failed to create utun\n", .{});
         return error.FailedToCreateUtun;
@@ -371,19 +380,19 @@ pub fn main() !void {
 
     const tun_name_z: [*:0]const u8 = @ptrCast(&tun_name);
 
-    // Configure IP and peer (using Zig wrappers for POSIX ioctl)
-    _ = configure_ip_zig(tun_name_z, "10.0.0.1");
-    _ = configure_peer_zig(tun_name_z, "10.0.0.2");
-    _ = interface_up_zig(tun_name_z);
+    // Configure IP and peer
+    _ = configure_ip(tun_name_z, "10.0.0.1");
+    _ = configure_peer(tun_name_z, "10.0.0.2");
+    _ = interface_up(tun_name_z);
 
     // Add route
-    _ = add_route_zig(tun_name_z);
+    _ = add_route(tun_name_z);
 
     // Verify route
-    _ = verify_route_zig();
+    _ = verify_route();
 
     // Set non-blocking
-    _ = set_nonblocking_zig(tun_fd);
+    _ = set_nonblocking(tun_fd);
 
     std.debug.print("\nListening for ICMP...\n", .{});
     std.debug.print("(Press Ctrl+C to stop)\n\n", .{});
@@ -396,26 +405,26 @@ pub fn main() !void {
                 std.time.sleep(10 * std.time.ns_per_ms);
                 continue;
             }
-            std.debug.print("Read error\n", .{});
+            std.debug.print("Read error: {d}\n", .{err});
             break;
         }
 
         std.debug.print("=== Received {d} bytes ===\n", .{n});
 
         // Process packet in Zig layer
-        const result = process_packet(buf[0..@as(usize, @intCast(n))]) catch {
+        const result = process_packet(n) catch {
             std.debug.print("Process error\n", .{});
             break;
         };
-        _ = result;
+        if (result == 0) continue;
 
         n = tun_write(tun_fd, n, &err);
         if (n < 0) {
-            std.debug.print("Write error\n", .{});
+            std.debug.print("Write error: {d}\n", .{err});
         } else {
             std.debug.print("Sent {d} bytes\n\n", .{n});
         }
     }
 
-    _ = tun_close_zig(tun_fd);
+    tun_close(tun_fd);
 }
