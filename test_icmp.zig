@@ -22,55 +22,34 @@ extern "c" fn interface_up(ifname: [*:0]const u8) c_int;  // Keep C version
 extern "c" fn calc_sum(addr: [*]u16, len: c_int) u16;  // Keep C version (used by process_packet_c)
 extern "c" fn ip2str(ip: u32) [*:0]const u8;  // Keep C version (used by process_packet_c)
 extern "c" fn get_buffer() [*]u8;
-extern "c" fn get_buffer_size() c_int;
-extern "c" fn set_nonblocking(fd: c_int) c_int;
+// extern "c" fn set_nonblocking(fd: c_int) c_int;  // Migrated to set_nonblocking_zig
 extern "c" fn tun_read(fd: c_int, error_code: *c_int) c_int;
 extern "c" fn tun_write(fd: c_int, len: c_int, error_code: *c_int) c_int;
 extern "c" fn tun_close(fd: c_int) c_int;
-extern "c" fn process_packet_c(len: c_int) c_int;
 
 // ============================================================================
 // Migrated Functions
 // ============================================================================
 
-// Calculate checksum (migrated from C, also available in C layer)
-pub fn calc_sum_zig(addr: [*]u16, len: usize) u16 {
-    var nleft: usize = len;
-    var sum: u32 = 0;
-    var w: [*]u16 = addr;
-
-    while (nleft > 1) {
-        sum += w[0];
-        w = w[1..];
-        nleft -= 2;
-    }
-    if (nleft == 1) {
-        const byte_ptr = @as([*]u8, @ptrCast(w));
-        sum += byte_ptr[0];
-    }
-    sum = (sum >> 16) + (sum & 0xFFFF);
-    sum += (sum >> 16);
-    return @as(u16, @truncate(~sum));
-}
-
 // Convert IP to string (migrated from C, also available in C layer)
-var ip2str_buf: [16]u8 = undefined;
+var ip2str_buf1: [16]u8 = undefined;
+var ip2str_buf2: [16]u8 = undefined;
+var ip2str_use_first = true;
 pub fn ip2str_zig(ip: u32) [*:0]const u8 {
     // Network byte order: big-endian, so first byte is highest
     const b0 = (ip >> 24) & 0xFF;
     const b1 = (ip >> 16) & 0xFF;
     const b2 = (ip >> 8) & 0xFF;
     const b3 = ip & 0xFF;
-    const len = std.fmt.bufPrint(&ip2str_buf, "{d}.{d}.{d}.{d}", .{ b0, b1, b2, b3 }) catch unreachable;
-    ip2str_buf[len.len] = 0;
-    return @as([*:0]const u8, @ptrCast(&ip2str_buf));
+
+    const buf = if (ip2str_use_first) &ip2str_buf1 else &ip2str_buf2;
+    ip2str_use_first = !ip2str_use_first;
+
+    const len = std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ b0, b1, b2, b3 }) catch unreachable;
+    buf[len.len] = 0;
+    return @as([*:0]const u8, @ptrCast(buf));
 }
 
-// Buffer size constant (migrated from C)
-const BUF_SIZE = 4096;
-fn get_buffer_size_zig() usize {
-    return BUF_SIZE;
-}
 
 // Delete route (migrated from C)
 extern "c" fn system(command: [*:0]const u8) c_int;
@@ -90,12 +69,18 @@ fn add_route_zig(tun_name: [*:0]const u8) c_int {
     return system(cmd);
 }
 
+// Set non-blocking on socket (migrated from C)
+fn set_nonblocking_zig(fd: c_int) c_int {
+    const flags = std.posix.fcntl(fd, std.posix.F.GETFL, 0) catch return -1;
+    // O_NONBLOCK on macOS is 0x0004
+    _ = std.posix.fcntl(fd, std.posix.F.SETFL, flags | 0x0004) catch return -1;
+    return 0;
+}
+
 // ============================================================================
 // Packet Processing (migrated from C)
 // ============================================================================
 
-// Process packet in Zig layer (migrated from C)
-var packet_buf: [4096]u8 = undefined;
 pub fn process_packet(buf: []u8) !usize {
     const n = @as(isize, @intCast(buf.len));
 
@@ -192,7 +177,7 @@ pub fn process_packet(buf: []u8) !usize {
 pub fn main() !void {
     var tun_fd: c_int = undefined;
     var tun_name: [64]u8 = undefined;
-    var buf = get_buffer();  // Get buffer from C helper
+    var buf = get_buffer();  // Use C global buffer
     var n: c_int = undefined;
     var err: c_int = undefined;
 
@@ -225,7 +210,7 @@ pub fn main() !void {
     _ = verify_route_zig();
 
     // Set non-blocking
-    _ = set_nonblocking(tun_fd);
+    _ = set_nonblocking_zig(tun_fd);
 
     std.debug.print("\nListening for ICMP...\n", .{});
     std.debug.print("(Press Ctrl+C to stop)\n\n", .{});
