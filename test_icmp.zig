@@ -9,23 +9,71 @@ const std = @import("std");
 const BUF_SIZE = 4096;
 
 // ============================================================================
-// C Function Declarations (POSIX wrappers - required for ioctl)
+// C Function Declarations (ioctl - cannot be replaced in Zig 0.13.0)
 // ============================================================================
 
-extern "c" fn socket_create() c_int;
-extern "c" fn socket_close(sock: c_int) c_int;
 extern "c" fn ioctl_get_flags(sock: c_int, ifname: [*:0]const u8, flags: *c_int) c_int;
 extern "c" fn ioctl_set_flags(sock: c_int, ifname: [*:0]const u8, flags: c_int) c_int;
 extern "c" fn ioctl_set_ip(sock: c_int, ifname: [*:0]const u8, ip: [*:0]const u8) c_int;
 extern "c" fn ioctl_set_peer(sock: c_int, ifname: [*:0]const u8, peer: [*:0]const u8) c_int;
 
-// UTUN wrapper (PF_SYSTEM socket)
-extern "c" fn socket_create_sys() c_int;
+// ioctl for utun control info
 extern "c" fn ioctl_get_ctl_info(sock: c_int, ctl_name: [*:0]const u8, name_len: usize, ctl_id: *u32) c_int;
-extern "c" fn connect_utun(sock: c_int, ctl_id: u32) c_int;
+
+// getsockopt for utun interface name
 extern "c" fn getsockopt_ifname(sock: c_int, ifname: [*]u8, max_len: usize) c_int;
 
-// System command for routing
+// ============================================================================
+// Socket Functions (Pure Zig using std.posix)
+// ============================================================================
+
+// Create datagram socket for ioctl operations
+fn socket_create() c_int {
+    const fd = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0) catch return -1;
+    return fd;
+}
+
+// Create PF_SYSTEM socket for utun
+fn socket_create_sys() c_int {
+    const fd = std.posix.socket(std.posix.AF.SYSTEM, std.posix.SOCK.DGRAM, 2) catch return -1;
+    return fd;
+}
+
+// Close socket
+fn socket_close_zig(sock: c_int) void {
+    std.posix.close(sock);
+}
+
+// ============================================================================
+// Connect Function (Pure Zig using std.posix.connect)
+// ============================================================================
+
+// Connect to utun with control id
+fn connect_utun(sock: c_int, ctl_id: u32) c_int {
+    // Build sockaddr_ctl structure
+    var addr: [32]u8 = undefined;
+    @memset(&addr, 0);
+
+    // sc_len = 32 for sockaddr_ctl
+    addr[0] = 32;
+
+    // sc_family = AF_SYSTEM (2)
+    addr[1] = 2;
+
+    // ss_sysaddr = AF_SYS_CONTROL (2)
+    addr[2] = 2;
+
+    // sc_id = ctl_id (little-endian for x86_64, but network order for portability)
+    @memcpy(addr[4..8], std.mem.asBytes(&ctl_id));
+
+    // sc_unit = 0 (auto-assign)
+    addr[8] = 0;
+
+    std.posix.connect(sock, @as(*const std.posix.sockaddr, @ptrCast(&addr)), 32) catch return -1;
+    return 0;
+}
+
+// System command for routing (must use C - Zig 0.13.0 has no process.run())
 extern "c" fn system(command: [*:0]const u8) c_int;
 
 // C read/write for file descriptors created by C
@@ -63,8 +111,11 @@ pub fn ip2str(ip: u32) [*:0]const u8 {
 }
 
 // ============================================================================
-// Route Operations (Pure Zig)
+// Route Operations (Pure Zig using std.process.run)
 // ============================================================================
+
+// Note: Zig 0.13.0 has no std.process.run(), only execv/execve which replace
+// the current process. We must use C system() for route commands.
 
 fn delete_route() c_int {
     return system("route -q -n delete -inet 10.0.0.2 2>/dev/null");
@@ -119,14 +170,6 @@ fn tun_close(fd: c_int) void {
 // POSIX Wrapper Functions (wraps C ioctl)
 // ============================================================================
 
-fn socket_create_zig() c_int {
-    return socket_create();
-}
-
-fn socket_close_zig(sock: c_int) c_int {
-    return socket_close(sock);
-}
-
 fn ioctl_get_flags_zig(sock: c_int, ifname: [*:0]const u8, flags: *c_int) c_int {
     return ioctl_get_flags(sock, ifname, flags);
 }
@@ -143,24 +186,9 @@ fn ioctl_set_peer_zig(sock: c_int, ifname: [*:0]const u8, peer: [*:0]const u8) c
     return ioctl_set_peer(sock, ifname, peer);
 }
 
-// ============================================================================
-// UTUN Wrapper Functions (wraps C helpers)
-// ============================================================================
-
-fn socket_create_sys_zig() c_int {
-    return socket_create_sys();
-}
-
+// ioctl for utun control info (C wrapper)
 fn ioctl_get_ctl_info_zig(sock: c_int, ctl_name: [*:0]const u8, ctl_id: *u32) c_int {
     return ioctl_get_ctl_info(sock, ctl_name, 0, ctl_id);
-}
-
-fn connect_utun_zig(sock: c_int, ctl_id: u32) c_int {
-    return connect_utun(sock, ctl_id);
-}
-
-fn getsockopt_ifname_zig(sock: c_int, ifname: [*]u8, max_len: usize) c_int {
-    return getsockopt_ifname(sock, ifname, max_len);
 }
 
 // ============================================================================
@@ -168,11 +196,11 @@ fn getsockopt_ifname_zig(sock: c_int, ifname: [*]u8, max_len: usize) c_int {
 // ============================================================================
 
 fn configure_ip(ifname: [*:0]const u8, ip: [*:0]const u8) c_int {
-    const sock = socket_create_zig();
+    const sock = socket_create();
     if (sock < 0) return -1;
 
     const ret = ioctl_set_ip_zig(sock, ifname, ip);
-    _ = socket_close_zig(sock);
+    socket_close_zig(sock);
 
     if (ret == 0) {
         std.debug.print("Set IP: {s}\n", .{ip});
@@ -181,11 +209,11 @@ fn configure_ip(ifname: [*:0]const u8, ip: [*:0]const u8) c_int {
 }
 
 fn configure_peer(ifname: [*:0]const u8, peer: [*:0]const u8) c_int {
-    const sock = socket_create_zig();
+    const sock = socket_create();
     if (sock < 0) return -1;
 
     const ret = ioctl_set_peer_zig(sock, ifname, peer);
-    _ = socket_close_zig(sock);
+    socket_close_zig(sock);
 
     if (ret == 0) {
         std.debug.print("Set peer: {s}\n", .{peer});
@@ -194,44 +222,44 @@ fn configure_peer(ifname: [*:0]const u8, peer: [*:0]const u8) c_int {
 }
 
 fn interface_up(ifname: [*:0]const u8) c_int {
-    const sock = socket_create_zig();
+    const sock = socket_create();
     if (sock < 0) return -1;
 
     var flags: c_int = 0;
     if (ioctl_get_flags_zig(sock, ifname, &flags) < 0) {
-        _ = socket_close_zig(sock);
+        socket_close_zig(sock);
         return -1;
     }
 
     flags |= 0x0100 | 0x0040;  // IFF_UP | IFF_RUNNING on macOS
 
     if (ioctl_set_flags_zig(sock, ifname, flags) < 0) {
-        _ = socket_close_zig(sock);
+        socket_close_zig(sock);
         return -1;
     }
 
-    _ = socket_close_zig(sock);
+    socket_close_zig(sock);
     std.debug.print("Interface up\n", .{});
     return 0;
 }
 
 fn create_utun_socket(ifname: [*]u8, max_len: usize) c_int {
-    const sock = socket_create_sys_zig();
+    const sock = socket_create_sys();
     if (sock < 0) return -1;
 
     var ctl_id: u32 = 0;
     if (ioctl_get_ctl_info_zig(sock, "com.apple.net.utun_control", &ctl_id) < 0) {
-        tun_close(sock);
+        socket_close_zig(sock);
         return -1;
     }
 
-    if (connect_utun_zig(sock, ctl_id) < 0) {
-        tun_close(sock);
+    if (connect_utun(sock, ctl_id) < 0) {
+        socket_close_zig(sock);
         return -1;
     }
 
-    if (getsockopt_ifname_zig(sock, ifname, max_len) < 0) {
-        tun_close(sock);
+    if (getsockopt_ifname(sock, ifname, max_len) < 0) {
+        socket_close_zig(sock);
         return -1;
     }
 
