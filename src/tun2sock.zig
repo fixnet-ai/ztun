@@ -290,14 +290,14 @@ pub fn main() !u8 {
     }
 
     // Configure route: target_ip/32 -> TUN (via C layer)
-    // On macOS, use peer as gateway for proper reply routing
+    // For macOS utun point-to-point interfaces, use gateway=0 (direct route)
+    // The -iface option in route command associates route with the interface directly
     const target_cidr = try std.fmt.allocPrint(allocator, "{s}/32", .{args.target_ip});
     defer allocator.free(target_cidr);
 
-    const gateway_ip = if (builtin.os.tag == .macos or builtin.os.tag == .ios)
-        args.tun_peer
-    else
-        args.tun_ip;
+    // For point-to-point utun, use gateway=0 (direct interface route)
+    // This matches test_tun.zig's BSD Routing Socket implementation
+    const gateway_ip: []const u8 = "0.0.0.0";
 
     network.configSystemRoute(
         null,
@@ -307,10 +307,11 @@ pub fn main() !u8 {
     ) catch |err| {
         std.debug.print("Warning: Route configuration failed: {}, continuing...\n", .{err});
     };
-    std.debug.print("Route configured: {s} -> {s} (gateway={s})\n", .{ target_cidr, args.tun_ip, gateway_ip });
+    std.debug.print("Route configured: {s} -> {s} (gateway={s}, direct)\n", .{ target_cidr, args.tun_ip, gateway_ip });
 
     // Add route for TUN IP itself via TUN interface (symmetric routing for ICMP replies)
     // This ensures reply packets to 10.0.0.1 can be routed back through the TUN interface
+    // For point-to-point utun, use gateway=0 (direct route)
     if (builtin.os.tag == .macos or builtin.os.tag == .ios) {
         const tun_ip_cidr = try std.fmt.allocPrint(allocator, "{s}/32", .{args.tun_ip});
         defer allocator.free(tun_ip_cidr);
@@ -323,7 +324,7 @@ pub fn main() !u8 {
         ) catch |err| {
             std.debug.print("Warning: TUN IP route configuration failed: {}, continuing...\n", .{err});
         };
-        std.debug.print("Route configured: {s} -> {s} (local)\n", .{ tun_ip_cidr, tun_name });
+        std.debug.print("Route configured: {s} -> {s} (local, direct)\n", .{ tun_ip_cidr, tun_name });
     }
 
     // Parse TUN IP and peer for router configuration
