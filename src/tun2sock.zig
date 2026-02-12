@@ -29,6 +29,113 @@ const tun = @import("tun");
 const router = @import("router");
 const network = @import("network");
 
+// =============================================================================
+// DEBUG UTILITIES (from tests/test_tun.zig)
+// =============================================================================
+
+var ip2str_buf1: [16]u8 = undefined;
+var ip2str_buf2: [16]u8 = undefined;
+var ip2str_use_first = true;
+
+// Convert u32 to dotted-decimal string (thread-unsafe, for debug only)
+// Usage: std.debug.print("IP: {s}\n", .{ip2str(my_ip)});
+pub fn ip2str(ip: u32) [:0]const u8 {
+    const b0 = (ip >> 24) & 0xFF;
+    const b1 = (ip >> 16) & 0xFF;
+    const b2 = (ip >> 8) & 0xFF;
+    const b3 = ip & 0xFF;
+
+    const buf = if (ip2str_use_first) &ip2str_buf1 else &ip2str_buf2;
+    ip2str_use_first = !ip2str_use_first;
+
+    const len = std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ b0, b1, b2, b3 }) catch unreachable;
+    return buf[0..len.len :0];
+}
+
+// Parse dotted-decimal IPv4 string to u32 (network byte order)
+// Usage: const ip = parseIpv4ToU32("10.0.0.1");
+fn parseIpv4ToU32(ip_str: [*:0]const u8) u32 {
+    var val: u32 = 0;
+    var parts: [4]u8 = undefined;
+    var count: usize = 0;
+    var i: usize = 0;
+
+    while (ip_str[i] != 0) : (i += 1) {
+        const ch = ip_str[i];
+        if (ch == '.') {
+            if (count < 4) {
+                parts[count] = @as(u8, @intCast(val));
+                val = 0;
+                count += 1;
+            }
+        } else {
+            val = val * 10 + (ch - '0');
+        }
+    }
+    if (count < 4) {
+        parts[count] = @as(u8, @intCast(val));
+    }
+
+    // Network byte order: most significant byte first
+    return @as(u32, parts[0]) << 24 |
+           @as(u32, parts[1]) << 16 |
+           @as(u32, parts[2]) << 8 |
+           @as(u32, parts[3]);
+}
+
+// Parse dotted-decimal IPv4 string to u32 (heap-allocated, null-terminated)
+pub fn parseIp(ip_str: []const u8) !u32 {
+    var val: u32 = 0;
+    var parts: [4]u8 = undefined;
+    var count: usize = 0;
+
+    for (ip_str) |ch| {
+        if (ch == '.') {
+            if (count < 4) {
+                parts[count] = @as(u8, @intCast(val));
+                val = 0;
+                count += 1;
+            }
+        } else {
+            val = val * 10 + (ch - '0');
+        }
+    }
+    if (count < 4) {
+        parts[count] = @as(u8, @intCast(val));
+    }
+
+    return @as(u32, parts[0]) << 24 |
+           @as(u32, parts[1]) << 16 |
+           @as(u32, parts[2]) << 8 |
+           @as(u32, parts[3]);
+}
+
+// Print current routing table (useful for debugging)
+pub fn printRoutingTable() void {
+    std.debug.print("\n=== Routing Table ===\n", .{});
+    std.debug.print("Target Route:\n", .{});
+    std.debug.print("  Route: 111.45.11.5/32 -> TUN (utunX)\n", .{});
+    std.debug.print("  This routes traffic to target IP through TUN device\n", .{});
+    std.debug.print("  Traffic is then forwarded to SOCKS5 proxy\n\n", .{});
+}
+
+// Print network interface status
+pub fn printInterfaceStatus(tun_name: []const u8) void {
+    std.debug.print("\n=== Interface Status ===\n", .{});
+    std.debug.print("TUN Device: {s}\n", .{tun_name});
+    std.debug.print("  Type: Point-to-point (utun)\n", .{});
+    std.debug.print("  Local IP: 10.0.0.1\n", .{});
+    std.debug.print("  Peer IP: 10.0.0.2\n", .{});
+    std.debug.print("  MTU: 1500\n", .{});
+    std.debug.print("\nExpected Traffic Flow:\n", .{});
+    std.debug.print("  1. App connects to 111.45.11.5:80\n", .{});
+    std.debug.print("  2. Packet routes to TUN (10.0.0.1)\n", .{});
+    std.debug.print("  3. tun2sock receives packet from TUN\n", .{});
+    std.debug.print("  4. SOCKS5 proxy connects to target\n", .{});
+    std.debug.print("  5. TCP handshake completes via SYN-ACK\n", .{});
+    std.debug.print("  6. Data flows through SOCKS5 tunnel\n\n", .{});
+}
+
 // POSIX geteuid for Unix systems
 extern "c" fn geteuid() callconv(.C) c_uint;
 
@@ -131,10 +238,114 @@ fn printHelp() void {
         \\  On macOS, TUN device name is auto-generated (utunX).
         \\  Route configuration passes IP strings to C layer for byte order handling.
         \\
+        \\Test Commands:
+        \\  # 1. Start SOCKS5 proxy (e.g., sing-box on port 1080)
+        \\  # 2. Start tun2sock: sudo ./tun2sock --tun-ip 10.0.0.1 --proxy 127.0.0.1:1080
+        \\  # 3. Test ICMP: ping -c 3 10.0.0.2
+        \\  # 4. Test HTTP: curl -v http://111.45.11.5/ (NO --proxy flag!)
+        \\
         \\Example:
         \\  sudo ./tun2sock --tun-ip 10.0.0.1 --target 111.45.11.5 --proxy 127.0.0.1:1080
         \\
     , .{});
+}
+
+// =============================================================================
+// PACKET ANALYSIS HELPERS (for debugging TUN traffic)
+// =============================================================================
+
+// TCP flag constants
+const TCP_FIN = 0x01;
+const TCP_SYN = 0x02;
+const TCP_RST = 0x04;
+const TCP_PSH = 0x08;
+const TCP_ACK = 0x10;
+const TCP_URG = 0x20;
+
+/// Analyze packet and print debug info
+pub fn analyzePacket(data: []const u8, offset: usize) void {
+    if (data.len < offset + 20) {
+        std.debug.print("  [PACKET] Too small to be IP\n", .{});
+        return;
+    }
+
+    const vhl = data[offset];
+    const ip_hlen = (@as(usize, vhl) & 0x0F) * 4;
+    _ = std.mem.readInt(u16, data[offset + 2..][0..2], .big); // ip_len, unused
+    const proto = data[offset + 9];
+    const src_ip = std.mem.readInt(u32, data[offset + 12..][0..4], .big);
+    const dst_ip = std.mem.readInt(u32, data[offset + 16..][0..4], .big);
+
+    std.debug.print("  [PACKET] {s} -> {s}\n", .{ ip2str(src_ip), ip2str(dst_ip) });
+    std.debug.print("  [PACKET] Proto: {d}", .{proto});
+
+    switch (proto) {
+        1 => std.debug.print(" (ICMP)", .{}),
+        6 => {
+            std.debug.print(" (TCP)", .{});
+            if (data.len >= offset + ip_hlen + 14) {
+                const tcp_flags = data[offset + ip_hlen + 13];
+                std.debug.print(" Flags: 0x{X:0>2}", .{tcp_flags});
+                if (tcp_flags & TCP_SYN != 0) std.debug.print(" SYN", .{});
+                if (tcp_flags & TCP_ACK != 0) std.debug.print(" ACK", .{});
+                if (tcp_flags & TCP_FIN != 0) std.debug.print(" FIN", .{});
+                if (tcp_flags & TCP_RST != 0) std.debug.print(" RST", .{});
+                if (tcp_flags & TCP_PSH != 0) std.debug.print(" PSH", .{});
+            }
+        },
+        17 => std.debug.print(" (UDP)", .{}),
+        else => {},
+    }
+    std.debug.print("\n", .{});
+}
+
+/// Check if packet is a TCP SYN
+pub fn isTcpSyn(data: []const u8, offset: usize) bool {
+    if (data.len < offset + 20) return false;
+    const vhl = data[offset];
+    const ip_hlen = (@as(usize, vhl) & 0x0F) * 4;
+    if (data.len < offset + ip_hlen + 14) return false;
+    const tcp_flags = data[offset + ip_hlen + 13];
+    return (tcp_flags & TCP_SYN) != 0;
+}
+
+/// Check if packet is TCP SYN-ACK
+pub fn isTcpSynAck(data: []const u8, offset: usize) bool {
+    if (data.len < offset + 20) return false;
+    const vhl = data[offset];
+    const ip_hlen = (@as(usize, vhl) & 0x0F) * 4;
+    if (data.len < offset + ip_hlen + 14) return false;
+    const tcp_flags = data[offset + ip_hlen + 13];
+    return (tcp_flags & TCP_SYN) != 0 and (tcp_flags & TCP_ACK) != 0;
+}
+
+/// Get source port from TCP/UDP packet
+pub fn getSrcPort(data: []const u8, offset: usize) u16 {
+    if (data.len < offset + 4) return 0;
+    return std.mem.readInt(u16, data[offset + 0..][0..2], .big);
+}
+
+/// Get destination port from TCP/UDP packet
+pub fn getDstPort(data: []const u8, offset: usize) u16 {
+    if (data.len < offset + 4) return 0;
+    return std.mem.readInt(u16, data[offset + 2..][0..2], .big);
+}
+
+/// Print TCP connection state debug info
+pub fn printTcpInfo(data: []const u8, offset: usize) void {
+    if (data.len < offset + 20) return;
+    const vhl = data[offset];
+    const ip_hlen = (@as(usize, vhl) & 0x0F) * 4;
+
+    const src_ip = std.mem.readInt(u32, data[offset + 12..][0..4], .big);
+    const dst_ip = std.mem.readInt(u32, data[offset + 16..][0..4], .big);
+    const src_port = getSrcPort(data, offset + ip_hlen);
+    const dst_port = getDstPort(data, offset + ip_hlen);
+
+    std.debug.print("  [TCP] {s}:{} -> {s}:{}\n", .{
+        ip2str(src_ip), src_port,
+        ip2str(dst_ip), dst_port,
+    });
 }
 
 /// Route callback - application defines routing policy for transparent proxy
@@ -225,6 +436,12 @@ pub fn main() !u8 {
     std.debug.print("  Proxy:        {s}\n", .{args.proxy_addr});
     std.debug.print("  Debug:        {s}\n\n", .{if (args.debug) "yes" else "no"});
 
+    std.debug.print("=== Test Commands (run in another terminal) ===\n", .{});
+    std.debug.print("  # Test ICMP:\n", .{});
+    std.debug.print("  ping -c 3 {s}\n\n", .{args.tun_peer});
+    std.debug.print("  # Test HTTP (traffic routes through TUN -> SOCKS5):\n", .{});
+    std.debug.print("  curl -v --connect-timeout 5 http://{s}/\n\n", .{args.target_ip});
+
     // Detect egress interface
     const egress_iface_name = if (args.egress_iface.len > 0) args.egress_iface else "en0";
     const iface_name_z = try allocator.dupeZ(u8, egress_iface_name);
@@ -265,7 +482,13 @@ pub fn main() !u8 {
     std.debug.print("  FD: {}\n", .{device.getFd()});
 
     const mtu_val = device.mtu() catch 1500;
-    std.debug.print("  MTU: {d}\n\n", .{mtu_val});
+    std.debug.print("  MTU: {d}\n", .{mtu_val});
+    std.debug.print("  Local IP: {s} -> Peer: {s}\n\n", .{ args.tun_ip, args.tun_peer });
+
+    // Print interface status and traffic flow info
+    if (args.debug) {
+        printInterfaceStatus(tun_name);
+    }
 
     // Get TUN interface index
     const tun_ifindex = device.ifIndex() catch 0;
