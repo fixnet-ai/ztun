@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const checksum = @import("checksum");
+const checksum = @import("ipstack_checksum");
 
 // TCP header size constants
 pub const HDR_MIN_SIZE = 20;
@@ -185,7 +185,7 @@ pub fn buildHeader(
     flags: u8,
     window: u16,
 ) usize {
-    const header = @as(*TcpHeader, @ptrCast(buf));
+    const header = @as(*TcpHeader, @ptrCast(@alignCast(buf)));
 
     // Write ports in network byte order
     std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(&header.src_port)), src_port, .big);
@@ -230,11 +230,13 @@ pub fn buildHeaderWithChecksum(
 ) usize {
     const header_len = buildHeader(buf, src_port, dst_port, seq_num, ack_num, flags, window);
 
-    // Compute pseudo-header sum
-    const pseudo_sum = checksum.checksumPseudoIPv4(src_ip, dst_ip, 6, @as(u16, header_len) + @as(u16, payload.len));
+    // Compute pseudo-header sum - cast to u16 with bounds check
+    const payload_len_u16 = if (payload.len > std.math.maxInt(u16)) std.math.maxInt(u16) else @as(u16, @intCast(payload.len));
+    const tcp_total_len = @as(u16, @intCast(header_len)) + payload_len_u16;
+    const pseudo_sum = checksum.checksumPseudoIPv4(src_ip, dst_ip, 6, tcp_total_len);
 
     // Compute full checksum
-    const header_u16 = @as([*]const u16, @ptrCast(buf));
+    const header_u16 = @as([*]const u16, @ptrCast(@alignCast(buf)));
     var sum: u32 = pseudo_sum;
 
     var i: usize = 0;
@@ -258,9 +260,9 @@ pub fn buildHeaderWithChecksum(
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
 
-    const cs = @as(u16, @bitCast(sum));
+    const cs = @as(u16, @truncate(sum));
     // Write checksum in network byte order
-    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(&@as(*TcpHeader, @ptrCast(buf)).checksum)), ~cs, .big);
+    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(@alignCast(&@as(*TcpHeader, @ptrCast(@alignCast(buf))).checksum))), ~cs, .big);
 
     return header_len;
 }

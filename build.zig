@@ -152,12 +152,18 @@ const zig_modules = &[_]framework.ZigModule{
         .deps = &[_][]const u8{"router_route"},
     },
     .{
+        .name = "router_outbound",
+        .file = "src/router/outbound.zig",
+        .deps = &[_][]const u8{ "router_socks5", "router_route" },
+    },
+    .{
         .name = "router",
         .file = "src/router/mod.zig",
         .deps = &[_][]const u8{
             "router_route",
             "router_nat",
             "router_socks5",
+            "router_outbound",
             "ipstack",
             "monitor",
         },
@@ -216,26 +222,26 @@ pub fn build(b: *std.Build) void {
     // Build test_runner executable to bin/{os}/
     framework.buildTestRunner(b, target, optimize, config);
 
-    // Build tun2sock executable to bin/{os}/
-    const tun2sock_step = b.step("tun2sock", "Build tun2sock application");
-    const tun2sock = b.addExecutable(.{
-        .name = "tun2sock",
-        .root_source_file = b.path("src/tun2sock.zig"),
+    // Build tun2socks executable to bin/{os}/
+    const tun2socks_step = b.step("tun2socks", "Build tun2socks application");
+    const tun2socks = b.addExecutable(.{
+        .name = "tun2socks",
+        .root_source_file = b.path("src/tun2socks.zig"),
         .target = target,
         .optimize = optimize,
     });
-    tun2sock.linkLibC();
+    tun2socks.linkLibC();
     // Add C source files (route.c, network.c)
-    tun2sock.root_module.addCSourceFiles(.{
+    tun2socks.root_module.addCSourceFiles(.{
         .files = config.c_sources,
         .flags = config.cflags,
     });
-    tun2sock.root_module.addSystemIncludePath(.{ .cwd_relative = "src" });
+    tun2socks.root_module.addSystemIncludePath(.{ .cwd_relative = "src" });
     // Add Zig modules
     const all_modules = framework.createModules(b, config);
-    var tun2sock_iter = all_modules.map.iterator();
-    while (tun2sock_iter.next()) |entry| {
-        tun2sock.root_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    var tun2socks_iter = all_modules.map.iterator();
+    while (tun2socks_iter.next()) |entry| {
+        tun2socks.root_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
     }
     // Add libxev dependency and add xev module to router module
     const libxev = b.dependency("libxev", .{
@@ -246,24 +252,24 @@ pub fn build(b: *std.Build) void {
     if (all_modules.map.get("router")) |router_mod| {
         router_mod.addImport("xev", libxev.module("xev"));
     }
-    tun2sock.root_module.addImport("xev", libxev.module("xev"));
+    tun2socks.root_module.addImport("xev", libxev.module("xev"));
     // Add zinternal dependency (exports "app", "platform", "logger", etc.)
     const zinternal = b.dependency("zinternal", .{
         .target = target,
         .optimize = optimize,
     });
-    tun2sock.root_module.addImport("app", zinternal.module("app"));
-    tun2sock.root_module.addImport("platform", zinternal.module("platform"));
-    tun2sock.root_module.addImport("logger", zinternal.module("logger"));
-    tun2sock.root_module.addImport("signal", zinternal.module("signal"));
-    tun2sock.root_module.addImport("config", zinternal.module("config"));
-    tun2sock.root_module.addImport("storage", zinternal.module("storage"));
+    tun2socks.root_module.addImport("app", zinternal.module("app"));
+    tun2socks.root_module.addImport("platform", zinternal.module("platform"));
+    tun2socks.root_module.addImport("logger", zinternal.module("logger"));
+    tun2socks.root_module.addImport("signal", zinternal.module("signal"));
+    tun2socks.root_module.addImport("config", zinternal.module("config"));
+    tun2socks.root_module.addImport("storage", zinternal.module("storage"));
     // Install to bin/linux-gnu/ for cross-compiled targets
     const bin_dir = if (target.result.os.tag == .linux) "bin/linux-gnu" else "bin/macos";
-    const tun2sock_install = b.addInstallArtifact(tun2sock, .{
+    const tun2socks_install = b.addInstallArtifact(tun2socks, .{
         .dest_dir = .{ .override = .{ .custom = bin_dir } },
     });
-    tun2sock_step.dependOn(&tun2sock_install.step);
+    tun2socks_step.dependOn(&tun2socks_install.step);
 
     // Build test_http_server executable for TUN testing
     const test_http_step = b.step("test-http-server", "Build simple HTTP 200 server for testing");

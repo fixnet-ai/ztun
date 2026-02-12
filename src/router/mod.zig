@@ -897,31 +897,29 @@ pub const Router = struct {
     }
 
     /// Extract TCP payload from packet
-    /// Returns empty slice for SYN packets (which have no payload)
+    /// Uses ipstack for TCP header parsing (handles TCP options correctly)
     fn extractTcpPayload(packet: *const Packet) []const u8 {
         const ip_header_len = ((packet.data[0] & 0x0F) * 4);
-        const tcp_header_len = 20; // Standard TCP header without options
-        const payload_offset = ip_header_len + tcp_header_len;
-        if (payload_offset >= packet.data.len) {
+        const tcp_info = ipstack.tcp.parseHeader(
+            packet.data.ptr + ip_header_len,
+            packet.data.len - ip_header_len,
+        ) orelse {
             return &[_]u8{};
-        }
-        return packet.data[payload_offset..];
+        };
+        return packet.data[ip_header_len + tcp_info.header_len..];
     }
 
     /// Extract TCP sequence number from packet
-    /// Returns the sequence number from bytes 4-8 of TCP header (network byte order)
+    /// Uses ipstack for TCP header parsing
     fn extractTcpSeqNum(packet: *const Packet) u32 {
-        // IP header length in bytes (IHL * 4)
         const ip_header_len = ((packet.data[0] & 0x0F) * 4);
-        // TCP header starts after IP header
-        const tcp_offset = ip_header_len;
-        // Sequence number is at offset 4-8 in TCP header
-        // Read bytes manually
-        const b0 = packet.data[tcp_offset + 4];
-        const b1 = packet.data[tcp_offset + 5];
-        const b2 = packet.data[tcp_offset + 6];
-        const b3 = packet.data[tcp_offset + 7];
-        return (@as(u32, b0) << 24) | (@as(u32, b1) << 16) | (@as(u32, b2) << 8) | @as(u32, b3);
+        const tcp_info = ipstack.tcp.parseHeader(
+            packet.data.ptr + ip_header_len,
+            packet.data.len - ip_header_len,
+        ) orelse {
+            return 0;
+        };
+        return tcp_info.seq_num;
     }
 
     /// Forward packet with NAT translation (UDP)
@@ -1090,6 +1088,7 @@ pub const Router = struct {
 
     /// Send TCP SYN-ACK packet to complete three-way handshake
     /// Called after SOCKS5 tunnel is established
+    /// Uses ipstack for IP/TCP header construction and checksum calculation
     fn sendSynAck(router: *Router, src_ip: u32, src_port: u16, dst_ip: u32, dst_port: u16, client_seq: u32) !void {
         std.debug.print("\n[SYNACK] ============================================\n", .{});
         std.debug.print("[SYNACK] sendSynAck called at {}\n", .{std.time.nanoTimestamp()});
@@ -1097,63 +1096,42 @@ pub const Router = struct {
         std.debug.print("[SYNACK] dst_ip={s}:{} (client)\n", .{fmtIp(dst_ip), dst_port});
         std.debug.print("[SYNACK] client_seq={} ack_num={}\n", .{client_seq, client_seq + 1});
 
-        std.debug.print("[SYNACK] Building SYN-ACK packet...\n", .{});
+        std.debug.print("[SYNACK] Building SYN-ACK packet using ipstack...\n", .{});
 
-        // Build IP + TCP header
-        const ip_len: u16 = 40; // IP header (20) + TCP header (20)
-        const tcp_len: u16 = 20; // TCP header without options
+        // Build IP header using ipstack
+        const tcp_header_len = 20; // SYN packet, no options
+        const ip_offset = ipstack.ipv4.buildHeader(
+            router.write_buf[0..].ptr,
+            src_ip,
+            dst_ip,
+            6, // TCP protocol
+            tcp_header_len,
+        );
 
-        // IP header
-        const ip_offset = 0;
-        router.write_buf[ip_offset + 0] = 0x45; // Version (4) + IHL (5)
-        router.write_buf[ip_offset + 1] = 0x00; // TOS = 0
-        std.mem.writeInt(u16, router.write_buf[ip_offset + 2 .. ip_offset + 4], ip_len, .big); // Total length
-        std.mem.writeInt(u16, router.write_buf[ip_offset + 4 .. ip_offset + 6], 0x1234, .big); // ID
-        router.write_buf[ip_offset + 6] = 0x40; // Flags (DF)
-        router.write_buf[ip_offset + 7] = 0x00; // Fragment offset
-        router.write_buf[ip_offset + 8] = 64; // TTL
-        router.write_buf[ip_offset + 9] = 6; // Protocol = TCP
-        std.mem.writeInt(u16, router.write_buf[ip_offset + 10 .. ip_offset + 12], 0, .big); // Checksum (will calc)
-        std.mem.writeInt(u32, router.write_buf[ip_offset + 12 .. ip_offset + 16], src_ip, .big); // Source IP (server)
-        std.mem.writeInt(u32, router.write_buf[ip_offset + 16 .. ip_offset + 20], dst_ip, .big); // Dest IP (client)
+        std.debug.print("[SYNACK] IP header built at offset {}\n", .{ip_offset});
 
-        std.debug.print("[SYNACK] IP header built: src={s} dst={s}\n", .{fmtIp(src_ip), fmtIp(dst_ip)});
+        // Build TCP header with checksum using ipstack
+        const tcp_offset = ip_offset;
+        const tcp_len = ipstack.tcp.buildHeaderWithChecksum(
+            router.write_buf[tcp_offset..].ptr,
+            src_ip,
+            dst_ip,
+            src_port,     // Server port
+            dst_port,     // Client port
+            0,            // Server's initial sequence number (will be random in real impl)
+            client_seq + 1, // ACK number = client_seq + 1
+            0x12,         // Flags: SYN + ACK
+            65535,        // Window size
+            &[0]u8{},     // No payload for SYN-ACK
+        );
 
-        // TCP header
-        const tcp_offset = 20;
-        std.mem.writeInt(u16, router.write_buf[tcp_offset + 0 .. tcp_offset + 2], dst_port, .big); // Source port
-        std.mem.writeInt(u16, router.write_buf[tcp_offset + 2 .. tcp_offset + 4], src_port, .big); // Dest port
-        std.mem.writeInt(u32, router.write_buf[tcp_offset + 4 .. tcp_offset + 8], 0, .big); // Seq number (server's initial)
-        std.mem.writeInt(u32, router.write_buf[tcp_offset + 8 .. tcp_offset + 12], client_seq + 1, .big); // Ack number
-        router.write_buf[tcp_offset + 12] = 0x50; // Data offset (5 * 4 = 20) + Reserved
-        router.write_buf[tcp_offset + 13] = 0x12; // Flags: SYN + ACK (0x12)
-        std.mem.writeInt(u16, router.write_buf[tcp_offset + 14 .. tcp_offset + 16], 65535, .big); // Window
-        std.mem.writeInt(u16, router.write_buf[tcp_offset + 16 .. tcp_offset + 18], 0, .big); // Checksum
-        std.mem.writeInt(u16, router.write_buf[tcp_offset + 18 .. tcp_offset + 20], 0, .big); // Urgent pointer
+        std.debug.print("[SYNACK] TCP header built at offset {}, len={}\n", .{tcp_offset, tcp_len});
 
-        std.debug.print("[SYNACK] TCP header built: SYN+ACK flags=0x12\n", .{});
+        const total_len = ip_offset + tcp_len;
+        std.debug.print("[SYNACK] Total packet length: {}\n", .{total_len});
 
-        // Calculate IP checksum using ipstack.checksum
-        const ip_checksum = ipstack.checksum.checksum(router.write_buf[0..20], 0);
-        std.mem.writeInt(u16, router.write_buf[10 .. 12], ip_checksum, .big);
-        std.debug.print("[SYNACK] IP checksum: {x:0>4}\n", .{ip_checksum});
-
-        // Calculate TCP checksum (requires pseudo-header)
-        var tcp_sum: u32 = 0;
-        // Pseudo-header
-        tcp_sum += (src_ip >> 16) & 0xFFFF;
-        tcp_sum += src_ip & 0xFFFF;
-        tcp_sum += (dst_ip >> 16) & 0xFFFF;
-        tcp_sum += dst_ip & 0xFFFF;
-        tcp_sum += 6; // TCP protocol
-        tcp_sum += @as(u32, @intCast(tcp_len));
-        // TCP header
-        const tcp_sum_final = ipstack.checksum.checksum(router.write_buf[tcp_offset..tcp_offset + 20], tcp_sum);
-        std.mem.writeInt(u16, router.write_buf[tcp_offset + 16 .. tcp_offset + 18], tcp_sum_final, .big);
-        std.debug.print("[SYNACK] TCP checksum: {x:0>4}\n", .{tcp_sum_final});
-
-        std.debug.print("[SYNACK] Writing {} bytes to TUN...\n", .{ip_len});
-        try router.writeToTunBuf(router.write_buf[0..ip_len]);
+        std.debug.print("[SYNACK] Writing {} bytes to TUN...\n", .{total_len});
+        try router.writeToTunBuf(router.write_buf[0..total_len]);
         std.debug.print("[SYNACK] SYN-ACK sent successfully!\n", .{});
         std.debug.print("[SYNACK-EXIT] ============================================\n\n", .{});
     }
@@ -1227,6 +1205,7 @@ pub const Router = struct {
     }
 
     /// Send HTTP 200 data response (PSH+ACK with payload)
+    /// Uses ipstack for IP/TCP header construction
     fn sendMockDataResponse(router: *Router, src_ip: u32, src_port: u16, dst_ip: u32, dst_port: u16, seq_num: u32) !void {
         // HTTP 200 response body
         const http_body = "Hello World!\r\n";
@@ -1238,55 +1217,34 @@ pub const Router = struct {
             "\r\n" ++
             http_body;
 
-        // Calculate lengths
         const tcp_header_len = 20;
-        const ip_header_len = 20;
         const payload_len = http_response.len;
-        const total_len = ip_header_len + tcp_header_len + payload_len;
 
-        // Build IP header
-        router.write_buf[0] = 0x45; // Version (4) + IHL (5)
-        router.write_buf[1] = 0x00; // TOS = 0
-        std.mem.writeInt(u16, router.write_buf[2..4], @as(u16, @intCast(total_len)), .big);
-        std.mem.writeInt(u16, router.write_buf[4..6], 0x1234, .big); // ID
-        router.write_buf[6] = 0x40; // Flags (DF)
-        router.write_buf[7] = 0x00; // Fragment offset
-        router.write_buf[8] = 64; // TTL
-        router.write_buf[9] = 6; // Protocol = TCP
-        std.mem.writeInt(u16, router.write_buf[10..12], 0, .big); // Checksum
-        std.mem.writeInt(u32, router.write_buf[12..16], src_ip, .big); // Source IP
-        std.mem.writeInt(u32, router.write_buf[16..20], dst_ip, .big); // Dest IP
+        // Build IP header using ipstack
+        const ip_offset = ipstack.ipv4.buildHeader(
+            router.write_buf[0..].ptr,
+            src_ip,
+            dst_ip,
+            6, // TCP protocol
+            tcp_header_len + payload_len,
+        );
 
-        // Build TCP header
-        const tcp_offset = 20;
-        std.mem.writeInt(u16, router.write_buf[tcp_offset + 0 .. tcp_offset + 2], dst_port, .big); // Source port
-        std.mem.writeInt(u16, router.write_buf[tcp_offset + 2 .. tcp_offset + 4], src_port, .big); // Dest port
-        std.mem.writeInt(u32, router.write_buf[tcp_offset + 4 .. tcp_offset + 8], 0, .big); // Seq number (server's initial)
-        std.mem.writeInt(u32, router.write_buf[tcp_offset + 8 .. tcp_offset + 12], seq_num, .big); // Ack number
-        router.write_buf[tcp_offset + 12] = 0x50; // Data offset
-        router.write_buf[tcp_offset + 13] = 0x18; // Flags: PSH + ACK (0x18)
-        std.mem.writeInt(u16, router.write_buf[tcp_offset + 14 .. tcp_offset + 16], 65535, .big); // Window
-        std.mem.writeInt(u16, router.write_buf[tcp_offset + 16 .. tcp_offset + 18], 0, .big); // Checksum
-        std.mem.writeInt(u16, router.write_buf[tcp_offset + 18 .. tcp_offset + 20], 0, .big); // Urgent
+        // Build TCP header with checksum using ipstack
+        const tcp_offset = ip_offset;
+        const tcp_len = ipstack.tcp.buildHeaderWithChecksum(
+            router.write_buf[tcp_offset..].ptr,
+            src_ip,
+            dst_ip,
+            src_port,  // Server port
+            dst_port,  // Client port
+            0,         // Server's initial sequence number
+            seq_num,   // ACK number
+            0x18,      // Flags: PSH + ACK
+            65535,     // Window size
+            http_response,
+        );
 
-        // Copy HTTP response to payload position
-        @memcpy(router.write_buf[tcp_offset + tcp_header_len..][0..payload_len], http_response);
-
-        // Calculate IP checksum
-        const ip_checksum = ipstack.checksum.checksum(router.write_buf[0..20], 0);
-        std.mem.writeInt(u16, router.write_buf[10..12], ip_checksum, .big);
-
-        // Calculate TCP checksum
-        const tcp_len = tcp_header_len + payload_len;
-        var tcp_sum: u32 = 0;
-        tcp_sum += (src_ip >> 16) & 0xFFFF;
-        tcp_sum += src_ip & 0xFFFF;
-        tcp_sum += (dst_ip >> 16) & 0xFFFF;
-        tcp_sum += dst_ip & 0xFFFF;
-        tcp_sum += 6; // TCP protocol
-        tcp_sum += @as(u32, @intCast(tcp_len));
-        const tcp_sum_final = ipstack.checksum.checksum(router.write_buf[tcp_offset..tcp_offset + tcp_header_len + payload_len], tcp_sum);
-        std.mem.writeInt(u16, router.write_buf[tcp_offset + 16 .. tcp_offset + 18], tcp_sum_final, .big);
+        const total_len = ip_offset + tcp_len;
 
         std.debug.print("[MOCK-DATA] Sending HTTP 200 ({} bytes)...\n", .{total_len});
         try router.writeToTunBuf(router.write_buf[0..total_len]);
@@ -1485,45 +1443,45 @@ pub const Router = struct {
     }
 
     /// Parse IP packet and extract 4-tuple
-    fn parsePacket(_: *Router, data: []const u8) !Packet {
-        // Parse IPv4 header (minimum 20 bytes)
-        if (data.len < 20) return error.PacketTooSmall;
-
-        const ver_ihl = data[0];
-        const version = ver_ihl >> 4;
-        const ihl = ver_ihl & 0x0F;
-
-        if (version != 4) return error.NotIPv4;
-        if (ihl < 5) return error.InvalidIhl;
-
-        const header_len = @as(usize, ihl) * 4;
-        if (data.len < header_len) return error.PacketTooSmall;
-
-        const protocol = data[9];
-
-        const src_ip = std.mem.readInt(u32, data[12..16], .big);
-        const dst_ip = std.mem.readInt(u32, data[16..20], .big);
+    /// Uses ipstack for protocol parsing
+    fn parsePacket(router: *Router, data: []const u8) !Packet {
+        _ = router; // Reserved for future use (e.g., accessing config)
+        // Use ipstack's IPv4 header parser
+        const ip_info = ipstack.ipv4.parseHeader(data.ptr, data.len) orelse {
+            return error.InvalidPacket;
+        };
 
         var src_port: u16 = 0;
         var dst_port: u16 = 0;
 
-        // Parse transport layer header for TCP/UDP
-        if (protocol == 6 or protocol == 17) {
-            if (data.len < header_len + 4) return error.PacketTooSmall;
-            const src_port_bytes = data[header_len..header_len + 2];
-            const dst_port_bytes = data[header_len + 2..header_len + 4];
-            src_port = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(src_port_bytes.ptr)), .big);
-            dst_port = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(dst_port_bytes.ptr)), .big);
+        // Parse transport layer header for TCP/UDP using ipstack
+        if (ip_info.protocol == 6) { // TCP
+            const tcp_info = ipstack.tcp.parseHeader(
+                data.ptr + ip_info.header_len,
+                ip_info.payload_len,
+            ) orelse {
+                return error.InvalidPacket;
+            };
+            src_port = tcp_info.src_port;
+            dst_port = tcp_info.dst_port;
+        } else if (ip_info.protocol == 17) { // UDP
+            const udp_info = ipstack.udp.parseHeader(
+                data.ptr + ip_info.header_len,
+                ip_info.payload_len,
+            ) orelse {
+                return error.InvalidPacket;
+            };
+            src_port = udp_info.src_port;
+            dst_port = udp_info.dst_port;
         }
 
-        // Return packet info - data is already in our buffer
         return Packet{
             .data = data,
-            .src_ip = src_ip,
+            .src_ip = ip_info.src_ip,
             .src_port = src_port,
-            .dst_ip = dst_ip,
+            .dst_ip = ip_info.dst_ip,
             .dst_port = dst_port,
-            .protocol = protocol,
+            .protocol = ip_info.protocol,
         };
     }
 };

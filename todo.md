@@ -7,6 +7,52 @@
 
 ## Current Tasks
 
+### Phase 8: Outbound Abstraction + ipstack Integration (COMPLETED)
+
+**Date**: 2026-02-13
+
+**Goal**: Refactor Router to use ipstack for protocol parsing and add Outbound abstraction layer
+
+**Problem Identified**:
+- Router manually implements IP/TCP/UDP parsing (~150 lines of duplicate code)
+- ipstack module already has `ipv4.parseHeader()`, `tcp.parseHeader()`, etc. but was unused
+- Need Outbound abstraction for SOCKS5/Direct support (like sing-box)
+
+**Architecture**:
+```
+TUN → Router → Outbound (interface) → SOCKS5/Direct (impl) → ipstack (protocol)
+```
+
+**Changes**:
+- [x] Created `src/router/outbound.zig` - Outbound interface with SOCKS5/Direct implementations
+- [x] Updated `src/router/mod.zig` to use ipstack for protocol parsing:
+  - `parsePacket()` → `ipstack.ipv4.parseHeader()` + `ipstack.tcp.parseHeader()` + `ipstack.udp.parseHeader()`
+  - `extractTcpPayload()` → `ipstack.tcp.parseHeader()`
+  - `extractTcpSeqNum()` → `ipstack.tcp.parseHeader()`
+  - `sendSynAck()` → `ipstack.ipv4.buildHeader()` + `ipstack.tcp.buildHeaderWithChecksum()`
+  - `sendMockDataResponse()` → `ipstack.ipv4.buildHeader()` + `ipstack.tcp.buildHeaderWithChecksum()`
+- [x] Updated `build.zig` to add router_outbound module
+- [x] Compilation and tests pass
+
+**Files Created**:
+| File | Description |
+|------|-------------|
+| `src/router/outbound.zig` | Outbound abstraction (SOCKS5 + Direct) |
+
+**Files Modified**:
+| File | Changes |
+|------|---------|
+| `src/router/mod.zig` | Use ipstack for protocol parsing |
+| `build.zig` | Added router_outbound module |
+
+**Verification**:
+```
+zig build  # SUCCESS
+zig build test  # All tests passed
+```
+
+---
+
 ### Phase 7.13: Network Monitor Bug Fixes (COMPLETED)
 
 **Date**: 2026-02-13
