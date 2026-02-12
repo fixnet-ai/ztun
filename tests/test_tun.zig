@@ -789,6 +789,27 @@ pub fn process_packet(n: isize) !isize {
 }
 
 // =============================================================================
+// TEST SCENARIOS
+// =============================================================================
+//
+// SCENARIO 1: Basic ICMP Test (this file)
+//   Build:   zig build-exe tests/test_tun.zig -lc -I. --name test_tun
+//   Run:     sudo ./test_tun
+//   Test:    ping -c 3 10.0.0.2
+//   Result:  ICMP echo replies sent back through TUN
+//
+// SCENARIO 2: Full SOCKS5 Proxy Test (tun2sock binary)
+//   Build:   zig build tun2sock
+//   Run:     sudo ./zig-out/bin/macos/tun2sock --tun-ip 10.0.0.1 --proxy 127.0.0.1:1080
+//   Route:   sudo route add -net 111.45.11.5/32 10.0.0.1
+//   Test:    curl -v http://111.45.11.5/ (NO --proxy flag needed!)
+//   Result:  Traffic routes through TUN -> SOCKS5 proxy automatically
+//
+// Note: For Scenario 2, a SOCKS5 proxy must be running at 127.0.0.1:1080.
+//       The routing table directs traffic to the TUN device, and tun2sock
+//       forwards it to the SOCKS5 proxy without requiring --proxy in curl.
+//
+// =============================================================================
 // MAIN
 // =============================================================================
 
