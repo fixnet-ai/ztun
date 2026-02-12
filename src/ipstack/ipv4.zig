@@ -116,27 +116,36 @@ pub const PacketInfo = struct {
 pub fn parseHeader(data: [*]const u8, len: usize) ?PacketInfo {
     if (len < HDR_MIN_SIZE) return null;
 
-    const header = @as(*const Ipv4Header, @ptrCast(@alignCast(data)));
+    // Read version and IHL directly from bytes (offset 0)
+    // Version is upper 4 bits, IHL is lower 4 bits
+    const ver_ihl = data[0];
+    const version = ver_ihl >> 4;
+    const ihl = ver_ihl & 0x0F;
 
-    // Validate version
-    if (getVersion(header) != 4) return null;
+    // Validate version (must be 4 for IPv4)
+    if (version != 4) return null;
 
-    const ihl = getIHL(header);
-    if (ihl < 5) return null;  // Minimum IHL is 5 (20 bytes)
+    // Minimum IHL is 5 (20 bytes)
+    if (ihl < 5) return null;
 
     const hdr_size = @as(usize, ihl) * 4;
     if (len < hdr_size) return null;
     if (hdr_size > HDR_MAX_SIZE) return null;
 
-    // Validate total length (network byte order -> big-endian)
-    const total_len = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(&header.total_len)), .big);
+    // Read total length from bytes 2-3 (network byte order -> big-endian)
+    const total_len = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(data[2..4].ptr)), .big);
     if (total_len < hdr_size or @as(usize, total_len) > len) return null;
 
-    // Check if this is a fragment
-    const flags = getFlags(header);
-    const offset = getFragmentOffset(header);
-    const is_fragment = offset != 0 or (flags == 0x02);  // 0x02 = FRAG_MORE bit in extracted 3-bit flags
-    const is_first_fragment = (offset == 0);
+    // Read flags and fragment offset from bytes 6-7
+    const flags_offset = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(data[6..8].ptr)), .big);
+    const flags = @as(u8, @truncate(flags_offset >> 13));
+    const fragment_offset = flags_offset & 0x1FFF;
+
+    const is_fragment = fragment_offset != 0 or (flags == 0x02);
+    const is_first_fragment = (fragment_offset == 0);
+
+    // Read protocol from byte 9
+    const protocol = data[9];
 
     // Read IP addresses from raw packet data (network byte order)
     const src_ip = std.mem.readInt(u32, data[12..16], .big);
@@ -145,7 +154,7 @@ pub fn parseHeader(data: [*]const u8, len: usize) ?PacketInfo {
     return PacketInfo{
         .src_ip = src_ip,
         .dst_ip = dst_ip,
-        .protocol = header.protocol,
+        .protocol = protocol,
         .total_len = @as(usize, total_len),
         .header_len = hdr_size,
         .payload_len = @as(usize, total_len) - hdr_size,
@@ -168,49 +177,55 @@ pub fn buildHeader(
     protocol: u8,
     payload_len: usize,
 ) usize {
-    const header = @as(*Ipv4Header, @ptrCast(@alignCast(buf)));
+    // Use direct byte access to avoid alignment issues
 
-    // Version (4) and IHL (5 = 20 bytes)
-    header.ver_ihl = (4 << 4) | 5;
+    // Byte 0: Version (4) and IHL (5 = 20 bytes)
+    buf[0] = (4 << 4) | 5;
 
-    // Type of Service (default 0)
-    header.tos = 0;
+    // Byte 1: Type of Service (default 0)
+    buf[1] = 0;
 
-    // Total length = header + payload (write in network byte order)
+    // Bytes 2-3: Total length = header + payload (network byte order)
     const total_len = HDR_MIN_SIZE + payload_len;
-    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(&header.total_len)), @as(u16, @intCast(total_len)), .big);
+    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(buf[2..4].ptr)), @as(u16, @intCast(total_len)), .big);
 
-    // Identification (for fragmentation)
-    header.identification = 0;
+    // Bytes 4-5: Identification (for fragmentation)
+    buf[4] = 0;
+    buf[5] = 0;
 
-    // Flags and fragment offset (no fragmentation)
-    header.flags_frag = FRAG_DONT;
+    // Bytes 6-7: Flags and fragment offset (no fragmentation = 0x4000)
+    buf[6] = 0x40;
+    buf[7] = 0;
 
-    // Time to Live
-    header.ttl = 64;
+    // Byte 8: Time to Live
+    buf[8] = 64;
 
-    // Protocol
-    header.protocol = protocol;
+    // Byte 9: Protocol
+    buf[9] = protocol;
 
-    // Checksum (will be filled by caller)
-    header.checksum = 0;
+    // Bytes 10-11: Checksum (will be filled by caller)
+    buf[10] = 0;
+    buf[11] = 0;
 
-    // Source and destination addresses
-    header.src_addr = src_ip;
-    header.dst_addr = dst_ip;
+    // Bytes 12-15: Source IP (network byte order)
+    std.mem.writeInt(u32, buf[12..16], src_ip, .big);
+
+    // Bytes 16-19: Destination IP (network byte order)
+    std.mem.writeInt(u32, buf[16..20], dst_ip, .big);
 
     return HDR_MIN_SIZE;
 }
 
 /// Calculate and set header checksum
 pub fn setChecksum(buf: [*]u8, ihl: u4) void {
-    const header = @as(*Ipv4Header, @ptrCast(@alignCast(buf)));
-    header.checksum = 0;
+    // Zero checksum field first
+    buf[10] = 0;
+    buf[11] = 0;
 
     const hdr_size = @as(usize, ihl) * 4;
-    const cs = checksum(buf, hdr_size);
+    const cs = checksum(buf[0..hdr_size].ptr, hdr_size);
     // Write checksum in network byte order
-    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(&header.checksum)), cs, .big);
+    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(buf[10..12].ptr)), cs, .big);
 }
 
 /// Build IPv4 header with checksum

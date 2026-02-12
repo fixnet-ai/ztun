@@ -144,26 +144,40 @@ pub const PacketInfo = struct {
 pub fn parseHeader(data: [*]const u8, len: usize) ?PacketInfo {
     if (len < HDR_MIN_SIZE) return null;
 
-    const header = @as(*const TcpHeader, @ptrCast(@alignCast(data)));
-    const hdr_len = headerSize(header);
+    // Use direct byte access to avoid alignment issues
+    // TCP header offsets from data pointer:
+    //   0-1: src_port
+    //   2-3: dst_port
+    //   4-7: seq_num
+    //   8-11: ack_num
+    //   12-13: flags_len (flags in upper 6 bits)
+    const hdr_len = @as(usize, data[12] & 0xF0) >> 2; // Lower 4 bits * 4 = header size
     if (len < hdr_len) return null;
+    if (hdr_len < HDR_MIN_SIZE) return null;
 
     // Read ports in network byte order
-    const src_port = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(&header.src_port)), .big);
-    const dst_port = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(&header.dst_port)), .big);
+    const src_port = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(data[0..2].ptr)), .big);
+    const dst_port = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(data[2..4].ptr)), .big);
+
+    // Read seq/ack numbers (network byte order)
+    const seq_num = std.mem.readInt(u32, data[4..8], .big);
+    const ack_num = std.mem.readInt(u32, data[8..12], .big);
+
+    // Read flags (upper 6 bits of bytes 12-13)
+    const flags = data[13];
 
     return PacketInfo{
         .src_port = src_port,
         .dst_port = dst_port,
-        .seq_num = header.seq_num, // u32, already in network order when reading from packet
-        .ack_num = header.ack_num,
-        .flags = getFlags(header),
+        .seq_num = seq_num,
+        .ack_num = ack_num,
+        .flags = flags,
         .header_len = hdr_len,
         .payload_len = len - hdr_len,
-        .is_syn = isSyn(header),
-        .is_ack = isAck(header),
-        .is_fin = isFin(header),
-        .is_rst = isRst(header),
+        .is_syn = (flags & FLAG_SYN) != 0,
+        .is_ack = (flags & FLAG_ACK) != 0,
+        .is_fin = (flags & FLAG_FIN) != 0,
+        .is_rst = (flags & FLAG_RST) != 0,
     };
 }
 
@@ -185,21 +199,36 @@ pub fn buildHeader(
     flags: u8,
     window: u16,
 ) usize {
-    const header = @as(*TcpHeader, @ptrCast(@alignCast(buf)));
+    // Use direct byte access to avoid alignment issues
 
-    // Write ports in network byte order
-    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(&header.src_port)), src_port, .big);
-    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(&header.dst_port)), dst_port, .big);
+    // Bytes 0-1: Source port (network byte order)
+    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(buf[0..2].ptr)), src_port, .big);
 
-    header.seq_num = seq_num;
-    header.ack_num = ack_num;
+    // Bytes 2-3: Destination port (network byte order)
+    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(buf[2..4].ptr)), dst_port, .big);
 
-    // Data offset (5 = 20 bytes) and flags
-    header.flags_len = (@as(u16, 5) << 12) | flags;
+    // Bytes 4-7: Sequence number (network byte order)
+    std.mem.writeInt(u32, buf[4..8], seq_num, .big);
 
-    header.window = window;
-    header.checksum = 0;
-    header.urgent_ptr = 0;
+    // Bytes 8-11: Acknowledgment number (network byte order)
+    std.mem.writeInt(u32, buf[8..12], ack_num, .big);
+
+    // Bytes 12-13: Data offset (5 = 20 bytes) and flags
+    // Byte 12: offset high nibble + flags low bits
+    // Byte 13: rest of flags
+    buf[12] = 0x50; // 5 << 4 = 0x50
+    buf[13] = flags;
+
+    // Bytes 14-15: Window size (network byte order)
+    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(buf[14..16].ptr)), window, .big);
+
+    // Bytes 16-17: Checksum (will be filled by caller)
+    buf[16] = 0;
+    buf[17] = 0;
+
+    // Bytes 18-19: Urgent pointer
+    buf[18] = 0;
+    buf[19] = 0;
 
     return HDR_MIN_SIZE;
 }
@@ -235,13 +264,14 @@ pub fn buildHeaderWithChecksum(
     const tcp_total_len = @as(u16, @intCast(header_len)) + payload_len_u16;
     const pseudo_sum = checksum.checksumPseudoIPv4(src_ip, dst_ip, 6, tcp_total_len);
 
-    // Compute full checksum
-    const header_u16 = @as([*]const u16, @ptrCast(@alignCast(buf)));
+    // Compute full checksum using byte-level access
     var sum: u32 = pseudo_sum;
 
+    // Add TCP header (20 bytes = 10 x 16-bit words)
     var i: usize = 0;
-    while (i < header_len / 2) : (i += 1) {
-        sum += header_u16[i];
+    while (i < 10) : (i += 1) {
+        const val = @as(u16, buf[i * 2]) | (@as(u16, buf[i * 2 + 1]) << 8);
+        sum += val;
     }
 
     // Add payload
@@ -261,8 +291,8 @@ pub fn buildHeaderWithChecksum(
     }
 
     const cs = @as(u16, @truncate(sum));
-    // Write checksum in network byte order
-    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(@alignCast(&@as(*TcpHeader, @ptrCast(@alignCast(buf))).checksum))), ~cs, .big);
+    // Write checksum in network byte order (bytes 16-17)
+    std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(buf[16..18].ptr)), ~cs, .big);
 
     return header_len;
 }

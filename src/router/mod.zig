@@ -375,18 +375,29 @@ pub const Router = struct {
             }
 
             // Add macOS utun header if needed (4-byte AF_INET header)
+            // macOS format: bytes 0-3 = AF_INET family in LITTLE-ENDIAN (from tcpdump observation)
             if (header_len > 0) {
-                // AF_INET = 2, followed by 3 zero bytes
+                // AF_INET = 2 in little-endian format (02 00 00 00)
                 router.write_buf[0] = 2;
                 router.write_buf[1] = 0;
                 router.write_buf[2] = 0;
                 router.write_buf[3] = 0;
 
-                // Only copy if data is not already in the right place (avoid aliasing)
-                if (data.ptr != &router.write_buf) {
-                    @memcpy(router.write_buf[header_len..total_len], data);
-                }
+                // Debug: dump first 4 bytes of data being copied
+                std.debug.print("[TUN-WRITE-DBG] data[0..4] before copy: {x:0>2} {x:0>2} {x:0>2} {x:0>2}\n",
+                    .{ data[0], data[1], data[2], data[3] });
             }
+
+            // Always copy data to write_buf if not already there (avoid aliasing)
+            if (data.ptr != &router.write_buf) {
+                @memcpy(router.write_buf[header_len..total_len], data);
+            }
+
+            // Debug: verify copied data
+            std.debug.print("[TUN-WRITE-DBG] write_buf[{}..{}] after copy: {x:0>2} {x:0>2} {x:0>2} {x:0>2}\n",
+                .{ header_len, header_len + 4,
+                   router.write_buf[header_len], router.write_buf[header_len + 1],
+                   router.write_buf[header_len + 2], router.write_buf[header_len + 3] });
 
             // Debug: dump what we're writing
             std.debug.print("[TUN-WRITE] writing ", .{});
@@ -404,6 +415,12 @@ pub const Router = struct {
             }
             std.debug.print("[TUN-WRITE] wrote {} bytes (expected {})\n", .{ bytes_written, total_len });
             router._stats.bytes_tx += bytes_written;
+
+            // Final verification: dump first 12 bytes of what was written
+            std.debug.print("[TUN-WRITE-DBG] final verify: {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2}\n",
+                .{ router.write_buf[0], router.write_buf[1], router.write_buf[2], router.write_buf[3],
+                   router.write_buf[4], router.write_buf[5], router.write_buf[6], router.write_buf[7],
+                   router.write_buf[8], router.write_buf[9], router.write_buf[10], router.write_buf[11] });
         }
     }
 
@@ -659,14 +676,6 @@ pub const Router = struct {
 
     /// Forward packet based on route decision
     fn forwardPacket(router: *Router, packet: *const Packet) !void {
-        std.debug.print("\n[FORWARD] ============================================\n", .{});
-        std.debug.print("[FORWARD] forwardPacket called at {}\n", .{std.time.nanoTimestamp()});
-        std.debug.print("[FORWARD] Packet: {s}:{} -> {s}:{} proto={}\n", .{
-            fmtIp(packet.src_ip), packet.src_port,
-            fmtIp(packet.dst_ip), packet.dst_port,
-            packet.protocol });
-        std.debug.print("[FORWARD] Packet data len: {}\n", .{packet.data.len});
-
         const decision = router.config.route_cb(
             packet.src_ip,
             packet.src_port,
@@ -675,47 +684,41 @@ pub const Router = struct {
             packet.protocol,
         );
 
-        std.debug.print("[FORWARD] Route decision: {s}\n", .{@tagName(decision)});
-        std.debug.print("[FORWARD] SOCKS5 conn available: {}\n", .{router.socks5_conn != null});
-
         switch (decision) {
             .Direct => {
-                std.debug.print("[FORWARD] Action: forwardToEgress (Direct)\n", .{});
+                std.debug.print("[FWD] Direct: {s}:{} -> {s}:{}\n", .{
+                    fmtIp(packet.src_ip), packet.src_port,
+                    fmtIp(packet.dst_ip), packet.dst_port });
                 try router.forwardToEgress(packet);
                 router._stats.packets_forwarded += 1;
             },
             .Socks5 => {
-                std.debug.print("[FORWARD] Action: forwardToProxy (Socks5)\n", .{});
-                // Check if mock mode is enabled
+                std.debug.print("[FWD] Socks5: {s}:{} -> {s}:{}\n", .{
+                    fmtIp(packet.src_ip), packet.src_port,
+                    fmtIp(packet.dst_ip), packet.dst_port });
                 if (router.config.mock_enabled) {
-                    std.debug.print("[FORWARD] Mock mode enabled\n", .{});
                     try router.handleMockHttp(packet);
-                    router._stats.packets_forwarded += 1;
                 } else {
                     try router.forwardToProxy(packet);
-                    router._stats.packets_forwarded += 1;
                 }
+                router._stats.packets_forwarded += 1;
             },
             .Drop => {
-                std.debug.print("[FORWARD] Action: Drop packet\n", .{});
                 router._stats.packets_dropped += 1;
             },
             .Local => {
-                std.debug.print("[FORWARD] Action: writeToTun (Local)\n", .{});
+                std.debug.print("[FWD] Local: {s}:{} -> {s}:{}\n", .{
+                    fmtIp(packet.src_ip), packet.src_port,
+                    fmtIp(packet.dst_ip), packet.dst_port });
                 try router.writeToTun(packet);
                 router._stats.packets_forwarded += 1;
             },
             .Nat => {
-                std.debug.print("[FORWARD] Action: forwardWithNat (Nat)\n", .{});
                 try router.forwardWithNat(packet);
                 router._stats.packets_forwarded += 1;
             },
-            else => {
-                std.debug.print("[FORWARD-WARN] Unhandled decision: {s}\n", .{@tagName(decision)});
-            },
+            else => {},
         }
-        std.debug.print("[FORWARD] forwardPacket complete\n", .{});
-        std.debug.print("[FORWARD-EXIT] ============================================\n\n", .{});
     }
 
     /// Forward packet through SOCKS5 proxy (TCP)
@@ -1398,13 +1401,19 @@ pub const Router = struct {
 
         var sum: u32 = 0;
 
-        // Add pseudo-header: source IP
-        sum += src_ip >> 16;
-        sum += src_ip & 0xFFFF;
+        // Use the REPLY IPs (already swapped in icmp_buf) for pseudo-header
+        // icmp_buf[12..16] = reply source IP (original dst_ip = 10.0.0.2)
+        // icmp_buf[16..20] = reply destination IP (original src_ip = 10.0.0.1)
+        const reply_src_ip = std.mem.readInt(u32, router.icmp_buf[12..16], .big);
+        const reply_dst_ip = std.mem.readInt(u32, router.icmp_buf[16..20], .big);
 
-        // Pseudo-header: destination IP
-        sum += dst_ip >> 16;
-        sum += dst_ip & 0xFFFF;
+        // Add pseudo-header: source IP (reply source)
+        sum += reply_src_ip >> 16;
+        sum += reply_src_ip & 0xFFFF;
+
+        // Pseudo-header: destination IP (reply destination)
+        sum += reply_dst_ip >> 16;
+        sum += reply_dst_ip & 0xFFFF;
 
         // Pseudo-header: zero + protocol (1 = ICMP)
         sum += 1;
@@ -1520,6 +1529,7 @@ fn onTunReadable(
     router._stats.bytes_rx += n;
 
     // Check for macOS utun 4-byte AF_INET header
+    // macOS format: bytes 0-3 = 00 00 00 02 (AF_INET=2 at byte 3 in network byte order)
     var packet_offset: usize = 0;
     if (n >= 4 and router.packet_buf[3] == 2) {
         std.debug.print("[TUN-CB] UTUN header detected (AF_INET=2), skipping 4 bytes\n", .{});
@@ -1537,8 +1547,24 @@ fn onTunReadable(
     const src_ip = std.mem.readInt(u32, router.packet_buf[packet_offset + 12..][0..4], .big);
     const dst_ip = std.mem.readInt(u32, router.packet_buf[packet_offset + 16..][0..4], .big);
 
-    std.debug.print("[TUN-CB] Packet: {s}:{} -> {s}:{} proto={}\n", .{
-        fmtIp(src_ip), 0, fmtIp(dst_ip), 0, proto_byte });
+    std.debug.print("[TUN-CB] Packet: {s} -> {s} proto={}\n", .{
+        fmtIp(src_ip), fmtIp(dst_ip), proto_byte });
+
+    // Check for ICMP echo request (protocol=1, type=8)
+    if (proto_byte == 1) {
+        const ip_header_len = (@as(usize, router.packet_buf[packet_offset]) & 0x0F) * 4;
+        if (n - packet_offset >= ip_header_len + 8) {
+            const icmp_type = router.packet_buf[packet_offset + ip_header_len];
+            if (icmp_type == 8) {
+                std.debug.print("[TUN-CB] ICMP echo request detected, sending reply\n", .{});
+                router.handleIcmpEcho(packet_offset, n, ip_header_len) catch {
+                    std.debug.print("[TUN-CB-ERROR] handleIcmpEcho failed\n", .{});
+                };
+                router.submitTunRead();
+                return .disarm;
+            }
+        }
+    }
 
     // Parse and forward packet
     const raw_data = router.packet_buf[packet_offset..n];
@@ -1556,7 +1582,6 @@ fn onTunReadable(
         fmtIp(packet.dst_ip), packet.dst_port,
         packet.protocol });
 
-    std.debug.print("[TUN-CB] Calling forwardPacket...\n", .{});
     router.forwardPacket(&packet) catch |err| {
         std.debug.print("[TUN-CB-ERROR] forwardPacket failed: {}\n", .{err});
     };
