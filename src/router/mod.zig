@@ -63,11 +63,15 @@ const xev = @import("xev");
 
 // Socket constants
 const AF_INET = 2;   // IPv4
+const AF_ROUTE = 32; // BSD Routing socket (macOS)
 const SOCK_STREAM = 1;
 const SOCK_DGRAM = 2;
+const SOCK_RAW = 3;
 const SOL_SOCKET = 0xffff;
 const SO_REUSEADDR = 0x0004;
 const O_NONBLOCK = 0x4000; // Non-blocking socket
+const F_GETFL = 3;
+const F_SETFL = 4;
 
 /// sockaddr_in for IPv4 (macOS/Linux compatible)
 const sockaddr_in = extern struct {
@@ -187,6 +191,25 @@ pub const Packet = struct {
     protocol: u8,
 };
 
+/// Network change callback interface
+/// Used for monitoring network interface changes, suspend/resume events
+pub const NetworkListener = struct {
+    /// Called when default interface changes
+    onDefaultInterfaceChanged: ?*const fn (userdata: ?*anyopaque, interface_name: []const u8, interface_index: u32) void = null,
+
+    /// Called when network becomes unavailable (no default interface)
+    onNetworkPaused: ?*const fn (userdata: ?*anyopaque) void = null,
+
+    /// Called when network resumes (after being paused)
+    onNetworkResumed: ?*const fn (userdata: ?*anyopaque) void = null,
+
+    /// Called when routes change (address added/removed)
+    onRoutesChanged: ?*const fn (userdata: ?*anyopaque) void = null,
+
+    /// User-provided context
+    userdata: ?*anyopaque = null,
+};
+
 /// Router statistics
 pub const RouterStats = struct {
     tcp_connections: u64 = 0,
@@ -195,6 +218,8 @@ pub const RouterStats = struct {
     packets_dropped: u64 = 0,
     bytes_rx: u64 = 0,
     bytes_tx: u64 = 0,
+    network_changes: u64 = 0,
+    route_updates: u64 = 0,
 };
 
 /// Router configuration
@@ -271,6 +296,9 @@ pub const Router = struct {
     /// libxev completion for UDP socket
     udp_completion: xev.Completion,
 
+    /// libxev completion for routing socket
+    routing_completion: xev.Completion,
+
     /// Configuration
     config: RouterConfig,
 
@@ -310,6 +338,21 @@ pub const Router = struct {
         src_port: u16,
         seq_num: u32,
     } = null,
+
+    /// Current egress interface name (updated on network change)
+    egress_iface: [64]u8 = undefined,
+
+    /// Network listener callbacks
+    network_listener: ?*NetworkListener = null,
+
+    /// Network state
+    is_paused: bool = false,
+
+    /// Routing socket for network change detection (BSD/macOS)
+    routing_sock: ?std.posix.socket_t = null,
+
+    /// Routing socket read buffer
+    route_buf: [1024]u8 = undefined,
 
     /// Statistics
     _stats: RouterStats,
@@ -423,6 +466,10 @@ pub const Router = struct {
             }
         }
 
+        // Initialize egress interface name from config
+        var egress_iface_init: [64]u8 = undefined;
+        @memcpy(&egress_iface_init, config.egress.name);
+
         // Create Router as local variable first
         var router = Router{
             .loop = loop,
@@ -431,6 +478,7 @@ pub const Router = struct {
             .nat_timer = .{},
             .socks5_completion = .{},
             .udp_completion = .{},
+            .routing_completion = .{},
             .config = config,
             .nat_table = nat_table,
             .socks5_conn = socks5_conn_ptr,
@@ -440,6 +488,9 @@ pub const Router = struct {
             .packet_buf = undefined,
             .write_buf = undefined,
             .icmp_buf = undefined,
+            .route_buf = undefined,
+            .egress_iface = egress_iface_init,
+            .is_paused = false,
             ._stats = .{},
             .allocator = allocator,
         };
@@ -497,6 +548,11 @@ pub const Router = struct {
         if (router.config.nat_config != null) {
             router.submitNatTimer();
         }
+
+        // Start BSD Routing Socket listener for network change detection
+        router.startRoutingSocketListener() catch |err| {
+            std.debug.print("[ROUTER] Warning: Failed to start routing socket listener: {}\n", .{err});
+        };
 
         // Run event loop
         std.debug.print("[ROUTER] Starting event loop...\n", .{});
@@ -950,6 +1006,161 @@ pub const Router = struct {
         std.debug.print("[TCP-SYNACK] SYN-ACK sent successfully\n", .{});
     }
 
+    // ============ Network Change Detection ============
+
+    /// Handle network change - reset connections and reselect egress
+    fn handleNetworkChange(router: *Router, interface_name: []const u8, interface_index: u32) void {
+        std.debug.print("[NET] Network change detected: {s} (index={})\n", .{ interface_name, interface_index });
+
+        // Update default interface info
+        @memcpy(router.egress_iface[0..interface_name.len], interface_name);
+        router._stats.network_changes += 1;
+
+        // Notify listeners
+        if (router.network_listener) |listener| {
+            if (listener.onDefaultInterfaceChanged) |cb| {
+                cb(listener.userdata, interface_name, interface_index);
+            }
+        }
+
+        // Close existing SOCKS5 connection
+        if (router.socks5_conn) |conn| {
+            std.debug.print("[NET] Closing SOCKS5 connection due to network change\n", .{});
+            Socks5Conn.destroy(conn, router.allocator);
+            router.socks5_conn = null;
+        }
+
+        // Clear pending SYN state
+        router.pending_syn = null;
+
+        // Reset NAT table - invalidate all sessions
+        if (router.nat_table) |nat| {
+            std.debug.print("[NET] Clearing NAT table due to network change\n", .{});
+            // Invalidate all sessions by clearing the slots
+            for (nat.slots) |*slot| {
+                slot.session.flags.valid = false;
+                slot.key_hash = 0;
+            }
+        }
+
+        // Close raw socket (will be recreated on next use)
+        if (router.raw_sock) |sock| {
+            std.posix.close(sock);
+            router.raw_sock = null;
+        }
+
+        // Reselect egress interface
+        router.reselectEgressInterface() catch |err| {
+            std.debug.print("[NET] Failed to reselect egress: {}\n", .{err});
+        };
+
+        std.debug.print("[NET] Network change handled successfully\n", .{});
+    }
+
+    /// Handle network pause (no default interface)
+    fn handleNetworkPause(router: *Router) void {
+        std.debug.print("[NET] Network paused (no default interface)\n", .{});
+        router.is_paused = true;
+
+        if (router.network_listener) |listener| {
+            if (listener.onNetworkPaused) |cb| {
+                cb(listener.userdata);
+            }
+        }
+
+        // Close SOCKS5 connection
+        if (router.socks5_conn) |conn| {
+            Socks5Conn.destroy(conn, router.allocator);
+            router.socks5_conn = null;
+        }
+        router.pending_syn = null;
+    }
+
+    /// Handle network resume (after being paused)
+    fn handleNetworkResume(router: *Router) void {
+        std.debug.print("[NET] Network resumed\n", .{});
+        router.is_paused = false;
+
+        if (router.network_listener) |listener| {
+            if (listener.onNetworkResumed) |cb| {
+                cb(listener.userdata);
+            }
+        }
+
+        // Reselect egress interface
+        router.reselectEgressInterface() catch |err| {
+            std.debug.print("[NET] Failed to reselect egress: {}\n", .{err});
+        };
+    }
+
+    /// Handle route changes (address added/removed)
+    fn handleRoutesChanged(router: *Router) void {
+        std.debug.print("[NET] Route changed\n", .{});
+        router._stats.route_updates += 1;
+
+        if (router.network_listener) |listener| {
+            if (listener.onRoutesChanged) |cb| {
+                cb(listener.userdata);
+            }
+        }
+    }
+
+    /// Re-select egress interface after network change
+    fn reselectEgressInterface(router: *Router) !void {
+        std.debug.print("[NET] Reselecting egress interface...\n", .{});
+
+        // Close existing raw socket if any
+        if (router.raw_sock) |sock| {
+            std.posix.close(sock);
+            router.raw_sock = null;
+        }
+
+        // Log current interface
+        std.debug.print("[NET] Egress interface: {s}\n", .{router.config.egress.name});
+
+        // Create new raw socket for egress interface
+        router.raw_sock = std.posix.socket(
+            AF_INET,
+            SOCK_RAW | O_NONBLOCK,
+            0,
+        ) catch {
+            std.debug.print("[NET] Failed to create raw socket, using TUN only\n", .{});
+            router.raw_sock = null;
+            return;
+        };
+
+        std.debug.print("[NET] Egress interface reselected successfully\n", .{});
+    }
+
+    /// Start BSD Routing Socket listener for network changes
+    fn startRoutingSocketListener(router: *Router) !void {
+        const family = AF_ROUTE;  // BSD Routing socket
+        const sock = std.posix.socket(family, std.posix.SOCK.RAW, 0) catch {
+            std.debug.print("[ROUTE] Failed to create routing socket\n", .{});
+            return error.SocketFailed;
+        };
+
+        // Set non-blocking
+        const flags = std.posix.fcntl(sock, F_GETFL, 0) catch 0;
+        _ = std.posix.fcntl(sock, F_SETFL, flags | O_NONBLOCK) catch {};
+
+        // Register with libxev for read events
+        router.routing_sock = sock;
+        router.routing_completion = .{
+            .op = .{
+                .read = .{
+                    .fd = sock,
+                    .buffer = .{ .slice = &router.route_buf },
+                },
+            },
+            .userdata = router,
+            .callback = onRoutingSocketReadable,
+        };
+        router.loop.add(&router.routing_completion);
+
+        std.debug.print("[ROUTE] Routing socket listener started (fd={})\n", .{sock});
+    }
+
     /// Handle ICMP echo request - send echo reply
     fn handleIcmpEcho(router: *Router, packet_offset: usize, packet_len: usize, ip_header_len: usize) !void {
         // ICMP header is at ip_header_len in the packet (after packet_offset)
@@ -1291,5 +1502,121 @@ fn onSocks5Ready(userdata: ?*anyopaque) void {
 fn onSocks5Error(userdata: ?*anyopaque, err: socks5.Socks5Error) void {
     _ = userdata;
     std.debug.print("[SOCKS5] Error occurred: {}\n", .{err});
+}
+
+// ============ BSD Routing Socket Event Handling ============
+
+/// BSD Routing Socket message types
+const RTM_ADD = 0x1;
+const RTM_DELETE = 0x2;
+const RTM_CHANGE = 0x3;
+const RTM_GET = 0x4;
+const RTM_LOSING = 0x5;
+const RTM_IFINFO = 0x6;
+const RTM_NEWMADDR = 0x7;
+const RTM_DELMADDR = 0x8;
+const RTM_IFINFO2 = 0xa;
+const RTM_NEWADDR = 0xb;
+const RTM_DELADDR = 0xc;
+const RTM_OIFINFO = 0xd;
+
+/// Routing socket message header (BSD)
+const rt_msghdr = extern struct {
+    rtm_msglen: u16,
+    rtm_version: u8,
+    rtm_type: u8,
+    rtm_index: u16,
+    rtm_flags: i32,
+    rtm_addrs: i32,
+    rtm_pid: i32,
+    rtm_seq: i32,
+    rtm_errno: i32,
+    rtm_use: i32,
+    rtm_inits: i32,
+    rtm_rmx: rtmetrics,
+};
+
+/// Routing metrics (simplified)
+const rtmetrics = extern struct {
+    rmx_locks: u32,
+    rmx_mtu: u32,
+    rmx_hopcount: i32,
+    rmx_expire: i32,
+    rmx_recvpipe: i32,
+    rmx_sendpipe: i32,
+    rmx_ssthresh: i32,
+    rmx_rtt: i32,
+    rmx_rttvar: i32,
+    rmx_pksent: i32,
+    rmx_filler: [4]i32,
+};
+
+/// Handle routing socket readable event
+fn onRoutingSocketReadable(
+    userdata: ?*anyopaque,
+    loop: *xev.Loop,
+    completion: *xev.Completion,
+    result: xev.Result,
+) xev.CallbackAction {
+    const router = @as(*Router, @ptrCast(@alignCast(userdata orelse return .disarm)));
+
+    const n = result.read catch |err| {
+        std.debug.print("[ROUTE] Routing socket read error: {}\n", .{err});
+        return .disarm;
+    };
+
+    if (n == 0) {
+        return .disarm;
+    }
+
+    // Parse routing message header
+    if (n < @sizeOf(rt_msghdr)) {
+        std.debug.print("[ROUTE] Truncated routing message\n", .{});
+    } else {
+        const msg = @as(*const rt_msghdr, @ptrCast(@alignCast(&router.route_buf)));
+
+        std.debug.print("[ROUTE] RTM message: type={}, index={}\n", .{ msg.rtm_type, msg.rtm_index });
+
+        switch (msg.rtm_type) {
+            RTM_IFINFO => {
+                // Interface status changed (up/down)
+                std.debug.print("[ROUTE] IFINFO: interface {} changed\n", .{msg.rtm_index});
+                router.handleNetworkChange(&[_]u8{}, msg.rtm_index);
+            },
+            RTM_NEWADDR => {
+                // Address added
+                std.debug.print("[ROUTE] NEWADDR: address added on interface {}\n", .{msg.rtm_index});
+                router.handleRoutesChanged();
+            },
+            RTM_DELADDR => {
+                // Address removed
+                std.debug.print("[ROUTE] DELADDR: address removed on interface {}\n", .{msg.rtm_index});
+                router.handleRoutesChanged();
+            },
+            RTM_LOSING => {
+                // Route is losing (network is down)
+                std.debug.print("[ROUTE] LOSING: route losing\n", .{});
+                router.handleNetworkPause();
+            },
+            else => {
+                std.debug.print("[ROUTE] Unhandled RTM type: {}\n", .{msg.rtm_type});
+            },
+        }
+    }
+
+    // Re-submit read
+    completion.* = .{
+        .op = .{
+            .read = .{
+                .fd = router.routing_sock orelse return .disarm,
+                .buffer = .{ .slice = &router.route_buf },
+            },
+        },
+        .userdata = router,
+        .callback = onRoutingSocketReadable,
+    };
+    loop.add(completion);
+
+    return .disarm;
 }
 

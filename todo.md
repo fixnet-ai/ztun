@@ -1,13 +1,35 @@
 # ztun Development Todo List
 
-**Version**: 0.2.3
+**Version**: 0.2.4
 **Last Updated**: 2026-02-12
 
 ---
 
 ## Current Tasks
 
-### Phase 7.9: Network Change Detection and Handling (PENDING)
+### Phase 7.10: Graceful Shutdown (PENDING)
+
+---
+
+### Phase 7.9: Network Change Detection and Handling (COMPLETED)
+
+**Date**: 2026-02-12
+
+**Reference**: sing-box `route/network.go` architecture
+
+**Result**: BSD Routing Socket listener and network change handlers implemented
+
+**Key Changes**:
+1. **BSD Routing Socket Listener** (`mod.zig:1149+`)
+2. **Network Change Handlers**: `handleNetworkChange()`, `handleNetworkPause()`, `handleNetworkResume()`
+3. **NetworkListener Interface**: Callback-based notification system
+4. **Router Updates**: `egress_iface`, `network_listener`, `is_paused`, `routing_sock`
+
+**Files Modified**: `src/router/mod.zig`, `build.zig`
+
+---
+
+### Phase 7.8: SOCKS5 TCP Handshake Fix (COMPLETED)
 
 **Date**: 2026-02-12
 
