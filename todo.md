@@ -1,11 +1,27 @@
 # ztun Development Todo List
 
-**Version**: 0.2.5
-**Last Updated**: 2026-02-12
+**Version**: 0.2.6
+**Last Updated**: 2026-02-13
 
 ---
 
 ## Current Tasks
+
+### Phase 7.13: Network Monitor Bug Fixes (COMPLETED)
+
+**Date**: 2026-02-13
+
+**Issues Fixed**:
+- Removed dead code: `handleNetworkChange()` referenced non-existent `network_listener` field
+- Fixed event mapping: `address_removed` now pauses network instead of resuming
+- Updated `onNetworkChangeCallback` to correctly handle all network events
+
+**Files Modified**:
+| File | Changes |
+|------|---------|
+| `src/router/mod.zig` | Removed dead `handleNetworkChange()`, fixed event mapping |
+
+---
 
 ### Phase 7.12: Cross-Platform Network Monitor Integration (PENDING)
 

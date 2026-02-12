@@ -805,17 +805,27 @@ pub const Router = struct {
             std.debug.print("[SOCKS5-PATH] Blocking connect succeeded!\n", .{});
 
             // Send SYN-ACK to complete TCP handshake
+            // SYN-ACK should appear to come from the server (target)
+            // to the client that sent the original SYN
             if (router.pending_syn) |syn| {
-                std.debug.print("[SOCKS5-PATH] Sending SYN-ACK to client...\n", .{});
-                router.sendSynAck(syn.src_ip, syn.src_port, client.dst_ip, client.dst_port, syn.seq_num) catch |err| {
-                    std.debug.print("[SOCKS5-PATH-ERROR] sendSynAck failed: {}\n", .{err});
+                std.debug.print("[SYNACK-PATH] Sending SYN-ACK...\n", .{});
+                std.debug.print("[SYNACK-PATH] Server (src): {s}:{}\n", .{fmtIp(client.dst_ip), client.dst_port});
+                std.debug.print("[SYNACK-PATH] Client (dst): {s}:{}\n", .{fmtIp(syn.src_ip), syn.src_port});
+                router.sendSynAck(
+                    client.dst_ip,   // src_ip: server IP (111.45.11.5)
+                    client.dst_port, // src_port: server port (80)
+                    syn.src_ip,      // dst_ip: client IP (10.0.0.1)
+                    syn.src_port,    // dst_port: client port
+                    syn.seq_num,
+                ) catch |err| {
+                    std.debug.print("[SYNACK-PATH-ERROR] sendSynAck failed: {}\n", .{err});
                     router.pending_syn = null;
                     return;
                 };
                 router.pending_syn = null;
-                std.debug.print("[SOCKS5-PATH] SYN-ACK sent successfully!\n", .{});
+                std.debug.print("[SYNACK-PATH] SYN-ACK sent successfully!\n", .{});
             } else {
-                std.debug.print("[SOCKS5-PATH-WARN] No pending_syn found!\n", .{});
+                std.debug.print("[SYNACK-PATH-WARN] No pending_syn found!\n", .{});
             }
         } else {
             // Non-SYN packet - check if we need to establish a new SOCKS5 connection
@@ -1136,55 +1146,6 @@ pub const Router = struct {
 
     // ============ Network Change Detection ============
 
-    /// Handle network change - reset connections and reselect egress
-    fn handleNetworkChange(router: *Router, interface_name: []const u8, interface_index: u32) void {
-        std.debug.print("[NET] Network change detected: {s} (index={})\n", .{ interface_name, interface_index });
-
-        // Update default interface info
-        @memcpy(router.egress_iface[0..interface_name.len], interface_name);
-        router._stats.network_changes += 1;
-
-        // Notify listeners
-        if (router.network_listener) |listener| {
-            if (listener.onDefaultInterfaceChanged) |cb| {
-                cb(listener.userdata, interface_name, interface_index);
-            }
-        }
-
-        // Close existing SOCKS5 connection
-        if (router.socks5_conn) |conn| {
-            std.debug.print("[NET] Closing SOCKS5 connection due to network change\n", .{});
-            Socks5Conn.destroy(conn, router.allocator);
-            router.socks5_conn = null;
-        }
-
-        // Clear pending SYN state
-        router.pending_syn = null;
-
-        // Reset NAT table - invalidate all sessions
-        if (router.nat_table) |nat| {
-            std.debug.print("[NET] Clearing NAT table due to network change\n", .{});
-            // Invalidate all sessions by clearing the slots
-            for (nat.slots) |*slot| {
-                slot.session.flags.valid = false;
-                slot.key_hash = 0;
-            }
-        }
-
-        // Close raw socket (will be recreated on next use)
-        if (router.raw_sock) |sock| {
-            std.posix.close(sock);
-            router.raw_sock = null;
-        }
-
-        // Reselect egress interface
-        router.reselectEgressInterface() catch |err| {
-            std.debug.print("[NET] Failed to reselect egress: {}\n", .{err});
-        };
-
-        std.debug.print("[NET] Network change handled successfully\n", .{});
-    }
-
     /// Handle network pause (no default interface)
     fn handleNetworkPause(router: *Router) void {
         std.debug.print("[NET] Network paused\n", .{});
@@ -1257,8 +1218,12 @@ pub const Router = struct {
             .interface_down, .network_losing => {
                 router.handleNetworkPause();
             },
-            .interface_up, .address_added, .address_removed => {
+            .interface_up, .address_added => {
                 router.handleNetworkResume();
+            },
+            .address_removed => {
+                // Address removed - pause and let resume handle it when address is added back
+                router.handleNetworkPause();
             },
             .route_changed => {
                 router.handleRoutesChanged();
@@ -1603,9 +1568,14 @@ fn onSocks5TunnelReady(userdata: ?*anyopaque) void {
                 fmtIp(client.dst_ip), client.dst_port });
 
             // Send SYN-ACK to complete TCP handshake
-            // dst_ip/dst_port are the server (target)
-            // src_ip/src_port are the client that sent the SYN
-            router.sendSynAck(syn.src_ip, syn.src_port, client.dst_ip, client.dst_port, syn.seq_num) catch |err| {
+            // SYN-ACK appears to come from server (target) to client
+            router.sendSynAck(
+                client.dst_ip,   // src_ip: server IP (as source in SYN-ACK)
+                client.dst_port, // src_port: server port
+                syn.src_ip,      // dst_ip: client IP (as destination in SYN-ACK)
+                syn.src_port,    // dst_port: client port
+                syn.seq_num,
+            ) catch |err| {
                 std.debug.print("[SOCKS5-TUNNEL-ERROR] sendSynAck failed: {}\n", .{err});
                 router.pending_syn = null;
                 return;
