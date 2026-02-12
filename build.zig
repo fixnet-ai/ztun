@@ -265,6 +265,21 @@ pub fn build(b: *std.Build) void {
     });
     tun2sock_step.dependOn(&tun2sock_install.step);
 
+    // Build test_http_server executable for TUN testing
+    const test_http_step = b.step("test-http-server", "Build simple HTTP 200 server for testing");
+    const test_http = b.addExecutable(.{
+        .name = "test_http_server",
+        .root_source_file = b.path("tests/test_http_server.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_http.linkLibC();
+    const test_http_bin_dir = if (target.result.os.tag == .linux) "bin/linux-gnu" else "bin/macos";
+    const test_http_install = b.addInstallArtifact(test_http, .{
+        .dest_dir = .{ .override = .{ .custom = test_http_bin_dir } },
+    });
+    test_http_step.dependOn(&test_http_install.step);
+
     // Build test_tun executable to bin/{os}/
     const test_tun_step = b.step("test-tun", "Build ping echo test application");
     const test_tun = b.addExecutable(.{

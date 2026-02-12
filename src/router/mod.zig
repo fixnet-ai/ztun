@@ -224,6 +224,10 @@ pub const RouterConfig = struct {
     /// Proxy configuration (optional)
     proxy: ?ProxyConfig = null,
 
+    /// Mock HTTP server for testing (bypasses SOCKS5 proxy)
+    mock_enabled: bool = false,
+    mock_port: u16 = 0,
+
     /// Routing decision callback (required, from application)
     route_cb: RouteCallback,
 
@@ -326,6 +330,9 @@ pub const Router = struct {
         src_port: u16,
         seq_num: u32,
     } = null,
+
+    /// Mock HTTP state for testing (tracks TCP handshake)
+    mock_state: ?*MockState = null,
 
     /// Current egress interface name (updated on network change)
     egress_iface: [64]u8 = undefined,
@@ -679,8 +686,15 @@ pub const Router = struct {
             },
             .Socks5 => {
                 std.debug.print("[FORWARD] Action: forwardToProxy (Socks5)\n", .{});
-                try router.forwardToProxy(packet);
-                router._stats.packets_forwarded += 1;
+                // Check if mock mode is enabled
+                if (router.config.mock_enabled) {
+                    std.debug.print("[FORWARD] Mock mode enabled\n", .{});
+                    try router.handleMockHttp(packet);
+                    router._stats.packets_forwarded += 1;
+                } else {
+                    try router.forwardToProxy(packet);
+                    router._stats.packets_forwarded += 1;
+                }
             },
             .Drop => {
                 std.debug.print("[FORWARD] Action: Drop packet\n", .{});
@@ -1132,7 +1146,7 @@ pub const Router = struct {
         tcp_sum += (dst_ip >> 16) & 0xFFFF;
         tcp_sum += dst_ip & 0xFFFF;
         tcp_sum += 6; // TCP protocol
-        tcp_sum += tcp_len;
+        tcp_sum += @as(u32, @intCast(tcp_len));
         // TCP header
         const tcp_sum_final = ipstack.checksum.checksum(router.write_buf[tcp_offset..tcp_offset + 20], tcp_sum);
         std.mem.writeInt(u16, router.write_buf[tcp_offset + 16 .. tcp_offset + 18], tcp_sum_final, .big);
@@ -1142,6 +1156,140 @@ pub const Router = struct {
         try router.writeToTunBuf(router.write_buf[0..ip_len]);
         std.debug.print("[SYNACK] SYN-ACK sent successfully!\n", .{});
         std.debug.print("[SYNACK-EXIT] ============================================\n\n", .{});
+    }
+
+    /// Mock connection state for TCP handshake tracking
+    const MockState = struct {
+        src_ip: u32,
+        src_port: u16,
+        dst_ip: u32,
+        dst_port: u16,
+        client_seq: u32,
+        stage: MockStage,
+    };
+
+    const MockStage = enum {
+        syn_received,  // Waiting for ACK
+        established,   // Connection established, can send data
+    };
+
+    /// Handle mock HTTP response (SYN -> SYN-ACK, then HTTP on ACK)
+    fn handleMockHttp(router: *Router, packet: *const Packet) !void {
+        const tcp_offset = 20; // IP header is 20 bytes
+        if (packet.data.len < tcp_offset + 20) return;
+
+        const tcp_flags = packet.data[tcp_offset + 13];
+        const is_syn = (tcp_flags & 0x02) != 0;
+        const is_ack = (tcp_flags & 0x10) != 0;
+
+        std.debug.print("\n[MOCK] ============================================\n", .{});
+        std.debug.print("[MOCK] handleMockHttp: SYN={} ACK={}\n", .{is_syn, is_ack});
+
+        // Store mock state for tracking
+        if (router.mock_state == null) {
+            router.mock_state = try router.allocator.create(MockState);
+        }
+        const mock = router.mock_state.?;
+        mock.* = .{
+            .src_ip = packet.dst_ip,
+            .src_port = packet.dst_port,
+            .dst_ip = packet.src_ip,
+            .dst_port = packet.src_port,
+            .client_seq = std.mem.readInt(u32, packet.data[tcp_offset + 4..tcp_offset + 8], .big),
+            .stage = if (is_syn) .syn_received else .established,
+        };
+
+        if (is_syn) {
+            // Send SYN-ACK
+            std.debug.print("[MOCK] Sending SYN-ACK...\n", .{});
+            try router.sendSynAck(
+                mock.src_ip,
+                mock.src_port,
+                mock.dst_ip,
+                mock.dst_port,
+                mock.client_seq,
+            );
+        } else if (is_ack and mock.stage == .syn_received) {
+            // ACK received, connection established - send HTTP 200 response
+            mock.stage = .established;
+            std.debug.print("[MOCK] Connection established, sending HTTP 200...\n", .{});
+            try router.sendMockDataResponse(
+                mock.src_ip,
+                mock.src_port,
+                mock.dst_ip,
+                mock.dst_port,
+                mock.client_seq + 1,
+            );
+        } else {
+            std.debug.print("[MOCK] Ignoring packet (flags=0x{x:02})\n", .{tcp_flags});
+        }
+        std.debug.print("[MOCK-EXIT] ============================================\n\n", .{});
+    }
+
+    /// Send HTTP 200 data response (PSH+ACK with payload)
+    fn sendMockDataResponse(router: *Router, src_ip: u32, src_port: u16, dst_ip: u32, dst_port: u16, seq_num: u32) !void {
+        // HTTP 200 response body
+        const http_body = "Hello World!\r\n";
+        const http_response =
+            "HTTP/1.1 200 OK\r\n" ++
+            "Content-Type: text/plain\r\n" ++
+            "Content-Length: 13\r\n" ++
+            "Connection: close\r\n" ++
+            "\r\n" ++
+            http_body;
+
+        // Calculate lengths
+        const tcp_header_len = 20;
+        const ip_header_len = 20;
+        const payload_len = http_response.len;
+        const total_len = ip_header_len + tcp_header_len + payload_len;
+
+        // Build IP header
+        router.write_buf[0] = 0x45; // Version (4) + IHL (5)
+        router.write_buf[1] = 0x00; // TOS = 0
+        std.mem.writeInt(u16, router.write_buf[2..4], @as(u16, @intCast(total_len)), .big);
+        std.mem.writeInt(u16, router.write_buf[4..6], 0x1234, .big); // ID
+        router.write_buf[6] = 0x40; // Flags (DF)
+        router.write_buf[7] = 0x00; // Fragment offset
+        router.write_buf[8] = 64; // TTL
+        router.write_buf[9] = 6; // Protocol = TCP
+        std.mem.writeInt(u16, router.write_buf[10..12], 0, .big); // Checksum
+        std.mem.writeInt(u32, router.write_buf[12..16], src_ip, .big); // Source IP
+        std.mem.writeInt(u32, router.write_buf[16..20], dst_ip, .big); // Dest IP
+
+        // Build TCP header
+        const tcp_offset = 20;
+        std.mem.writeInt(u16, router.write_buf[tcp_offset + 0 .. tcp_offset + 2], dst_port, .big); // Source port
+        std.mem.writeInt(u16, router.write_buf[tcp_offset + 2 .. tcp_offset + 4], src_port, .big); // Dest port
+        std.mem.writeInt(u32, router.write_buf[tcp_offset + 4 .. tcp_offset + 8], 0, .big); // Seq number (server's initial)
+        std.mem.writeInt(u32, router.write_buf[tcp_offset + 8 .. tcp_offset + 12], seq_num, .big); // Ack number
+        router.write_buf[tcp_offset + 12] = 0x50; // Data offset
+        router.write_buf[tcp_offset + 13] = 0x18; // Flags: PSH + ACK (0x18)
+        std.mem.writeInt(u16, router.write_buf[tcp_offset + 14 .. tcp_offset + 16], 65535, .big); // Window
+        std.mem.writeInt(u16, router.write_buf[tcp_offset + 16 .. tcp_offset + 18], 0, .big); // Checksum
+        std.mem.writeInt(u16, router.write_buf[tcp_offset + 18 .. tcp_offset + 20], 0, .big); // Urgent
+
+        // Copy HTTP response to payload position
+        @memcpy(router.write_buf[tcp_offset + tcp_header_len..][0..payload_len], http_response);
+
+        // Calculate IP checksum
+        const ip_checksum = ipstack.checksum.checksum(router.write_buf[0..20], 0);
+        std.mem.writeInt(u16, router.write_buf[10..12], ip_checksum, .big);
+
+        // Calculate TCP checksum
+        const tcp_len = tcp_header_len + payload_len;
+        var tcp_sum: u32 = 0;
+        tcp_sum += (src_ip >> 16) & 0xFFFF;
+        tcp_sum += src_ip & 0xFFFF;
+        tcp_sum += (dst_ip >> 16) & 0xFFFF;
+        tcp_sum += dst_ip & 0xFFFF;
+        tcp_sum += 6; // TCP protocol
+        tcp_sum += @as(u32, @intCast(tcp_len));
+        const tcp_sum_final = ipstack.checksum.checksum(router.write_buf[tcp_offset..tcp_offset + tcp_header_len + payload_len], tcp_sum);
+        std.mem.writeInt(u16, router.write_buf[tcp_offset + 16 .. tcp_offset + 18], tcp_sum_final, .big);
+
+        std.debug.print("[MOCK-DATA] Sending HTTP 200 ({} bytes)...\n", .{total_len});
+        try router.writeToTunBuf(router.write_buf[0..total_len]);
     }
 
     // ============ Network Change Detection ============

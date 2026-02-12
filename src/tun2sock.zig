@@ -162,6 +162,7 @@ const Args = struct {
     proxy_addr: []const u8 = "127.0.0.1:1080",
     egress_iface: []const u8 = "",
     target_ip: []const u8 = "111.45.11.5",
+    mock_port: []const u8 = "",
     debug: bool = false,
 };
 
@@ -208,6 +209,11 @@ fn parseArgs(_: std.mem.Allocator) !Args {
             if (i < std.os.argv.len) {
                 args.tun_peer = std.mem.sliceTo(std.os.argv[i], 0);
             }
+        } else if (std.mem.eql(u8, arg, "--mock-port") or std.mem.eql(u8, arg, "-M")) {
+            i += 1;
+            if (i < std.os.argv.len) {
+                args.mock_port = std.mem.sliceTo(std.os.argv[i], 0);
+            }
         } else if (std.mem.eql(u8, arg, "--debug") or std.mem.eql(u8, arg, "-d")) {
             args.debug = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -231,6 +237,7 @@ fn printHelp() void {
         \\  -x, --proxy ADDR      SOCKS5 proxy address (default: 127.0.0.1:1080)
         \\  -e, --egress IFACE    Egress interface name (auto-detect if empty)
         \\  -t, --target IP       Target IP to route through TUN (default: 111.45.11.5)
+        \\  -M, --mock-port PORT  Enable mock HTTP mode (bypass SOCKS5, return HTTP 200)
         \\  -d, --debug           Enable debug logging
         \\  -h, --help            Show this help message
         \\
@@ -243,6 +250,10 @@ fn printHelp() void {
         \\  # 2. Start tun2sock: sudo ./tun2sock --tun-ip 10.0.0.1 --proxy 127.0.0.1:1080
         \\  # 3. Test ICMP: ping -c 3 10.0.0.2
         \\  # 4. Test HTTP: curl -v http://111.45.11.5/ (NO --proxy flag!)
+        \\
+        \\Mock Mode (testing without SOCKS5):
+        \\  sudo ./tun2sock --tun-ip 10.0.0.1 --target 111.45.11.5 --mock-port 8080
+        \\  curl http://111.45.11.5/  # Returns HTTP 200 "Hello World!"
         \\
         \\Example:
         \\  sudo ./tun2sock --tun-ip 10.0.0.1 --target 111.45.11.5 --proxy 127.0.0.1:1080
@@ -594,10 +605,15 @@ pub fn main() !u8 {
     };
 
     // Create router configuration
+    const mock_enabled = args.mock_port.len > 0;
+    const mock_port = if (mock_enabled) std.fmt.parseInt(u16, args.mock_port, 10) catch 0 else 0;
+
     const router_config = router.RouterConfig{
         .tun = tun_config,
         .egress = egress_config,
         .proxy = proxy_config,
+        .mock_enabled = mock_enabled,
+        .mock_port = mock_port,
         .route_cb = routeCallback,
         .tcp_pool_size = 4096,
         .udp_nat_size = 8192,
@@ -605,6 +621,13 @@ pub fn main() !u8 {
         .udp_timeout = 30,
         .nat_config = nat_config,
     };
+
+    // Print configuration summary
+    std.debug.print("\n=== Configuration ===\n", .{});
+    std.debug.print("  Mock Mode:     {s}\n", .{if (mock_enabled) "enabled" else "disabled"});
+    if (mock_enabled) {
+        std.debug.print("  Mock Port:     {}\n", .{mock_port});
+    }
 
     std.debug.print("Initializing router...\n\n", .{});
 
