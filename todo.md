@@ -1,13 +1,202 @@
 # ztun Development Todo List
 
-**Version**: 0.2.2
+**Version**: 0.2.3
 **Last Updated**: 2026-02-12
 
 ---
 
 ## Current Tasks
 
-### Phase 7.8: SOCKS5 TCP Handshake Fix (IN PROGRESS)
+### Phase 7.9: Network Change Detection and Handling (PENDING)
+
+**Date**: 2026-02-12
+
+**Reference**: sing-box `route/network.go` architecture
+
+**Goal**: Implement network change detection and graceful handling, similar to sing-box's NetworkManager
+
+**Background**: sing-box provides robust network change handling:
+- `NetworkManager` monitors default interface changes via `tun.NetworkUpdateMonitor`
+- `interfaceMonitor` detects interface up/down events
+- `ResetNetwork()` closes connections and notifies all components
+- `pauseManager` handles system suspend/resume events
+
+**ztun Current Status**:
+| Feature | Status | Location |
+|---------|--------|----------|
+| TUN packet handling | Done | `mod.zig:1102-1176` |
+| SOCKS5 callbacks | Done | `mod.zig:1207-1294` |
+| UDP NAT handling | Done | `mod.zig:559-599` |
+| Egress interface selection | Done | `network.zig:218-260` |
+| Network change detection | **Missing** | - |
+| Interface monitoring | **Missing** | - |
+| Egress interface reselection | **Missing** | - |
+| Connection reset on network change | **Missing** | - |
+| System suspend/resume | **Missing** | - |
+
+**Required Changes**:
+
+#### P0: Graceful Network Reset (Critical)
+- [ ] Close existing SOCKS5 connection when network changes
+- [ ] Clear pending SYN state
+- [ ] Reset NAT table on network change
+- [ ] **Re-select egress interface** using `selectEgressIp()` after network change
+- [ ] Update `egress_ip` and `egress_iface` fields in Router
+- Location: `src/router/mod.zig`
+
+#### P1: Egress Interface Reselection
+```zig
+/// Re-select egress interface after network change
+fn reselectEgressInterface(router: *Router) !void {
+    // Close existing raw socket if any
+    if (router.raw_sock) |sock| {
+        std.posix.close(sock);
+        router.raw_sock = null;
+    }
+
+    // Re-select egress interface using network.zig
+    const egress = try network.selectEgressIp(router.allocator, router.config.egress.iface);
+    router.egress_ip = egress.ip;
+    router.egress_iface = egress.iface;
+
+    // Create new raw socket for egress interface
+    router.raw_sock = try std.posix.socket(
+        std.posix.AF_INET,
+        std.posix.SOCK.RAW | std.posix.SOCK.NONBLOCK,
+        std.posix.IPPROTO_RAW,
+    );
+    // Bind to egress interface
+    var ifreq = std.mem.zeroInit(ifreq, .{
+        .ifr_name = router.egress_iface,
+    });
+    _ = std.posix.ioctl(router.raw_sock, std.posix.SIOCGIFINDEX, @ptrCast(&ifreq));
+
+    // Update routing if egress changed
+    if (!std.mem.eql(u8, router.egress_iface, router.config.egress.iface)) {
+        std.debug.print("[NET] Egress changed: {s} -> {s}\n", .{ router.config.egress.iface, router.egress_iface });
+    }
+}
+```
+
+#### P2: Network Listener Interface
+```zig
+/// Network change callback interface (new file: src/router/network.zig)
+pub const NetworkListener = struct {
+    onDefaultInterfaceChanged: ?*const fn (userdata: ?*anyopaque, interface_name: []const u8, interface_index: u32) void = null,
+    onNetworkPaused: ?*const fn (userdata: ?*anyopaque) void = null,
+    onNetworkResumed: ?*const fn (userdata: ?*anyopaque) void = null,
+    onRoutesChanged: ?*const fn (userdata: ?*anyopaque) void = null,
+    userdata: ?*anyopaque = null,
+};
+```
+
+#### P2: Router Enhancements
+- [ ] Add `network_listener: ?*NetworkListener` field
+- [ ] Add `default_interface` info storage
+- [ ] Add `is_paused: bool` state
+- [ ] Add `handleNetworkChange()` method
+- [ ] Add `handleNetworkPause()` / `handleNetworkResume()` methods
+- Location: `src/router/mod.zig`
+
+#### P3: BSD Routing Socket Listener (macOS)
+```zig
+/// Start Routing Socket listener for network events
+fn startRoutingSocketListener(router: *Router) !void {
+    const sock = std.posix.socket(std.posix.AF_ROUTE, std.posix.SOCK.RAW, 0) catch {
+        return error.SocketFailed;
+    };
+    // Register with libxev for RTM_IFINFO, RTM_NEWADDR, RTM_DELADDR events
+}
+
+/// Handle routing socket message
+fn onRoutingSocketReadable(...) xev.CallbackAction {
+    const msg = @as(*const rt_msghdr, @ptrCast(@alignCast(&router.route_buf)));
+    switch (msg.rtm_type) {
+        RTM_IFINFO => router.handleNetworkChange(...),
+        RTM_NEWADDR, RTM_DELADDR => router.handleRoutesChanged(),
+        else => {},
+    }
+}
+```
+
+#### P4: Router Statistics Update
+```zig
+pub const RouterStats = struct {
+    // ... existing fields ...
+    network_changes: u64 = 0,  // Add this field
+    route_updates: u64 = 0,    // Add this field
+};
+```
+
+**Reference Implementation**: sing-box patterns
+- `route/network.go:395-418` - `ResetNetwork()` implementation
+- `route/network.go:420-461` - `notifyInterfaceUpdate()` callback
+- `route/network.go:463-477` - Windows power event handling
+
+**Testing**:
+```bash
+# Test network change handling
+# 1. Start tun2sock
+# 2. Change network (Wi-Fi -> Ethernet, or toggle interface)
+# 3. Verify SOCKS5 connection is reset
+# 4. Verify new connections work
+```
+
+---
+
+### Phase 7.8: SOCKS5 TCP Handshake Fix (COMPLETED)
+
+**Date**: 2026-02-12
+
+**Result**: TCP three-way handshake through SOCKS5 proxy now works correctly
+
+**Verification**:
+```bash
+curl -v --proxy socks5://127.0.0.1:1080 http://111.45.11.5/
+# HTTP/1.1 403 Forbidden (connection established successfully)
+```
+
+**Git Commit**: `1ad1f52`
+
+---
+
+## Current Tasks
+
+### Phase 7.9: Network Change Detection and Handling (PENDING)
+
+**Date**: 2026-02-12
+
+**Reference**: sing-box `route/network.go` architecture
+
+**Goal**: Implement network change detection and graceful handling
+
+**Checklist**:
+- [ ] **P0**: Close SOCKS5 connection on network change
+- [ ] **P0**: Clear pending SYN state on network change
+- [ ] **P0**: Reset NAT table on network change
+- [ ] **P1**: Create `NetworkListener` interface (`src/router/network.zig`)
+- [ ] **P1**: Add `network_listener` field to Router
+- [ ] **P1**: Add `handleNetworkChange()` method
+- [ ] **P1**: Add `handleNetworkPause()` / `handleNetworkResume()` methods
+- [ ] **P2**: Implement BSD Routing Socket listener for macOS
+- [ ] **P2**: Handle RTM_IFINFO, RTM_NEWADDR, RTM_DELADDR events
+- [ ] **P3**: Update RouterStats with `network_changes` counter
+- [ ] **P4**: Add system suspend/resume handling
+
+**Reference Implementation**: sing-box patterns
+- `route/network.go:395-418` - `ResetNetwork()` implementation
+- `route/network.go:420-461` - `notifyInterfaceUpdate()` callback
+- `route/network.go:463-477` - Windows power event handling
+
+**Files to Modify**:
+| File | Changes |
+|------|---------|
+| `src/router/network.zig` | New file - NetworkListener interface |
+| `src/router/mod.zig` | Add network listener support |
+
+---
+
+### Phase 7.8: SOCKS5 TCP Handshake Fix (COMPLETED)
 
 **Date**: 2026-02-12
 
