@@ -159,6 +159,7 @@ const zig_modules = &[_]framework.ZigModule{
             "router_nat",
             "router_socks5",
             "ipstack",
+            "monitor",
         },
     },
     // System modules (all in src/system/)
@@ -168,8 +169,8 @@ const zig_modules = &[_]framework.ZigModule{
         .deps = &[_][]const u8{},
     },
     .{
-        .name = "network",
-        .file = "src/system/network.zig",
+        .name = "monitor",
+        .file = "src/system/monitor.zig",
         .deps = &[_][]const u8{},
     },
 };

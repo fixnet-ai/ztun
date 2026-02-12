@@ -1,11 +1,97 @@
 # ztun Development Todo List
 
-**Version**: 0.2.4
+**Version**: 0.2.5
 **Last Updated**: 2026-02-12
 
 ---
 
 ## Current Tasks
+
+### Phase 7.12: Cross-Platform Network Monitor Integration (PENDING)
+
+**Date**: 2026-02-12
+
+**Goal**: Fully integrate network change detection and handle network events
+
+**Required Changes**:
+- [ ] Implement egress interface reselection on network change
+- [ ] Close and reconnect SOCKS5 connection on network change
+- [ ] Reset NAT table on network change
+- [ ] Handle RTM_IFINFO, RTM_NEWADDR, RTM_DELADDR events in router
+
+---
+
+### Phase 7.11: Cross-Platform Network Monitor Implementation (COMPLETED)
+
+**Date**: 2026-02-12
+
+**Result**: Successfully implemented cross-platform network change detection
+
+**Architecture**:
+```
+src/system/monitor.zig           # Main facade (cross-platform interface)
+├── monitor_darwin.zig          # BSD Routing Socket (macOS)
+├── monitor_linux.zig           # rtnetlink (Linux)
+└── monitor_windows.zig         # NotifyAddrChange (Windows)
+```
+
+**API**:
+```zig
+pub const NetworkChange = enum {
+    interface_up,
+    interface_down,
+    address_added,
+    address_removed,
+    route_changed,
+    network_losing,
+};
+
+pub const NetworkEvent = struct {
+    change: NetworkChange,
+    interface_name: []const u8,
+    interface_index: u32,
+    timestamp: i64,
+};
+
+pub const ObserverCallback = *const fn (event: *const NetworkEvent, userdata: ?*anyopaque) void;
+
+pub const NetworkMonitor = struct {
+    register: *const fn (callback: ObserverCallback, userdata: ?*anyopaque) !void,
+    unregister: *const fn (callback: ObserverCallback) void,
+    notify: *const fn (event: *const NetworkEvent) void,
+};
+
+pub fn createNetworkMonitor(allocator: std.mem.Allocator) !*NetworkMonitor;
+pub fn destroyNetworkMonitor(monitor_ptr: *NetworkMonitor) void;
+```
+
+**Changes**:
+- [x] Create `src/system/monitor.zig` (main interface)
+- [x] Create `src/system/monitor_darwin.zig` (BSD Routing Socket)
+- [x] Create `src/system/monitor_linux.zig` (rtnetlink)
+- [x] Create `src/system/monitor_windows.zig` (Windows API)
+- [x] Update Router to use monitor instead of raw BSD socket
+- [x] Add monitor module to build.zig
+
+**Compilation Fixes**:
+- Removed xev imports from platform files (use opaque pointers)
+- Changed packed struct to extern struct for C interop
+- Defined F_GETFL/F_SETFL/O_NONBLOCK constants manually
+- Handled socket() error union properly
+- Used platform-specific types for callback registration
+
+**Files Modified**:
+| File | Action |
+|------|--------|
+| `src/system/monitor.zig` | Create - main interface |
+| `src/system/monitor_darwin.zig` | Create - macOS implementation |
+| `src/system/monitor_linux.zig` | Create - Linux implementation |
+| `src/system/monitor_windows.zig` | Create - Windows implementation |
+| `src/router/mod.zig` | Modify - use monitor API |
+| `build.zig` | Modify - add monitor module |
+| `zig.codegen.md` | Document compilation fixes |
+
+---
 
 ### Phase 7.10: Graceful Shutdown (PENDING)
 

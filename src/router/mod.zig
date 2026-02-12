@@ -63,7 +63,6 @@ const xev = @import("xev");
 
 // Socket constants
 const AF_INET = 2;   // IPv4
-const AF_ROUTE = 32; // BSD Routing socket (macOS)
 const SOCK_STREAM = 1;
 const SOCK_DGRAM = 2;
 const SOCK_RAW = 3;
@@ -101,6 +100,9 @@ pub const Socks5Conn = socks5.Socks5Client;
 
 // Import checksum from ipstack
 const ipstack = @import("ipstack");
+
+// Import network monitor for cross-platform network change detection
+const monitor = @import("monitor");
 
 /// Parse proxy address (ip:port string)
 fn parseProxyAddr(addr: [:0]const u8) !struct { ip: u32, port: u16 } {
@@ -191,25 +193,6 @@ pub const Packet = struct {
     protocol: u8,
 };
 
-/// Network change callback interface
-/// Used for monitoring network interface changes, suspend/resume events
-pub const NetworkListener = struct {
-    /// Called when default interface changes
-    onDefaultInterfaceChanged: ?*const fn (userdata: ?*anyopaque, interface_name: []const u8, interface_index: u32) void = null,
-
-    /// Called when network becomes unavailable (no default interface)
-    onNetworkPaused: ?*const fn (userdata: ?*anyopaque) void = null,
-
-    /// Called when network resumes (after being paused)
-    onNetworkResumed: ?*const fn (userdata: ?*anyopaque) void = null,
-
-    /// Called when routes change (address added/removed)
-    onRoutesChanged: ?*const fn (userdata: ?*anyopaque) void = null,
-
-    /// User-provided context
-    userdata: ?*anyopaque = null,
-};
-
 /// Router statistics
 pub const RouterStats = struct {
     tcp_connections: u64 = 0,
@@ -296,9 +279,6 @@ pub const Router = struct {
     /// libxev completion for UDP socket
     udp_completion: xev.Completion,
 
-    /// libxev completion for routing socket
-    routing_completion: xev.Completion,
-
     /// Configuration
     config: RouterConfig,
 
@@ -342,17 +322,11 @@ pub const Router = struct {
     /// Current egress interface name (updated on network change)
     egress_iface: [64]u8 = undefined,
 
-    /// Network listener callbacks
-    network_listener: ?*NetworkListener = null,
+    /// Network monitor for cross-platform change detection (platform-specific type)
+    net_monitor: ?*monitor.NetworkMonitor = null,
 
     /// Network state
     is_paused: bool = false,
-
-    /// Routing socket for network change detection (BSD/macOS)
-    routing_sock: ?std.posix.socket_t = null,
-
-    /// Routing socket read buffer
-    route_buf: [1024]u8 = undefined,
 
     /// Statistics
     _stats: RouterStats,
@@ -478,7 +452,6 @@ pub const Router = struct {
             .nat_timer = .{},
             .socks5_completion = .{},
             .udp_completion = .{},
-            .routing_completion = .{},
             .config = config,
             .nat_table = nat_table,
             .socks5_conn = socks5_conn_ptr,
@@ -488,12 +461,24 @@ pub const Router = struct {
             .packet_buf = undefined,
             .write_buf = undefined,
             .icmp_buf = undefined,
-            .route_buf = undefined,
             .egress_iface = egress_iface_init,
             .is_paused = false,
+            .net_monitor = null,
             ._stats = .{},
             .allocator = allocator,
         };
+
+        // Create network monitor for cross-platform change detection (macOS only for now)
+        if (builtin.os.tag == .macos) {
+            router.net_monitor = monitor.createNetworkMonitor(allocator) catch null;
+            if (router.net_monitor) |mon| {
+                mon.register(onNetworkChangeCallback, &router) catch {
+                    std.debug.print("[ROUTER] Warning: Failed to register network change callback\n", .{});
+                };
+            } else {
+                std.debug.print("[ROUTER] Warning: Failed to create network monitor\n", .{});
+            }
+        }
 
         // Update Socks5Client callbacks to point to this Router
         if (router.socks5_conn) |client| {
@@ -507,6 +492,11 @@ pub const Router = struct {
     pub fn deinit(router: *Router) void {
         if (router.state == .running) {
             router.loop.stop();
+        }
+
+        // Stop and cleanup network monitor
+        if (router.net_monitor) |mon| {
+            monitor.destroyNetworkMonitor(mon);
         }
 
         // Close SOCKS5 connection
@@ -549,10 +539,7 @@ pub const Router = struct {
             router.submitNatTimer();
         }
 
-        // Start BSD Routing Socket listener for network change detection
-        router.startRoutingSocketListener() catch |err| {
-            std.debug.print("[ROUTER] Warning: Failed to start routing socket listener: {}\n", .{err});
-        };
+        // Run event loop
 
         // Run event loop
         std.debug.print("[ROUTER] Starting event loop...\n", .{});
@@ -1059,14 +1046,8 @@ pub const Router = struct {
 
     /// Handle network pause (no default interface)
     fn handleNetworkPause(router: *Router) void {
-        std.debug.print("[NET] Network paused (no default interface)\n", .{});
+        std.debug.print("[NET] Network paused\n", .{});
         router.is_paused = true;
-
-        if (router.network_listener) |listener| {
-            if (listener.onNetworkPaused) |cb| {
-                cb(listener.userdata);
-            }
-        }
 
         // Close SOCKS5 connection
         if (router.socks5_conn) |conn| {
@@ -1081,12 +1062,6 @@ pub const Router = struct {
         std.debug.print("[NET] Network resumed\n", .{});
         router.is_paused = false;
 
-        if (router.network_listener) |listener| {
-            if (listener.onNetworkResumed) |cb| {
-                cb(listener.userdata);
-            }
-        }
-
         // Reselect egress interface
         router.reselectEgressInterface() catch |err| {
             std.debug.print("[NET] Failed to reselect egress: {}\n", .{err});
@@ -1098,11 +1073,10 @@ pub const Router = struct {
         std.debug.print("[NET] Route changed\n", .{});
         router._stats.route_updates += 1;
 
-        if (router.network_listener) |listener| {
-            if (listener.onRoutesChanged) |cb| {
-                cb(listener.userdata);
-            }
-        }
+        // Reselect egress interface on route changes
+        router.reselectEgressInterface() catch |err| {
+            std.debug.print("[NET] Failed to reselect egress on route change: {}\n", .{err});
+        };
     }
 
     /// Re-select egress interface after network change
@@ -1132,33 +1106,23 @@ pub const Router = struct {
         std.debug.print("[NET] Egress interface reselected successfully\n", .{});
     }
 
-    /// Start BSD Routing Socket listener for network changes
-    fn startRoutingSocketListener(router: *Router) !void {
-        const family = AF_ROUTE;  // BSD Routing socket
-        const sock = std.posix.socket(family, std.posix.SOCK.RAW, 0) catch {
-            std.debug.print("[ROUTE] Failed to create routing socket\n", .{});
-            return error.SocketFailed;
-        };
+    /// Network change callback for monitor
+    fn onNetworkChangeCallback(event: *const monitor.NetworkEvent, userdata: ?*anyopaque) void {
+        const router = @as(*Router, @ptrCast(@alignCast(userdata orelse return)));
 
-        // Set non-blocking
-        const flags = std.posix.fcntl(sock, F_GETFL, 0) catch 0;
-        _ = std.posix.fcntl(sock, F_SETFL, flags | O_NONBLOCK) catch {};
+        std.debug.print("[NET] Network change callback: {s}\n", .{@tagName(event.change)});
 
-        // Register with libxev for read events
-        router.routing_sock = sock;
-        router.routing_completion = .{
-            .op = .{
-                .read = .{
-                    .fd = sock,
-                    .buffer = .{ .slice = &router.route_buf },
-                },
+        switch (event.change) {
+            .interface_down, .network_losing => {
+                router.handleNetworkPause();
             },
-            .userdata = router,
-            .callback = onRoutingSocketReadable,
-        };
-        router.loop.add(&router.routing_completion);
-
-        std.debug.print("[ROUTE] Routing socket listener started (fd={})\n", .{sock});
+            .interface_up, .address_added, .address_removed => {
+                router.handleNetworkResume();
+            },
+            .route_changed => {
+                router.handleRoutesChanged();
+            },
+        }
     }
 
     /// Handle ICMP echo request - send echo reply
@@ -1502,121 +1466,5 @@ fn onSocks5Ready(userdata: ?*anyopaque) void {
 fn onSocks5Error(userdata: ?*anyopaque, err: socks5.Socks5Error) void {
     _ = userdata;
     std.debug.print("[SOCKS5] Error occurred: {}\n", .{err});
-}
-
-// ============ BSD Routing Socket Event Handling ============
-
-/// BSD Routing Socket message types
-const RTM_ADD = 0x1;
-const RTM_DELETE = 0x2;
-const RTM_CHANGE = 0x3;
-const RTM_GET = 0x4;
-const RTM_LOSING = 0x5;
-const RTM_IFINFO = 0x6;
-const RTM_NEWMADDR = 0x7;
-const RTM_DELMADDR = 0x8;
-const RTM_IFINFO2 = 0xa;
-const RTM_NEWADDR = 0xb;
-const RTM_DELADDR = 0xc;
-const RTM_OIFINFO = 0xd;
-
-/// Routing socket message header (BSD)
-const rt_msghdr = extern struct {
-    rtm_msglen: u16,
-    rtm_version: u8,
-    rtm_type: u8,
-    rtm_index: u16,
-    rtm_flags: i32,
-    rtm_addrs: i32,
-    rtm_pid: i32,
-    rtm_seq: i32,
-    rtm_errno: i32,
-    rtm_use: i32,
-    rtm_inits: i32,
-    rtm_rmx: rtmetrics,
-};
-
-/// Routing metrics (simplified)
-const rtmetrics = extern struct {
-    rmx_locks: u32,
-    rmx_mtu: u32,
-    rmx_hopcount: i32,
-    rmx_expire: i32,
-    rmx_recvpipe: i32,
-    rmx_sendpipe: i32,
-    rmx_ssthresh: i32,
-    rmx_rtt: i32,
-    rmx_rttvar: i32,
-    rmx_pksent: i32,
-    rmx_filler: [4]i32,
-};
-
-/// Handle routing socket readable event
-fn onRoutingSocketReadable(
-    userdata: ?*anyopaque,
-    loop: *xev.Loop,
-    completion: *xev.Completion,
-    result: xev.Result,
-) xev.CallbackAction {
-    const router = @as(*Router, @ptrCast(@alignCast(userdata orelse return .disarm)));
-
-    const n = result.read catch |err| {
-        std.debug.print("[ROUTE] Routing socket read error: {}\n", .{err});
-        return .disarm;
-    };
-
-    if (n == 0) {
-        return .disarm;
-    }
-
-    // Parse routing message header
-    if (n < @sizeOf(rt_msghdr)) {
-        std.debug.print("[ROUTE] Truncated routing message\n", .{});
-    } else {
-        const msg = @as(*const rt_msghdr, @ptrCast(@alignCast(&router.route_buf)));
-
-        std.debug.print("[ROUTE] RTM message: type={}, index={}\n", .{ msg.rtm_type, msg.rtm_index });
-
-        switch (msg.rtm_type) {
-            RTM_IFINFO => {
-                // Interface status changed (up/down)
-                std.debug.print("[ROUTE] IFINFO: interface {} changed\n", .{msg.rtm_index});
-                router.handleNetworkChange(&[_]u8{}, msg.rtm_index);
-            },
-            RTM_NEWADDR => {
-                // Address added
-                std.debug.print("[ROUTE] NEWADDR: address added on interface {}\n", .{msg.rtm_index});
-                router.handleRoutesChanged();
-            },
-            RTM_DELADDR => {
-                // Address removed
-                std.debug.print("[ROUTE] DELADDR: address removed on interface {}\n", .{msg.rtm_index});
-                router.handleRoutesChanged();
-            },
-            RTM_LOSING => {
-                // Route is losing (network is down)
-                std.debug.print("[ROUTE] LOSING: route losing\n", .{});
-                router.handleNetworkPause();
-            },
-            else => {
-                std.debug.print("[ROUTE] Unhandled RTM type: {}\n", .{msg.rtm_type});
-            },
-        }
-    }
-
-    // Re-submit read
-    completion.* = .{
-        .op = .{
-            .read = .{
-                .fd = router.routing_sock orelse return .disarm,
-                .buffer = .{ .slice = &router.route_buf },
-            },
-        },
-        .userdata = router,
-        .callback = onRoutingSocketReadable,
-    };
-    loop.add(completion);
-
-    return .disarm;
 }
 
