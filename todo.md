@@ -7,6 +7,80 @@
 
 ## Current Tasks
 
+### Phase 7.8: SOCKS5 TCP Handshake Fix (IN PROGRESS)
+
+**Date**: 2026-02-12
+
+**Problem**: TCP SYN packets received from TUN but SYN-ACK not sent back to client, causing curl to hang waiting for connection
+
+**Root Causes**:
+1. SOCKS5 client callbacks were not firing due to incorrect libxev API usage
+2. SYN-ACK response was not implemented - only logged as TODO
+3. Pending SYN information (src_ip, src_port, seq_num) was not stored for later use
+
+**Fixes**:
+1. **Rewrote socks5.zig with correct libxev API** (`src/router/proxy/socks5.zig`):
+   - Used raw `std.posix.socket` + `xev.Completion` pattern
+   - Fixed callback signatures for libxev 0.2+ completion callbacks
+   - Added proper error handling and state machine
+
+2. **Added SYN info storage in Router** (`src/router/mod.zig:307-311`):
+   - Added `pending_syn` field to store client connection info
+   - Stores src_ip, src_port, and seq_num when SYN is received
+
+3. **Implemented TCP sequence number extraction** (`src/router/mod.zig:715-727`):
+   - Added `extractTcpSeqNum()` function to parse TCP header
+   - Returns sequence number for SYN-ACK construction
+
+4. **Implemented SYN-ACK response** (`src/router/mod.zig:888-937`):
+   - Added `sendSynAck()` function to construct IP+TCP headers
+   - Calculates IP and TCP checksums using ipstack.checksum
+   - Sends constructed packet back to TUN device
+
+5. **Updated tunnel ready callback** (`src/router/mod.zig:1304-1325`):
+   - Modified `onSocks5TunnelReady()` to call `sendSynAck()`
+   - Clears pending SYN after response is sent
+
+**Key Code Changes**:
+```zig
+// Router struct addition
+pending_syn: ?struct {
+    src_ip: u32,
+    src_port: u16,
+    seq_num: u32,
+} = null,
+
+// SYN-ACK construction
+fn sendSynAck(router: *Router, src_ip: u32, src_port: u16, ...) !void {
+    // Build IP header (20 bytes)
+    // Build TCP header (20 bytes) with SYN+ACK flags
+    // Calculate checksums
+    router.writeToTunBuf(packet);
+}
+
+// Tunnel ready callback
+fn onSocks5TunnelReady(userdata: ?*anyopaque) void {
+    // ...
+    if (router.pending_syn) |syn| {
+        router.sendSynAck(syn.src_ip, syn.src_port, client.dst_ip, client.dst_port, syn.seq_num) catch {
+            return;
+        };
+        router.pending_syn = null;
+    }
+}
+```
+
+**Verification**:
+```bash
+# Build test
+zig build tun2sock  # SUCCESS
+
+# Test with curl (requires SOCKS5 proxy running)
+curl -v --proxy socks5://127.0.0.1:1080 http://111.45.11.5/
+```
+
+---
+
 ### Phase 7.7: TUN and Routing Bug Fixes (COMPLETED)
 
 **Date**: 2026-02-12
