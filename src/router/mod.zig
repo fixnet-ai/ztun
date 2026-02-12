@@ -72,6 +72,14 @@ const O_NONBLOCK = 0x4000; // Non-blocking socket
 const F_GETFL = 3;
 const F_SETFL = 4;
 
+// TCP flag constants
+const TCP_FIN = 0x01;
+const TCP_SYN = 0x02;
+const TCP_RST = 0x04;
+const TCP_PSH = 0x08;
+const TCP_ACK = 0x10;
+const TCP_URG = 0x20;
+
 /// sockaddr_in for IPv4 (macOS/Linux compatible)
 const sockaddr_in = extern struct {
     sin_len: u8 = 0,
@@ -644,6 +652,14 @@ pub const Router = struct {
 
     /// Forward packet based on route decision
     fn forwardPacket(router: *Router, packet: *const Packet) !void {
+        std.debug.print("\n[FORWARD] ============================================\n", .{});
+        std.debug.print("[FORWARD] forwardPacket called at {}\n", .{std.time.nanoTimestamp()});
+        std.debug.print("[FORWARD] Packet: {s}:{} -> {s}:{} proto={}\n", .{
+            fmtIp(packet.src_ip), packet.src_port,
+            fmtIp(packet.dst_ip), packet.dst_port,
+            packet.protocol });
+        std.debug.print("[FORWARD] Packet data len: {}\n", .{packet.data.len});
+
         const decision = router.config.route_cb(
             packet.src_ip,
             packet.src_port,
@@ -652,38 +668,57 @@ pub const Router = struct {
             packet.protocol,
         );
 
-        std.debug.print("[ROUTER] Route decision: {any}, dst={x:0>8}:{}\n", .{ decision, packet.dst_ip, packet.dst_port });
+        std.debug.print("[FORWARD] Route decision: {s}\n", .{@tagName(decision)});
+        std.debug.print("[FORWARD] SOCKS5 conn available: {}\n", .{router.socks5_conn != null});
 
         switch (decision) {
             .Direct => {
+                std.debug.print("[FORWARD] Action: forwardToEgress (Direct)\n", .{});
                 try router.forwardToEgress(packet);
                 router._stats.packets_forwarded += 1;
             },
             .Socks5 => {
+                std.debug.print("[FORWARD] Action: forwardToProxy (Socks5)\n", .{});
                 try router.forwardToProxy(packet);
                 router._stats.packets_forwarded += 1;
             },
             .Drop => {
+                std.debug.print("[FORWARD] Action: Drop packet\n", .{});
                 router._stats.packets_dropped += 1;
             },
             .Local => {
+                std.debug.print("[FORWARD] Action: writeToTun (Local)\n", .{});
                 try router.writeToTun(packet);
                 router._stats.packets_forwarded += 1;
             },
             .Nat => {
+                std.debug.print("[FORWARD] Action: forwardWithNat (Nat)\n", .{});
                 try router.forwardWithNat(packet);
                 router._stats.packets_forwarded += 1;
             },
-            else => {},
+            else => {
+                std.debug.print("[FORWARD-WARN] Unhandled decision: {s}\n", .{@tagName(decision)});
+            },
         }
+        std.debug.print("[FORWARD] forwardPacket complete\n", .{});
+        std.debug.print("[FORWARD-EXIT] ============================================\n\n", .{});
     }
 
     /// Forward packet through SOCKS5 proxy (TCP)
+    /// This is the CRITICAL PATH for TCP connections via SOCKS5 proxy
     fn forwardToProxy(router: *Router, packet: *const Packet) !void {
+        std.debug.print("\n[SOCKS5-PATH] ============================================\n", .{});
+        std.debug.print("[SOCKS5-PATH] forwardToProxy called at {}\n", .{std.time.nanoTimestamp()});
+        std.debug.print("[SOCKS5-PATH] Packet: {s}:{} -> {s}:{} proto={}\n", .{
+            fmtIp(packet.src_ip), packet.src_port,
+            fmtIp(packet.dst_ip), packet.dst_port,
+            packet.protocol });
+
         // TCP packets are handled via SOCKS5 proxy
 
         if (router.socks5_conn == null) {
-            std.debug.print("[SOCKS5] No SOCKS5 connection available\n", .{});
+            std.debug.print("[SOCKS5-PATH-ERROR] No SOCKS5 connection available!\n", .{});
+            std.debug.print("[SOCKS5-PATH-ACTION] Dropping packet\n", .{});
             router._stats.packets_dropped += 1;
             return;
         }
@@ -691,34 +726,59 @@ pub const Router = struct {
         const client = router.socks5_conn.?;
         const state = client.getState();
 
+        std.debug.print("[SOCKS5-PATH] Client state: {s}\n", .{@tagName(state)});
+        std.debug.print("[SOCKS5-PATH] Client dst_ip: {s}:{}\n", .{fmtIp(client.dst_ip), client.dst_port});
+        std.debug.print("[SOCKS5-PATH] Packet dst_ip: {s}:{}\n", .{fmtIp(packet.dst_ip), packet.dst_port});
+
         // Check if we're already connected for this destination
         if (state == .Ready) {
+            std.debug.print("[SOCKS5-PATH] Client is Ready\n", .{});
             // Check if this is a new connection to a different destination
             if (client.dst_ip != packet.dst_ip or client.dst_port != packet.dst_port) {
+                std.debug.print("[SOCKS5-PATH] Different destination, will reconnect\n", .{});
                 // Different destination - close old connection and start new one
-                std.debug.print("[SOCKS5] New destination, reconnecting...\n", .{});
+                client.close();
+                client.state = .Disconnected;
+                client.dst_ip = 0;
+                client.dst_port = 0;
             } else {
-                // Same destination, forward the data
-                std.debug.print("[SOCKS5] Forwarding data (connected)\n", .{});
-                _ = client.send(packet.data) catch {
-                    router._stats.packets_dropped += 1;
-                };
-                return;
+                std.debug.print("[SOCKS5-PATH] Same destination, will forward data\n", .{});
             }
+        } else {
+            std.debug.print("[SOCKS5-PATH] Client state is {s}, not Ready\n", .{@tagName(state)});
         }
 
-        // Extract payload to check if this is a SYN packet
-        const payload = extractTcpPayload(packet);
-        const is_syn = payload.len == 0;
+        // Extract TCP flags to check if this is a SYN packet
+        // TCP flags byte is at: IP header (20) + TCP offset 13
+        var tcp_flags: u8 = 0;
+        if (packet.data.len >= 34) {
+            tcp_flags = packet.data[33];
+        }
+
+        // CRITICAL: Use TCP flags to determine SYN, NOT payload length
+        // SYN packets have TCP header but NO payload, but may have TCP options (MSS, etc.)
+        const is_syn = (tcp_flags & TCP_SYN) != 0 and (tcp_flags & TCP_ACK) == 0;
+
+        std.debug.print("[SOCKS5-PATH] TCP flags: 0x{X:0>2} SYN={} ACK={}\n", .{tcp_flags, (tcp_flags & TCP_SYN) != 0, (tcp_flags & TCP_ACK) != 0});
+        std.debug.print("[SOCKS5-PATH] is_syn: {} (based on TCP flags)\n", .{is_syn});
+
+        // If client is Connecting and this is NOT a SYN, drop the packet
+        // Retries will resend the SYN after timeout
+        if (state != .Ready and !is_syn) {
+            std.debug.print("[SOCKS5-PATH-WARN] Client connecting, dropping non-SYN packet (will retry)\n", .{});
+            std.debug.print("[SOCKS5-PATH-ACTION] Dropping packet, waiting for SOCKS5 handshake\n", .{});
+            router._stats.packets_dropped += 1;
+            std.debug.print("[SOCKS5-PATH-EXIT] ============================================\n\n", .{});
+            return;
+        }
 
         if (is_syn) {
             // SYN packet - need to complete SOCKS5 connection then send SYN-ACK
-            std.debug.print("[SOCKS5] SYN packet, connecting to {s}:{}...\n", .{
-                fmtIp(packet.dst_ip), packet.dst_port });
+            std.debug.print("[SOCKS5-PATH] SYN detected - initiating SOCKS5 connection\n", .{});
 
             // Extract sequence number for SYN-ACK response
             const seq_num = extractTcpSeqNum(packet);
-            std.debug.print("[SOCKS5] Client seq={}, will send SYN-ACK later\n", .{seq_num});
+            std.debug.print("[SOCKS5-PATH] Client SEQ: {}\n", .{seq_num});
 
             // Store pending SYN info for SYN-ACK response later
             router.pending_syn = .{
@@ -726,22 +786,90 @@ pub const Router = struct {
                 .src_port = packet.src_port,
                 .seq_num = seq_num,
             };
+
+            std.debug.print("[SOCKS5-PATH] Stored pending_syn: {s}:{} seq={}\n", .{
+                fmtIp(packet.src_ip), packet.src_port, seq_num });
+
             client.dst_ip = packet.dst_ip;
             client.dst_port = packet.dst_port;
 
-            // Connect to SOCKS5 proxy (pending_data will be sent after connection)
-            client.connect(packet.dst_ip, packet.dst_port, null) catch {
-                std.debug.print("[SOCKS5] Failed to connect to proxy\n", .{});
+            // Connect to SOCKS5 proxy using blocking connect (simpler for SYN handling)
+            std.debug.print("[SOCKS5-PATH] Blocking connect to proxy...\n", .{});
+            client.connectBlocking(packet.dst_ip, packet.dst_port) catch |err| {
+                std.debug.print("[SOCKS5-PATH-ERROR] blocking connect failed: {}\n", .{err});
+                std.debug.print("[SOCKS5-PATH-ACTION] Dropping packet, clearing pending_syn\n", .{});
                 router._stats.packets_dropped += 1;
                 router.pending_syn = null;
+                return;
             };
+            std.debug.print("[SOCKS5-PATH] Blocking connect succeeded!\n", .{});
+
+            // Send SYN-ACK to complete TCP handshake
+            if (router.pending_syn) |syn| {
+                std.debug.print("[SOCKS5-PATH] Sending SYN-ACK to client...\n", .{});
+                router.sendSynAck(syn.src_ip, syn.src_port, client.dst_ip, client.dst_port, syn.seq_num) catch |err| {
+                    std.debug.print("[SOCKS5-PATH-ERROR] sendSynAck failed: {}\n", .{err});
+                    router.pending_syn = null;
+                    return;
+                };
+                router.pending_syn = null;
+                std.debug.print("[SOCKS5-PATH] SYN-ACK sent successfully!\n", .{});
+            } else {
+                std.debug.print("[SOCKS5-PATH-WARN] No pending_syn found!\n", .{});
+            }
         } else {
-            // Non-SYN packet
-            std.debug.print("[SOCKS5] Starting connection...\n", .{});
-            client.connect(packet.dst_ip, packet.dst_port, if (payload.len > 0) payload else null) catch {
-                router._stats.packets_dropped += 1;
-            };
+            // Non-SYN packet - check if we need to establish a new SOCKS5 connection
+            std.debug.print("[SOCKS5-PATH] Forwarding non-SYN packet (state={s})\n", .{@tagName(state)});
+            std.debug.print("[SOCKS5-PATH] Current dst: {s}:{}, New dst: {s}:{}\n", .{
+                fmtIp(client.dst_ip), client.dst_port,
+                fmtIp(packet.dst_ip), packet.dst_port });
+
+            // Check if the destination matches the current SOCKS5 connection
+            const same_dst = client.dst_ip == packet.dst_ip and client.dst_port == packet.dst_port;
+            std.debug.print("[SOCKS5-PATH] Same destination: {}\n", .{same_dst});
+
+            if (!same_dst) {
+                // Different destination - need to establish new SOCKS5 connection
+                std.debug.print("[SOCKS5-PATH] Different destination, will reconnect\n", .{});
+                client.close();
+                client.state = .Disconnected;
+                client.dst_ip = 0;
+                client.dst_port = 0;
+
+                // Set dst info and do blocking connect
+                client.dst_ip = packet.dst_ip;
+                client.dst_port = packet.dst_port;
+
+                std.debug.print("[SOCKS5-PATH] Blocking connect to proxy for new dst...\n", .{});
+                client.connectBlocking(packet.dst_ip, packet.dst_port) catch |err| {
+                    std.debug.print("[SOCKS5-PATH-ERROR] reconnect failed: {}\n", .{err});
+                    router._stats.packets_dropped += 1;
+                    return;
+                };
+                std.debug.print("[SOCKS5-PATH] Reconnect succeeded!\n", .{});
+            }
+
+            // Forward the data
+            const payload = extractTcpPayload(packet);
+            std.debug.print("[SOCKS5-PATH] Payload len: {}\n", .{payload.len});
+            if (payload.len > 0) {
+                std.debug.print("[SOCKS5-PATH] Calling send...\n", .{});
+                _ = client.send(packet.data) catch |err| {
+                    std.debug.print("[SOCKS5-PATH-ERROR] client.send failed: {}\n", .{err});
+                    router._stats.packets_dropped += 1;
+                };
+                std.debug.print("[SOCKS5-PATH] Send completed, checking for response...\n", .{});
+
+                // Manually check for proxy response (workaround for libxev callback issue)
+                client.checkForResponse() catch |err| {
+                    std.debug.print("[SOCKS5-PATH] checkForResponse error: {}\n", .{err});
+                };
+                std.debug.print("[SOCKS5-PATH] checkForResponse done\n", .{});
+            } else {
+                std.debug.print("[SOCKS5-PATH] No payload to forward\n", .{});
+            }
         }
+        std.debug.print("[SOCKS5-PATH-EXIT] ============================================\n\n", .{});
     }
 
     /// Extract TCP payload from packet
@@ -939,8 +1067,13 @@ pub const Router = struct {
     /// Send TCP SYN-ACK packet to complete three-way handshake
     /// Called after SOCKS5 tunnel is established
     fn sendSynAck(router: *Router, src_ip: u32, src_port: u16, dst_ip: u32, dst_port: u16, client_seq: u32) !void {
-        std.debug.print("[TCP-SYNACK] Sending SYN-ACK to {s}:{} (seq={}, ack={})\n", .{
-            fmtIp(src_ip), src_port, src_ip, client_seq + 1 });
+        std.debug.print("\n[SYNACK] ============================================\n", .{});
+        std.debug.print("[SYNACK] sendSynAck called at {}\n", .{std.time.nanoTimestamp()});
+        std.debug.print("[SYNACK] src_ip={s}:{} (server)\n", .{fmtIp(src_ip), src_port});
+        std.debug.print("[SYNACK] dst_ip={s}:{} (client)\n", .{fmtIp(dst_ip), dst_port});
+        std.debug.print("[SYNACK] client_seq={} ack_num={}\n", .{client_seq, client_seq + 1});
+
+        std.debug.print("[SYNACK] Building SYN-ACK packet...\n", .{});
 
         // Build IP + TCP header
         const ip_len: u16 = 40; // IP header (20) + TCP header (20)
@@ -957,8 +1090,10 @@ pub const Router = struct {
         router.write_buf[ip_offset + 8] = 64; // TTL
         router.write_buf[ip_offset + 9] = 6; // Protocol = TCP
         std.mem.writeInt(u16, router.write_buf[ip_offset + 10 .. ip_offset + 12], 0, .big); // Checksum (will calc)
-        std.mem.writeInt(u32, router.write_buf[ip_offset + 12 .. ip_offset + 16], dst_ip, .big); // Source IP (server)
-        std.mem.writeInt(u32, router.write_buf[ip_offset + 16 .. ip_offset + 20], src_ip, .big); // Dest IP (client)
+        std.mem.writeInt(u32, router.write_buf[ip_offset + 12 .. ip_offset + 16], src_ip, .big); // Source IP (server)
+        std.mem.writeInt(u32, router.write_buf[ip_offset + 16 .. ip_offset + 20], dst_ip, .big); // Dest IP (client)
+
+        std.debug.print("[SYNACK] IP header built: src={s} dst={s}\n", .{fmtIp(src_ip), fmtIp(dst_ip)});
 
         // TCP header
         const tcp_offset = 20;
@@ -967,14 +1102,17 @@ pub const Router = struct {
         std.mem.writeInt(u32, router.write_buf[tcp_offset + 4 .. tcp_offset + 8], 0, .big); // Seq number (server's initial)
         std.mem.writeInt(u32, router.write_buf[tcp_offset + 8 .. tcp_offset + 12], client_seq + 1, .big); // Ack number
         router.write_buf[tcp_offset + 12] = 0x50; // Data offset (5 * 4 = 20) + Reserved
-        router.write_buf[tcp_offset + 13] = 0x12; // Flags: SYN + ACK
+        router.write_buf[tcp_offset + 13] = 0x12; // Flags: SYN + ACK (0x12)
         std.mem.writeInt(u16, router.write_buf[tcp_offset + 14 .. tcp_offset + 16], 65535, .big); // Window
         std.mem.writeInt(u16, router.write_buf[tcp_offset + 16 .. tcp_offset + 18], 0, .big); // Checksum
         std.mem.writeInt(u16, router.write_buf[tcp_offset + 18 .. tcp_offset + 20], 0, .big); // Urgent pointer
 
+        std.debug.print("[SYNACK] TCP header built: SYN+ACK flags=0x12\n", .{});
+
         // Calculate IP checksum using ipstack.checksum
         const ip_checksum = ipstack.checksum.checksum(router.write_buf[0..20], 0);
         std.mem.writeInt(u16, router.write_buf[10 .. 12], ip_checksum, .big);
+        std.debug.print("[SYNACK] IP checksum: {x:0>4}\n", .{ip_checksum});
 
         // Calculate TCP checksum (requires pseudo-header)
         var tcp_sum: u32 = 0;
@@ -988,10 +1126,12 @@ pub const Router = struct {
         // TCP header
         const tcp_sum_final = ipstack.checksum.checksum(router.write_buf[tcp_offset..tcp_offset + 20], tcp_sum);
         std.mem.writeInt(u16, router.write_buf[tcp_offset + 16 .. tcp_offset + 18], tcp_sum_final, .big);
+        std.debug.print("[SYNACK] TCP checksum: {x:0>4}\n", .{tcp_sum_final});
 
-        // Write to TUN
+        std.debug.print("[SYNACK] Writing {} bytes to TUN...\n", .{ip_len});
         try router.writeToTunBuf(router.write_buf[0..ip_len]);
-        std.debug.print("[TCP-SYNACK] SYN-ACK sent successfully\n", .{});
+        std.debug.print("[SYNACK] SYN-ACK sent successfully!\n", .{});
+        std.debug.print("[SYNACK-EXIT] ============================================\n\n", .{});
     }
 
     // ============ Network Change Detection ============
@@ -1275,7 +1415,7 @@ pub const Router = struct {
     }
 };
 
-/// TUN readable callback (libxev callback)
+/// TUN readable callback (libxev callback) - ENTRY POINT FOR ALL INCOMING PACKETS
 fn onTunReadable(
     userdata: ?*anyopaque,
     loop: *xev.Loop,
@@ -1286,68 +1426,74 @@ fn onTunReadable(
     _ = completion;
 
     const router = @as(*Router, @ptrCast(@alignCast(userdata orelse return .disarm)));
-    std.debug.print("[TUN-CB] onTunReadable called, result={any}\n", .{result});
+    std.debug.print("\n[TUN-CB-ENTRY] ============================================\n", .{});
+    std.debug.print("[TUN-CB-ENTRY] onTunReadable called at {}\n", .{std.time.nanoTimestamp()});
+    std.debug.print("[TUN-CB-ENTRY] result type: {s}\n", .{@tagName(result)});
+    std.debug.print("[TUN-CB-ENTRY] router.state: {s}\n", .{@tagName(router.state)});
 
     // Check for read result (result.read is error union !usize)
-    const n = result.read catch {
-        std.debug.print("[TUN] Read error, resubmitting\n", .{});
+    const n = result.read catch |err| {
+        std.debug.print("[TUN-CB-ERROR] Read failed: {}\n", .{err});
+        std.debug.print("[TUN-CB-ACTION] Resubmitting TUN read\n", .{});
         router.submitTunRead();
         return .disarm;
     };
     if (n == 0) {
-        // EOF, resubmit read
-        std.debug.print("[TUN] EOF received, resubmitting\n", .{});
+        std.debug.print("[TUN-CB-WARN] EOF received (n=0)\n", .{});
+        std.debug.print("[TUN-CB-ACTION] Resubmitting TUN read\n", .{});
         router.submitTunRead();
         return .disarm;
     }
-    std.debug.print("[TUN] Read {} bytes from TUN\n", .{n});
 
+    std.debug.print("[TUN-CB] Read {} bytes from TUN (fd={})\n", .{n, router.tunFd()});
     router._stats.bytes_rx += n;
 
     // Check for macOS utun 4-byte AF_INET header
-    // Observed: first 4 bytes are 0x00000002 (AF_INET family)
-    // Byte 3 contains AF_INET=2 (bytes 0-2 are zero padding)
-    // IP header starts at byte 4: 0x45 = IPv4 with 20-byte header
     var packet_offset: usize = 0;
     if (n >= 4 and router.packet_buf[3] == 2) {
-        // UTUN header detected, skip 4 bytes
+        std.debug.print("[TUN-CB] UTUN header detected (AF_INET=2), skipping 4 bytes\n", .{});
         packet_offset = 4;
     }
 
     if (n - packet_offset < 20) {
+        std.debug.print("[TUN-CB-WARN] Packet too small ({} < 20), dropping\n", .{n - packet_offset});
         router.submitTunRead();
         return .disarm;
     }
 
-    // Packet data starts at packet_offset
-    const packet_data = router.packet_buf[packet_offset..n];
+    // Extract packet info for logging
+    const proto_byte = router.packet_buf[packet_offset + 9];
+    const src_ip = std.mem.readInt(u32, router.packet_buf[packet_offset + 12..][0..4], .big);
+    const dst_ip = std.mem.readInt(u32, router.packet_buf[packet_offset + 16..][0..4], .big);
 
-    const protocol = packet_data[9];
-
-    // ICMP protocol = 1
-    if (protocol == 1) {
-        const ver_ihl = packet_data[0];
-        const ip_header_len = @as(usize, ver_ihl & 0x0F) * 4;
-        router.handleIcmpEcho(packet_offset, n - packet_offset, ip_header_len) catch {};
-        router.submitTunRead();
-        return .disarm;
-    }
+    std.debug.print("[TUN-CB] Packet: {s}:{} -> {s}:{} proto={}\n", .{
+        fmtIp(src_ip), 0, fmtIp(dst_ip), 0, proto_byte });
 
     // Parse and forward packet
-    // NOTE: Copy packet data to avoid buffer reuse issues with libxev
     const raw_data = router.packet_buf[packet_offset..n];
     @memcpy(router.write_buf[0..raw_data.len], raw_data);
     const packet_copy = router.write_buf[0..raw_data.len];
 
-    const packet = router.parsePacket(packet_copy) catch {
+    const packet = router.parsePacket(packet_copy) catch |err| {
+        std.debug.print("[TUN-CB-ERROR] Parse packet failed: {}\n", .{err});
         router.submitTunRead();
         return .disarm;
     };
 
-    router.forwardPacket(&packet) catch {};
+    std.debug.print("[TUN-CB] Parsed: {s}:{} -> {s}:{} proto={}\n", .{
+        fmtIp(packet.src_ip), packet.src_port,
+        fmtIp(packet.dst_ip), packet.dst_port,
+        packet.protocol });
 
-    // Resubmit read
+    std.debug.print("[TUN-CB] Calling forwardPacket...\n", .{});
+    router.forwardPacket(&packet) catch |err| {
+        std.debug.print("[TUN-CB-ERROR] forwardPacket failed: {}\n", .{err});
+    };
+
+    // Submit next TUN read
     router.submitTunRead();
+    std.debug.print("[TUN-CB] Submitted next TUN read\n", .{});
+    std.debug.print("[TUN-CB-EXIT] ============================================\n\n", .{});
     return .disarm;
 }
 
@@ -1383,12 +1529,19 @@ fn onNatTimer(
 fn onSocks5Data(userdata: ?*anyopaque, data: []const u8) void {
     const router = @as(*Router, @ptrCast(@alignCast(userdata orelse return)));
 
+    std.debug.print("\n[SOCKS5-DATA] ============================================\n", .{});
+    std.debug.print("[SOCKS5-DATA] onSocks5Data called at {}\n", .{std.time.nanoTimestamp()});
+    std.debug.print("[SOCKS5-DATA] Received {} bytes from proxy\n", .{data.len});
+
     // Get destination info from Socks5Client
-    if (router.socks5_conn == null) return;
+    if (router.socks5_conn == null) {
+        std.debug.print("[SOCKS5-DATA-ERROR] No SOCKS5 client, dropping data\n", .{});
+        return;
+    }
     const client = router.socks5_conn.?;
 
-    std.debug.print("[SOCKS5-DATA] Received {} bytes from proxy\n", .{data.len});
-    std.debug.print("[SOCKS5-DATA] dst_ip={s}, dst_port={}\n", .{ fmtIp(client.dst_ip), client.dst_port });
+    std.debug.print("[SOCKS5-DATA] From target: {s}:{}\n", .{fmtIp(client.dst_ip), client.dst_port});
+    std.debug.print("[SOCKS5-DATA] To TUN client: {s}:{}\n", .{fmtIp(router.config.tun.ip), 0});
 
     // Build IP header at position 0-19
     const total_len = 20 + data.len; // IP header + payload
@@ -1421,36 +1574,55 @@ fn onSocks5Data(userdata: ?*anyopaque, data: []const u8) void {
     const ip_sum = ipstack.checksum.checksum(router.write_buf[0..20], 0);
     std.mem.writeInt(u16, router.write_buf[10..12], ip_sum, .big);
 
+    std.debug.print("[SOCKS5-DATA] Writing {} bytes to TUN...\n", .{total_len});
+
     // Write to TUN
     router.writeToTunBuf(router.write_buf[0..total_len]) catch |err| {
-        std.debug.print("[SOCKS5-DATA] Failed to write to TUN: {}\n", .{err});
+        std.debug.print("[SOCKS5-DATA-ERROR] Failed to write to TUN: {}\n", .{err});
     };
+    std.debug.print("[SOCKS5-DATA] Data written to TUN successfully\n", .{});
+    std.debug.print("[SOCKS5-DATA-EXIT] ============================================\n\n", .{});
 }
 
 /// SOCKS5 tunnel ready callback - SOCKS5 CONNECT succeeded, send SYN-ACK to client
 fn onSocks5TunnelReady(userdata: ?*anyopaque) void {
     const router = @as(*Router, @ptrCast(@alignCast(userdata orelse return)));
 
+    std.debug.print("\n[SOCKS5-TUNNEL] ============================================\n", .{});
+    std.debug.print("[SOCKS5-TUNNEL] onSocks5TunnelReady called at {}\n", .{std.time.nanoTimestamp()});
+
     if (router.socks5_conn) |client| {
+        std.debug.print("[SOCKS5-TUNNEL] SOCKS5 client state: {s}\n", .{@tagName(client.getState())});
+        std.debug.print("[SOCKS5-TUNNEL] Client target: {s}:{}\n", .{fmtIp(client.dst_ip), client.dst_port});
+
         if (router.pending_syn) |syn| {
-            std.debug.print("[SOCKS5-TUNNEL] Tunnel ready, sending SYN-ACK to client {s}:{}...\n", .{
-                fmtIp(syn.src_ip), syn.src_port });
+            std.debug.print("[SOCKS5-TUNNEL] Pending SYN found:\n", .{});
+            std.debug.print("[SOCKS5-TUNNEL]   client: {s}:{} seq={}\n", .{
+                fmtIp(syn.src_ip), syn.src_port, syn.seq_num });
+            std.debug.print("[SOCKS5-TUNNEL]   server: {s}:{}\n", .{
+                fmtIp(client.dst_ip), client.dst_port });
 
             // Send SYN-ACK to complete TCP handshake
             // dst_ip/dst_port are the server (target)
             // src_ip/src_port are the client that sent the SYN
-            router.sendSynAck(syn.src_ip, syn.src_port, client.dst_ip, client.dst_port, syn.seq_num) catch {
-                std.debug.print("[SOCKS5-TUNNEL] Failed to send SYN-ACK\n", .{});
+            router.sendSynAck(syn.src_ip, syn.src_port, client.dst_ip, client.dst_port, syn.seq_num) catch |err| {
+                std.debug.print("[SOCKS5-TUNNEL-ERROR] sendSynAck failed: {}\n", .{err});
+                router.pending_syn = null;
                 return;
             };
 
             // Clear pending SYN since we've responded
             router.pending_syn = null;
-            std.debug.print("[SOCKS5-TUNNEL] SYN-ACK sent, handshake complete\n", .{});
+            std.debug.print("[SOCKS5-TUNNEL] SYN-ACK sent, handshake complete!\n", .{});
+            std.debug.print("[SOCKS5-TUNNEL] pending_syn cleared\n", .{});
         } else {
-            std.debug.print("[SOCKS5-TUNNEL] Tunnel ready (no pending SYN)\n", .{});
+            std.debug.print("[SOCKS5-TUNNEL-WARN] Tunnel ready but no pending SYN!\n", .{});
+            std.debug.print("[SOCKS5-TUNNEL-WARN] This should not happen - SYN should be stored before connect()\n", .{});
         }
+    } else {
+        std.debug.print("[SOCKS5-TUNNEL-ERROR] No SOCKS5 client!\n", .{});
     }
+    std.debug.print("[SOCKS5-TUNNEL-EXIT] ============================================\n\n", .{});
 }
 
 /// SOCKS5 ready callback - connection established
