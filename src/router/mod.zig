@@ -442,7 +442,8 @@ pub const Router = struct {
 
         // Initialize egress interface name from config
         var egress_iface_init: [64]u8 = undefined;
-        @memcpy(&egress_iface_init, config.egress.name);
+        const name_len = @min(config.egress.name.len, 63);
+        @memcpy(egress_iface_init[0..name_len], config.egress.name[0..name_len]);
 
         // Create Router as local variable first
         var router = Router{
