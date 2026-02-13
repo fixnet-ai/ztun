@@ -170,7 +170,67 @@ SOCKS5 UDP Response → onSocks5UdpData()
 
 ---
 
-## Completed Phases
+## Current Tasks
+
+### Phase 16: Fake-IP + DNS Interception (COMPLETED)
+
+**Goal**: Implement Fake-IP mode for DNS-based routing
+
+**Key Changes**:
+
+1. **DNS Module** (`src/dns.zig`)
+   - `DnsModule` struct with Fake-IP pool management
+   - `getFakeIp()` - allocate Fake-IP for domain
+   - `lookupByIp()` - find domain by Fake-IP
+   - `parseQuery()` - parse DNS query domain name
+   - `buildResponse()` - build Fake-IP DNS response
+
+2. **Fake-IP Range**
+   - 198.18.0.0/15 (198.18.0.0 - 198.19.255.255)
+   - Pool size configurable (default 8192 entries)
+   - Thread-safe allocation
+
+3. **DNS Features**
+   - DNS query parsing with name compression support
+   - Standard DNS response building
+   - TTL support (default 300 seconds)
+
+**Files Modified**:
+| File | Changes |
+|------|---------|
+| `src/dns.zig` | New DNS module with Fake-IP support |
+
+---
+
+### Phase 17: Rule Engine + Domain Matching (COMPLETED)
+
+**Goal**: Domain and IP-based traffic routing rules
+
+**Key Changes**:
+
+1. **Rule Engine** (`src/rules.zig`)
+   - `RuleSet` with priority-based rule evaluation
+   - `RuleType`: ip_cidr, domain_suffix, domain_exact, domain_keyword
+   - `RuleAction`: direct, proxy, block, dns
+
+2. **Matching**
+   - CIDR range matching for IPs
+   - Domain suffix matching (e.g., "example.com" matches "sub.example.com")
+   - Domain exact matching
+   - Domain keyword matching
+
+3. **GeoIP Support**
+   - `GeoIpDb` structure for country-based routing
+   - Placeholder for MaxMind DB integration
+
+**Files Modified**:
+| File | Changes |
+|------|---------|
+| `src/rules.zig` | New rule engine with domain/IP matching |
+
+---
+
+### Phase 18: IPv6 Support (IN PROGRESS)
 
 ### Phase 10: TCP Full-Duplex Data Forwarding (COMPLETED)
 
