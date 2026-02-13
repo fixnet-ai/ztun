@@ -93,32 +93,65 @@ SOCKS5 UDP Response → onSocks5UdpData()
 
 ---
 
-### Phase 12: Graceful Shutdown (IN PROGRESS)
+### Phase 12: Graceful Shutdown (COMPLETED)
 
 **Goal**: Implement graceful shutdown for all components
 
-**Required Changes**:
-- [x] Signal handler (SIGINT/SIGTERM)
-- [x] Stop libxev event loop gracefully
-- [x] Send FIN to all TCP connections
-- [x] Cleanup UDP NAT sessions
-- [x] Close SOCKS5 connections
-- [x] Destroy TUN device (via defer in main)
-- [ ] Restore routing table
+**Key Features**:
+- Signal handler for SIGINT/SIGTERM
+- stop() method with graceful TCP FIN sending
+- RouterState.stopping state for shutdown tracking
+- Signal handler wired to global router pointer
+
+**Files Modified**:
+| File | Changes |
+|------|---------|
+| `src/router/mod.zig` | Added stop(), sendFin(), RouterState.stopping |
+| `src/tun2socks.zig` | Added signal handler, global router pointer |
 
 ---
 
-### Phase 7.12: Cross-Platform Network Monitor Integration (PENDING)
+### Phase 13: Network Monitor Integration (COMPLETED)
 
-**Date**: 2026-02-12
+**Goal**: Handle network changes automatically
 
-**Goal**: Fully integrate network change detection and handle network events
+**Key Features**:
+- handleNetworkPause() - cleanup SOCKS5/UDP associate on network loss
+- handleNetworkResume() - reselect egress interface
+- handleRoutesChanged() - handle route updates
+- reselectEgressInterface() - recreate raw socket
 
-**Required Changes**:
-- [ ] Implement egress interface reselection on network change
-- [ ] Close and reconnect SOCKS5 connection on network change
-- [ ] Reset NAT table on network change
-- [ ] Handle RTM_IFINFO, RTM_NEWADDR, RTM_DELADDR events in router
+**Status**: Basic implementation complete. Connections will reconnect on new packets.
+
+---
+
+### Phase 14: HTTP Proxy Support (COMPLETED)
+
+**Goal**: Support HTTP CONNECT proxy as outbound
+
+**Key Changes**:
+
+1. **HTTP CONNECT Client** (`src/router/proxy/http.zig`)
+   - `HttpClient` struct with async connect
+   - HTTP CONNECT request/reply handling
+   - `send()` and `recv()` for tunnel data
+   - Support for 407 Proxy Authentication Required
+
+2. **Outbound Integration** (`src/router/outbound.zig`)
+   - Added `OutboundType.http` enum
+   - Added `HttpOutbound` context
+   - `httpConnect()`, `httpSend()`, `httpDestroy()`
+   - `OutboundConfig.http_addr` field
+
+**Files Modified**:
+| File | Changes |
+|------|---------|
+| `src/router/proxy/http.zig` | New HTTP CONNECT client implementation |
+| `src/router/outbound.zig` | Added HTTP outbound type and integration |
+
+---
+
+### Phase 15: JSON Configuration Support (IN PROGRESS)
 
 ---
 

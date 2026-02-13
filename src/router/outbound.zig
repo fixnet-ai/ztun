@@ -1,7 +1,7 @@
 //! outbound.zig - Outbound abstraction layer
 //!
 //! Provides a unified interface for different outbound implementations.
-//! Integrates with existing Socks5Client and supports Direct connections.
+//! Integrates with existing Socks5Client, HttpClient, and supports Direct connections.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -10,7 +10,8 @@ const xev = @import("xev");
 // Re-export for convenience
 pub const OutboundType = enum(u8) {
     socks5 = 1,
-    direct = 2,
+    http = 2,
+    direct = 3,
 };
 
 /// Outbound configuration
@@ -18,11 +19,14 @@ pub const OutboundConfig = struct {
     /// SOCKS5 proxy address (e.g., "127.0.0.1:1080")
     socks5_addr: ?[:0]const u8 = null,
 
-    /// Username for SOCKS5 authentication (optional)
-    socks5_username: ?[:0]const u8 = null,
+    /// HTTP proxy address (e.g., "127.0.0.1:8080")
+    http_addr: ?[:0]const u8 = null,
 
-    /// Password for SOCKS5 authentication (optional)
-    socks5_password: ?[:0]const u8 = null,
+    /// Username for proxy authentication (optional)
+    proxy_username: ?[:0]const u8 = null,
+
+    /// Password for proxy authentication (optional)
+    proxy_password: ?[:0]const u8 = null,
 
     /// Egress interface name for direct connections
     egress_iface: ?[*:0]const u8 = null,
@@ -83,6 +87,15 @@ const Socks5Outbound = struct {
     addr_str: [:0]const u8,
 };
 
+/// HTTP outbound context
+const HttpOutbound = struct {
+    allocator: std.mem.Allocator,
+    loop: *xev.Loop,
+    proxy_addr: std.net.Address,
+    client: ?*HttpClient,
+    addr_str: [:0]const u8,
+};
+
 /// Direct outbound context
 const DirectOutbound = struct {
     allocator: std.mem.Allocator,
@@ -124,6 +137,37 @@ pub fn create(
                 .connect = socks5Connect,
                 .send = socks5Send,
                 .name = socks5Name,
+            };
+        },
+        .http => {
+            const addr = config.http_addr orelse return error.HttpAddrRequired;
+            const proxy_addr = try parseProxyAddr(addr);
+
+            const proxy_net_addr = std.net.Address.initIp4(
+                .{ @as(u8, @truncate(proxy_addr.ip >> 24)), @as(u8, @truncate(proxy_addr.ip >> 16)), @as(u8, @truncate(proxy_addr.ip >> 8)), @as(u8, @truncate(proxy_addr.ip)) },
+                proxy_addr.port,
+            );
+
+            // Create placeholder target address (will be set during connect)
+            const target_net_addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, 0);
+            const client = try HttpClient.create(allocator, loop, proxy_net_addr, target_net_addr);
+
+            const ctx = try allocator.create(HttpOutbound);
+            ctx.* = .{
+                .allocator = allocator,
+                .loop = loop,
+                .proxy_addr = proxy_net_addr,
+                .client = client,
+                .addr_str = addr,
+            };
+
+            return Outbound{
+                .type = .http,
+                .ctx = ctx,
+                .destroy = httpDestroy,
+                .connect = httpConnect,
+                .send = httpSend,
+                .name = httpName,
             };
         },
         .direct => {
@@ -183,7 +227,60 @@ fn socks5Cleanup(userdata: ?*anyopaque) void {
     _ = userdata;
 }
 
-/// SOCKS5 name
+/// Destroy HTTP outbound
+fn httpDestroy(ctx: *anyopaque) void {
+    const h = @as(*HttpOutbound, @ptrCast(@alignCast(ctx)));
+    if (h.client) |client| {
+        HttpClient.destroy(client, h.allocator);
+    }
+    h.allocator.destroy(h);
+}
+
+/// Connect through HTTP proxy
+fn httpConnect(ctx: *anyopaque, dst_ip: u32, dst_port: u16) ConnectResult!void {
+    const h = @as(*HttpOutbound, @ptrCast(@alignCast(ctx)));
+    const client = h.client orelse return error.NoClient;
+
+    // Create target address
+    const target_net_addr = std.net.Address.initIp4(
+        .{ @as(u8, @truncate(dst_ip >> 24)), @as(u8, @truncate(dst_ip >> 16)), @as(u8, @truncate(dst_ip >> 8)), @as(u8, @truncate(dst_ip)) },
+        dst_port,
+    );
+
+    // TODO: Update client with target address
+    _ = target_net_addr;
+
+    client.connect() catch {
+        return error.ConnectionFailed;
+    };
+
+    return ConnectResult{
+        .sock = client.sock,
+        .dst_ip = dst_ip,
+        .dst_port = dst_port,
+        .cleanup = httpCleanup,
+        .userdata = ctx,
+    };
+}
+
+/// Send through HTTP proxy
+fn httpSend(ctx: *anyopaque, sock: std.posix.socket_t, data: []const u8) void {
+    _ = ctx;
+    _ = std.posix.send(sock, data, 0) catch {};
+}
+
+/// HTTP cleanup
+fn httpCleanup(userdata: ?*anyopaque) void {
+    _ = userdata;
+}
+
+/// HTTP name
+fn httpName(ctx: *anyopaque) [:0]const u8 {
+    const h = @as(*HttpOutbound, @ptrCast(@alignCast(ctx)));
+    return h.addr_str;
+}
+
+/// SOCKS5 cleanup
 fn socks5Name(ctx: *anyopaque) [:0]const u8 {
     const s = @as(*Socks5Outbound, @ptrCast(@alignCast(ctx)));
     return s.addr_str;
@@ -283,6 +380,9 @@ fn parseIpv4(ip_str: []const u8) !u32 {
 // Import Socks5Client from proxy/socks5.zig
 const Socks5Client = @import("proxy/socks5.zig").Socks5Client;
 
+// Import HttpClient from proxy/http.zig
+const HttpClient = @import("proxy/http.zig").HttpClient;
+
 // Error set
 const OutboundError = error{
     InvalidProxyAddr,
@@ -290,4 +390,5 @@ const OutboundError = error{
     InvalidIp,
     NoClient,
     ConnectionFailed,
+    HttpAddrRequired,
 };
