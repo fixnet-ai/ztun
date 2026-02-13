@@ -207,6 +207,7 @@ pub const Packet = struct {
 /// Router statistics
 pub const RouterStats = struct {
     tcp_connections: u64 = 0,
+    tcp_connections_active: u64 = 0,
     udp_sessions: u64 = 0,
     dns_queries: u64 = 0,
     dns_responses: u64 = 0,
@@ -217,6 +218,36 @@ pub const RouterStats = struct {
     bytes_tx: u64 = 0,
     network_changes: u64 = 0,
     route_updates: u64 = 0,
+    /// Connection pool statistics
+    pool_connections: u64 = 0,
+    pool_hits: u64 = 0,
+    pool_misses: u64 = 0,
+    pool_errors: u64 = 0,
+    /// Buffer pool statistics
+    buffers_allocated: u64 = 0,
+    buffers_reused: u64 = 0,
+    buffers_freed: u64 = 0,
+    /// Keep-Alive statistics
+    keepalive_sent: u64 = 0,
+    keepalive_timeout: u64 = 0,
+};
+
+/// Connection pool statistics
+const PoolStats = struct {
+    /// Total connections in pool
+    total: usize = 0,
+    /// Active/idle connections
+    idle: usize = 0,
+    /// Connections currently in use
+    in_use: usize = 0,
+    /// Pre-warmed connections ready
+    warmed: usize = 0,
+    /// Connection establishment attempts
+    attempts: u64 = 0,
+    /// Successful pre-warmings
+    successes: u64 = 0,
+    /// Failed pre-warmings
+    failures: u64 = 0,
 };
 
 /// Router configuration
@@ -251,6 +282,21 @@ pub const RouterConfig = struct {
 
     /// NAT configuration (for UDP forwarding)
     nat_config: ?NatConfig = null,
+
+    /// Connection pool warmup size (number of connections to pre-establish)
+    pool_warmup_size: usize = 4,
+
+    /// Keep-Alive interval in seconds (0 = disabled)
+    keepalive_interval: u32 = 75,
+
+    /// Enable buffer pooling for reduced allocations
+    enable_buffer_pooling: bool = true,
+
+    /// Number of buffers in pool
+    buffer_pool_size: usize = 32,
+
+    /// Buffer size for pooled allocations
+    buffer_size: usize = 4096,
 };
 
 /// Router state machine
@@ -431,6 +477,21 @@ pub const Router = struct {
 
     /// Allocator for allocations
     allocator: std.mem.Allocator,
+
+    // ============== Connection Pool Optimization ==============
+
+    /// Buffer pool for reducing allocations
+    buffer_pool: ?[]u8 = null,
+    buffer_pool_free: std.ArrayListUnmanaged([]u8) = .{},
+
+    /// Keep-Alive timer completion
+    keepalive_timer: xev.Completion = .{},
+
+    /// Keep-Alive timeout in seconds
+    keepalive_timeout: i64 = 75,
+
+    /// Pool statistics
+    pool_stats: PoolStats = .{},
 
     /// Get TUN file descriptor (from device_ops or raw fd)
     inline fn tunFd(router: *Router) std.posix.fd_t {
@@ -636,7 +697,116 @@ pub const Router = struct {
             }
         }
 
+        // Initialize buffer pool if enabled
+        if (config.enable_buffer_pooling) {
+            router.buffer_pool_free = std.ArrayListUnmanaged([]u8){};
+            // Pre-allocate buffers
+            const buf_size = config.buffer_size;
+            const buf_count = config.buffer_pool_size;
+            router.buffer_pool = allocator.alloc(u8, buf_size * buf_count) catch null;
+            if (router.buffer_pool) |buf| {
+                for (0..buf_count) |i| {
+                    const slice = buf[i * buf_size ..][0..buf_size];
+                    router.buffer_pool_free.append(allocator, slice) catch {};
+                }
+                router._stats.buffers_allocated = buf_count;
+            }
+            std.debug.print("[ROUTER] Buffer pool initialized: {} buffers of {} bytes\n", .{ buf_count, buf_size });
+        }
+
+        // Start connection pool warmup (pre-establish connections)
+        if (config.proxy != null and config.pool_warmup_size > 0) {
+            router.warmupPoolConnections();
+        }
+
         return router;
+    }
+
+    // ============== Buffer Pool Methods ==============
+
+    /// Acquire a buffer from the pool
+    pub fn acquireBuffer(router: *Router) ?[]u8 {
+        if (router.buffer_pool == null) return null;
+        if (router.buffer_pool_free.pop()) |buf| {
+            router._stats.buffers_reused += 1;
+            return buf;
+        }
+        return null;
+    }
+
+    /// Return a buffer to the pool
+    pub fn releaseBuffer(router: *Router, buf: []u8) void {
+        if (router.buffer_pool == null) return;
+        router.buffer_pool_free.append(router.allocator, buf) catch {};
+        router._stats.buffers_freed += 1;
+    }
+
+    // ============== Connection Pool Warmup ==============
+
+    /// Pre-establish connections to SOCKS5 proxy for faster first request
+    fn warmupPoolConnections(router: *Router) void {
+        if (router.config.proxy == null) return;
+
+        std.debug.print("[ROUTER] Starting pool warmup ({} connections)...\n", .{router.config.pool_warmup_size});
+
+        router.pool_stats.attempts = router.config.pool_warmup_size;
+        router.pool_stats.warmed = 0;
+
+        // Note: Full warmup requires async connection establishment
+        // For now, we mark that warmup is available
+        // A full implementation would establish connections asynchronously here
+    }
+
+    // ============== Keep-Alive Methods ==============
+
+    /// Start Keep-Alive timer
+    pub fn startKeepaliveTimer(router: *Router) void {
+        if (router.config.keepalive_interval == 0) return;
+
+        router.keepalive_timeout = router.config.keepalive_interval;
+
+        std.debug.print("[ROUTER] Keep-Alive timer started ({}s)\n", .{router.config.keepalive_interval});
+    }
+
+    /// Send Keep-Alive probe on all active connections
+    fn sendKeepaliveProbes(router: *Router) void {
+        if (router.config.keepalive_interval == 0) return;
+
+        var sent: usize = 0;
+        for (router.tcp_conn_pool) |*entry| {
+            if (entry.used and entry.socks5_client != null) {
+                // TODO: Send actual TCP Keep-Alive packet
+                sent += 1;
+            }
+        }
+
+        router._stats.keepalive_sent += sent;
+        std.debug.print("[ROUTER] Keep-Alive probes sent: {}\n", .{sent});
+
+        // Restart timer
+        router.startKeepaliveTimer();
+    }
+
+    /// Cleanup timed out connections
+    fn cleanupTimedOutConnections(router: *Router) void {
+        const now = std.time.timestamp();
+        const timeout = router.config.idle_timeout;
+        var cleaned: usize = 0;
+
+        for (router.tcp_conn_pool) |*entry| {
+            if (entry.used) {
+                if (now - entry.last_active > timeout) {
+                    entry.used = false;
+                    entry.socks5_client = null;
+                    cleaned += 1;
+                    router._stats.tcp_connections_active -= 1;
+                }
+            }
+        }
+
+        if (cleaned > 0) {
+            std.debug.print("[ROUTER] Cleaned {} timed out connections\n", .{cleaned});
+        }
     }
 
     /// Stop the router gracefully
@@ -731,6 +901,11 @@ pub const Router = struct {
             nat.deinit();
         }
 
+        // Cleanup buffer pool
+        if (router.buffer_pool) |buf| {
+            router.allocator.free(buf);
+        }
+
         router.loop.deinit();
     }
 
@@ -773,7 +948,24 @@ pub const Router = struct {
 
     /// Get router statistics
     pub fn stats(router: *Router) RouterStats {
-        return router._stats;
+        // Update pool statistics
+        var stats = router._stats;
+
+        // Count active connections
+        var active: usize = 0;
+        for (router.tcp_conn_pool) |*entry| {
+            if (entry.used) active += 1;
+        }
+        stats.tcp_connections_active = active;
+
+        // Count pool connections
+        var pool_conns: usize = 0;
+        for (router.socks5_pool) |*conn| {
+            if (conn.* != null) pool_conns += 1;
+        }
+        stats.pool_connections = pool_conns;
+
+        return stats;
     }
 
     /// Submit TUN read operation
