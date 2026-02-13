@@ -172,6 +172,7 @@ const zig_modules = &[_]framework.ZigModule{
             "router_outbound",
             "ipstack",
             "monitor",
+            "log",
         },
     },
     // System modules (all in src/system/)
@@ -183,6 +184,12 @@ const zig_modules = &[_]framework.ZigModule{
     .{
         .name = "monitor",
         .file = "src/system/monitor.zig",
+        .deps = &[_][]const u8{},
+    },
+    // Logging module
+    .{
+        .name = "log",
+        .file = "src/log.zig",
         .deps = &[_][]const u8{},
     },
 };

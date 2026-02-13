@@ -5,15 +5,51 @@
 
 ---
 
-## Current Tasks
+## Completed Phases
 
-### Phase 20: Log System (PENDING)
+### Phase 20: Log System (COMPLETED)
+
+**Date**: 2026-02-13
 
 **Goal**: Production-grade logging with levels and structured output
 
----
+**Key Changes Implemented**:
 
-## Completed Phases
+1. **Logger Module** (`src/log.zig`)
+   - Multi-level logging: ERROR, WARN, INFO, DEBUG, TRACE
+   - RFC 5424 syslog-inspired level ordering
+   - Structured logging with `Entry` and `ConnectionInfo`
+   - Module-scoped loggers with `ScopedLogger`
+
+2. **Output Options**
+   - Console output (stderr)
+   - Log file with rotation (configurable size and count)
+   - JSON structured output
+   - Combined output (console + file)
+
+3. **Formatting**
+   - Human-readable line format with timestamps
+   - JSON format for machine parsing
+   - Connection 4-tuple formatting (src_ip:port -> dst_ip:port)
+   - Source location tracking (file:line)
+
+4. **Features**
+   - Log rotation with multiple backup files
+   - Buffering for efficient writes
+   - Statistics tracking (messages, bytes, errors, rotations)
+   - Runtime log level adjustment
+
+**Files Created**:
+| File | Description |
+|------|-------------|
+| `src/log.zig` | Production-grade logging module |
+
+**Files Modified**:
+| File | Changes |
+|------|---------|
+| `build.zig` | Added `log` module and dependencies |
+
+---
 
 ### Phase 19: Connection Pool Optimization (COMPLETED)
 
