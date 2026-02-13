@@ -421,11 +421,11 @@ src/system/monitor.zig           # Main facade (cross-platform interface)
 
 ## Recent Changes
 
+- **2026-02-13**: Phase 15 - JSON Configuration Support
+- **2026-02-13**: Phase 14 - HTTP CONNECT Proxy Support
+- **2026-02-13**: Phase 12 - Graceful Shutdown
 - **2026-02-13**: Phase 11 - UDP over SOCKS5 + DNS (UDP Associate implementation)
 - **2026-02-13**: Phase 10 - TCP Full-Duplex Data Forwarding (connection pool architecture)
-- **2026-02-13**: Phase 9 - ICMP Echo on macOS Fix (commit `75be1de`)
-- **2026-02-13**: Phase 8 - Outbound Abstraction + ipstack Integration
-- **2026-02-13**: Phase 7.13 - Network Monitor Bug Fixes
 
 ---
 
