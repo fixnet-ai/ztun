@@ -7,7 +7,7 @@
 
 ## Current Tasks
 
-### Phase 11: UDP over SOCKS5 + DNS Basic Handling (IN PROGRESS)
+### Phase 12: Graceful Shutdown (IN PROGRESS)
 
 **Date**: 2026-02-13
 
@@ -75,16 +75,36 @@ SOCKS5 UDP Response → onSocks5UdpData()
      └─ writeToTunBuf() → TUN
 ```
 
-**Required Changes** (IN PROGRESS):
-- [x] SOCKS5 UDP Associate client infrastructure
-- [x] UDP session tracking
-- [x] UDP data encapsulation/decapsulation
-- [x] UDP response handling and TUN writeback
-- [x] SOCKS5 UDP Associate handshake (UDP bind request/reply)
-- [x] DNS query identification (port 53)
-- [ ] DNS response tunneling back to TUN
-- [ ] DNS timeout and retry logic
-- [x] UDP session timeout and cleanup
+**Status**: COMPLETED
+
+**Key Features Implemented**:
+- SOCKS5 UDP Associate client with async handshake
+- UDP datagram encapsulation (RSV + ATYP + DST.ADDR + DST.PORT + DATA)
+- UDP session tracking for response routing
+- DNS query identification (port 53)
+- DNS request tracking with transaction ID
+- DNS timeout detection and statistics
+- UDP session timeout cleanup (60s)
+- Periodic cleanup via NAT timer
+
+---
+
+### Phase 12: Graceful Shutdown (IN PROGRESS)
+
+---
+
+### Phase 12: Graceful Shutdown (IN PROGRESS)
+
+**Goal**: Implement graceful shutdown for all components
+
+**Required Changes**:
+- [ ] Signal handler (SIGINT/SIGTERM)
+- [ ] Stop libxev event loop gracefully
+- [ ] Send FIN to all TCP connections
+- [ ] Cleanup UDP NAT sessions
+- [ ] Close SOCKS5 connections
+- [ ] Destroy TUN device
+- [ ] Restore routing table
 
 ---
 
@@ -99,12 +119,6 @@ SOCKS5 UDP Response → onSocks5UdpData()
 - [ ] Close and reconnect SOCKS5 connection on network change
 - [ ] Reset NAT table on network change
 - [ ] Handle RTM_IFINFO, RTM_NEWADDR, RTM_DELADDR events in router
-
----
-
-### Phase 7.10: Graceful Shutdown (PENDING)
-
-**Goal**: Implement graceful shutdown for all components
 
 ---
 
@@ -169,6 +183,44 @@ Proxy Response → onSocks5Data()
   └─ Lookup by client.dst_ip:client.dst_port
      └─ writeToTunBuf() - Forward to TUN
 ```
+
+---
+
+### Phase 11: UDP over SOCKS5 + DNS Basic Handling (COMPLETED)
+
+**Date**: 2026-02-13
+
+**Goal**: Forward UDP traffic through SOCKS5 UDP Associate, DNS queries work correctly
+
+**Key Changes Implemented**:
+
+1. **SOCKS5 UDP Associate Client**
+   - Added `Socks5UdpAssociate` struct with async handshake
+   - Implemented `associateAsync()` for UDP ASSOCIATE request/reply
+   - Added `onUdpAssociateReply()` callback for proxy response handling
+   - Implemented `sendDatagram()` with SOCKS5 UDP header encapsulation
+
+2. **UDP Session Tracking**
+   - Added `Socks5UdpSession` struct for tracking UDP flows by 4-tuple
+   - Implemented `upsertUdpSession()` and `findUdpSession()` methods
+   - Added session timeout cleanup (60 seconds)
+
+3. **DNS Support**
+   - Added `isDnsQuery()` for DNS query identification (port 53)
+   - Added `DnsRequest` struct for tracking DNS transactions
+   - Implemented `extractDnsTxId()`, `trackDnsRequest()`, `checkDnsResponse()`
+   - Added DNS statistics (queries, responses, timeouts)
+
+4. **Router Integration**
+   - Added `forwardUdpToSocks5()` for routing UDP+SOCKS5 decisions
+   - Added `handleSocks5UdpResponse()` for response handling
+   - Integrated DNS tracking into UDP forwarding path
+
+**Files Modified**:
+| File | Changes |
+|------|---------|
+| `src/router/proxy/socks5.zig` | Added `Socks5UdpAssociate`, `UdpAssociateState`, UDP callbacks, handshake |
+| `src/router/mod.zig` | UDP session tracking, DNS tracking, SOCKS5 UDP routing |
 
 ---
 

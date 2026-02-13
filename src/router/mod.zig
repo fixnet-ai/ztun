@@ -208,6 +208,9 @@ pub const Packet = struct {
 pub const RouterStats = struct {
     tcp_connections: u64 = 0,
     udp_sessions: u64 = 0,
+    dns_queries: u64 = 0,
+    dns_responses: u64 = 0,
+    dns_timeouts: u64 = 0,
     packets_forwarded: u64 = 0,
     packets_dropped: u64 = 0,
     bytes_rx: u64 = 0,
@@ -324,6 +327,24 @@ const Socks5UdpSession = struct {
     used: bool,
 };
 
+/// DNS request tracking for timeout detection
+const DnsRequest = struct {
+    /// Original source 4-tuple
+    src_ip: u32,
+    src_port: u16,
+    dst_ip: u32,
+    dst_port: u16,
+
+    /// DNS transaction ID (from DNS header)
+    tx_id: u16,
+
+    /// When this request was made
+    created_at: i64,
+
+    /// Whether this entry is in use
+    used: bool,
+};
+
 /// Router - Transparent proxy forwarding engine with libxev
 pub const Router = struct {
     /// libxev event loop
@@ -361,6 +382,9 @@ pub const Router = struct {
 
     /// UDP session table for SOCKS5 UDP Associate
     udp_sessions: []Socks5UdpSession,
+
+    /// DNS request tracking table (for timeout detection)
+    dns_requests: []DnsRequest,
 
     /// UDP Associate client (single shared client for all UDP flows)
     udp_associate: ?*socks5.Socks5UdpAssociate,
@@ -550,6 +574,21 @@ pub const Router = struct {
             };
         }
 
+        // Allocate DNS request tracking table
+        const dns_request_size = @divExact(config.udp_nat_size, 4);
+        const dns_requests = try allocator.alloc(DnsRequest, dns_request_size);
+        for (dns_requests) |*entry| {
+            entry.* = .{
+                .src_ip = 0,
+                .src_port = 0,
+                .dst_ip = 0,
+                .dst_port = 0,
+                .tx_id = 0,
+                .created_at = 0,
+                .used = false,
+            };
+        }
+
         // Initialize egress interface name from config
         var egress_iface_init: [64]u8 = undefined;
         const name_len = @min(config.egress.name.len, 63);
@@ -569,6 +608,7 @@ pub const Router = struct {
             .tcp_conn_pool = tcp_conn_pool,
             .pending_tcp_pool = pending_tcp_pool,
             .udp_sessions = udp_sessions,
+            .dns_requests = dns_requests,
             .udp_associate = null,
             .udp_sock = udp_sock,
             .raw_sock = raw_sock,
@@ -626,6 +666,9 @@ pub const Router = struct {
 
         // Free UDP session table
         router.allocator.free(router.udp_sessions);
+
+        // Free DNS request tracking table
+        router.allocator.free(router.dns_requests);
 
         // Destroy UDP associate
         if (router.udp_associate) |ua| {
@@ -1209,6 +1252,17 @@ pub const Router = struct {
         const is_dns = router.isDnsQuery(packet.dst_port);
         if (is_dns) {
             std.debug.print("[UDP-SOCKS5] DNS query detected (port 53)\n", .{});
+            router._stats.dns_queries += 1;
+
+            // Extract DNS transaction ID and track request
+            const ip_header_len = ((packet.data[0] & 0x0F) * 4);
+            const udp_header_offset = ip_header_len;
+            const udp_payload_offset = udp_header_offset + 8;
+            if (packet.data.len >= udp_payload_offset) {
+                const udp_payload = packet.data[udp_payload_offset..];
+                const tx_id = router.extractDnsTxId(udp_payload);
+                router.trackDnsRequest(packet.src_ip, packet.src_port, packet.dst_ip, packet.dst_port, tx_id);
+            }
         }
 
         // Check if UDP associate is ready
@@ -1312,6 +1366,16 @@ pub const Router = struct {
     fn handleSocks5UdpResponse(router: *Router, data: []const u8, src_ip: u32, src_port: u16) void {
         std.debug.print("\n[UDP-SOCKS5-RESP] ============================================\n", .{});
         std.debug.print("[UDP-SOCKS5-RESP] Received {} bytes from {s}:{}\n", .{ data.len, fmtIp(src_ip), src_port });
+
+        // Check if this is a DNS response
+        const tx_id = router.extractDnsTxId(data);
+        if (tx_id != 0) {
+            // Check if response matches a pending request
+            if (router.checkDnsResponse(src_ip, src_port, tx_id)) {
+                std.debug.print("[UDP-SOCKS5-RESP] DNS response matched (tx_id={x:0>4})\n", .{tx_id});
+                router._stats.dns_responses += 1;
+            }
+        }
 
         // Find matching UDP session
         // The response source is the original destination
@@ -2110,12 +2174,90 @@ fn cleanupUdpSessions(router: *Router) void {
     if (cleaned > 0) {
         std.debug.print("[UDP-SESSION] Cleaned {} expired sessions\n", .{cleaned});
     }
+
+    // Also cleanup DNS requests
+    router.cleanupDnsRequests();
 }
 
+/// Check if packet is a DNS query (UDP port 53)
 /// Check if packet is a DNS query (UDP port 53)
 fn isDnsQuery(router: *Router, dst_port: u16) bool {
     _ = router;
     return dst_port == 53;
+}
+
+/// Extract DNS transaction ID from UDP payload
+fn extractDnsTxId(data: []const u8) u16 {
+    if (data.len < 2) return 0;
+    return std.mem.readInt(u16, data[0..2], .big);
+}
+
+/// Track DNS request for timeout detection
+fn trackDnsRequest(router: *Router, src_ip: u32, src_port: u16, dst_ip: u32, dst_port: u16, tx_id: u16) void {
+    // Check for existing request
+    for (router.dns_requests) |*entry| {
+        if (entry.used and
+            entry.src_ip == src_ip and entry.src_port == src_port and
+            entry.dst_ip == dst_ip and entry.dst_port == dst_port)
+        {
+            entry.tx_id = tx_id;
+            entry.created_at = std.time.timestamp();
+            return;
+        }
+    }
+
+    // Find empty slot
+    for (router.dns_requests) |*entry| {
+        if (!entry.used) {
+            entry.* = .{
+                .src_ip = src_ip,
+                .src_port = src_port,
+                .dst_ip = dst_ip,
+                .dst_port = dst_port,
+                .tx_id = tx_id,
+                .created_at = std.time.timestamp(),
+                .used = true,
+            };
+            return;
+        }
+    }
+
+    // Table full, log warning
+    std.debug.print("[DNS-WARN] DNS request table full\n", .{});
+}
+
+/// Check if received DNS response matches a pending request
+fn checkDnsResponse(router: *Router, src_ip: u32, src_port: u16, tx_id: u16) bool {
+    for (router.dns_requests) |*entry| {
+        if (entry.used and entry.dst_ip == src_ip and entry.dst_port == src_port) {
+            // Found matching destination, check if tx_id matches
+            if (entry.tx_id == tx_id) {
+                // Mark as completed (clear the entry)
+                entry.used = false;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// Cleanup expired DNS requests (for timeout detection)
+fn cleanupDnsRequests(router: *Router) void {
+    const now = std.time.timestamp();
+    const timeout: i64 = 5; // 5 seconds for DNS
+
+    var timed_out: usize = 0;
+    for (router.dns_requests) |*entry| {
+        if (entry.used and now - entry.created_at > timeout) {
+            entry.used = false;
+            timed_out += 1;
+            router._stats.dns_timeouts += 1;
+        }
+    }
+
+    if (timed_out > 0) {
+        std.debug.print("[DNS] Cleaned {} timed out requests\n", .{timed_out});
+    }
 }
 
 /// SOCKS5 data callback - forward received data from proxy to TUN
