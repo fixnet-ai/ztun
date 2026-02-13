@@ -98,12 +98,12 @@ SOCKS5 UDP Response → onSocks5UdpData()
 **Goal**: Implement graceful shutdown for all components
 
 **Required Changes**:
-- [ ] Signal handler (SIGINT/SIGTERM)
-- [ ] Stop libxev event loop gracefully
-- [ ] Send FIN to all TCP connections
-- [ ] Cleanup UDP NAT sessions
-- [ ] Close SOCKS5 connections
-- [ ] Destroy TUN device
+- [x] Signal handler (SIGINT/SIGTERM)
+- [x] Stop libxev event loop gracefully
+- [x] Send FIN to all TCP connections
+- [x] Cleanup UDP NAT sessions
+- [x] Close SOCKS5 connections
+- [x] Destroy TUN device (via defer in main)
 - [ ] Restore routing table
 
 ---

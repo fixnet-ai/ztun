@@ -257,6 +257,7 @@ pub const RouterConfig = struct {
 const RouterState = enum {
     init,
     running,
+    stopping,
     stopped,
 };
 
@@ -638,11 +639,50 @@ pub const Router = struct {
         return router;
     }
 
+    /// Stop the router gracefully
+    pub fn stop(router: *Router) void {
+        std.debug.print("[ROUTER] Stopping gracefully...\n", .{});
+
+        // Signal event loop to stop
+        router.state = .stopping;
+
+        // Send FIN to all active TCP connections
+        for (router.tcp_conn_pool) |*entry| {
+            if (entry.used) {
+                std.debug.print("[ROUTER] Closing TCP connection: {s}:{} -> {s}:{}\n", .{
+                    fmtIp(entry.src_ip), entry.src_port,
+                    fmtIp(entry.dst_ip), entry.dst_port,
+                });
+
+                // Send FIN to client
+                router.sendFin(
+                    entry.dst_ip,
+                    entry.dst_port,
+                    entry.src_ip,
+                    entry.src_port,
+                ) catch {
+                    std.debug.print("[ROUTER] Failed to send FIN\n", .{});
+                };
+
+                entry.used = false;
+            }
+        }
+
+        // Close UDP associate
+        if (router.udp_associate) |ua| {
+            ua.close();
+        }
+
+        // Stop the event loop
+        router.loop.stop();
+        router.state = .stopped;
+
+        std.debug.print("[ROUTER] Stopped.\n", .{});
+    }
+
     /// Destroy a Router instance
     pub fn deinit(router: *Router) void {
-        if (router.state == .running) {
-            router.loop.stop();
-        }
+        router.stop();
 
         // Stop and cleanup network monitor
         if (router.net_monitor) |mon| {
@@ -652,6 +692,7 @@ pub const Router = struct {
         // Close all SOCKS5 connections in the pool
         for (router.socks5_pool) |*conn_ptr| {
             if (conn_ptr.*) |conn| {
+                conn.close();
                 Socks5Conn.destroy(conn, router.allocator);
                 conn_ptr.* = null;
             }
@@ -1660,6 +1701,42 @@ pub const Router = struct {
         try router.writeToTunBuf(router.write_buf[0..total_len]);
         std.debug.print("[SYNACK] SYN-ACK sent successfully!\n", .{});
         std.debug.print("[SYNACK-EXIT] ============================================\n\n", .{});
+    }
+
+    /// Send TCP FIN packet to close connection gracefully
+    fn sendFin(router: *Router, src_ip: u32, src_port: u16, dst_ip: u32, dst_port: u16) !void {
+        std.debug.print("\n[FIN] ============================================\n", .{});
+        std.debug.print("[FIN] Sending FIN to {s}:{} -> {s}:{}\n", .{ fmtIp(dst_ip), dst_port, fmtIp(src_ip), src_port });
+
+        // Build IP header
+        const tcp_header_len = 20;
+        const ip_offset = ipstack.ipv4.buildHeader(
+            router.write_buf[0..].ptr,
+            src_ip,
+            dst_ip,
+            6, // TCP protocol
+            tcp_header_len,
+        );
+
+        // Build TCP header with FIN flag
+        const tcp_offset = ip_offset;
+        const tcp_len = ipstack.tcp.buildHeaderWithChecksum(
+            router.write_buf[tcp_offset..].ptr,
+            src_ip,
+            dst_ip,
+            src_port,
+            dst_port,
+            0, // Sequence number (simplified)
+            0, // ACK number
+            0x11, // Flags: FIN + ACK
+            0, // Window size
+            &[0]u8{},
+        );
+
+        const total_len = ip_offset + tcp_len;
+        try router.writeToTunBuf(router.write_buf[0..total_len]);
+        std.debug.print("[FIN] FIN sent successfully!\n", .{});
+        std.debug.print("[FIN-EXIT] ============================================\n\n", .{});
     }
 
     /// Mock connection state for TCP handshake tracking

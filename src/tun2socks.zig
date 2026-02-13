@@ -20,10 +20,23 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const posix = std.posix;
 const tun = @import("tun");
 const router = @import("router");
 const network = @import("network");
 const ipstack = @import("ipstack");
+
+// Global router pointer for signal handler
+var g_router: ?*router.Router = null;
+
+/// Signal handler for graceful shutdown
+fn handleSignal(sig: c_int) callconv(.C) void {
+    _ = sig;
+    std.debug.print("\n[MAIN] Received shutdown signal, stopping gracefully...\n", .{});
+    if (g_router) |rt| {
+        rt.stop();
+    }
+}
 
 // =============================================================================
 // IP Address Utilities
@@ -65,9 +78,9 @@ fn parseIp(ip_str: []const u8) !u32 {
 
     // Network byte order: most significant byte first
     return @as(u32, parts[0]) << 24 |
-           @as(u32, parts[1]) << 16 |
-           @as(u32, parts[2]) << 8 |
-           @as(u32, parts[3]);
+        @as(u32, parts[1]) << 16 |
+        @as(u32, parts[2]) << 8 |
+        @as(u32, parts[3]);
 }
 
 // =============================================================================
@@ -388,6 +401,13 @@ pub fn main() !u8 {
     // Initialize router
     var rt = try router.Router.init(allocator, router_config);
     defer rt.deinit();
+
+    // Setup signal handler for graceful shutdown
+    g_router = &rt;
+    const SIGINT = 2;
+    const SIGTERM = 15;
+    posix.signal(SIGINT, handleSignal) catch {};
+    posix.signal(SIGTERM, handleSignal) catch {};
 
     std.debug.print("Router initialized successfully.\n", .{});
     std.debug.print("Starting event loop...\n", .{});
