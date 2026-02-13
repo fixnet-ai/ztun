@@ -62,7 +62,7 @@ const builtin = @import("builtin");
 const xev = @import("xev");
 
 // Socket constants
-const AF_INET = 2;   // IPv4
+const AF_INET = 2; // IPv4
 const SOCK_STREAM = 1;
 const SOCK_DGRAM = 2;
 const SOCK_RAW = 3;
@@ -99,6 +99,9 @@ pub const ProxyType = @import("route.zig").ProxyType;
 pub const NatSession = @import("nat.zig").NatSession;
 pub const NatTable = @import("nat.zig").NatTable;
 pub const NatConfig = @import("nat.zig").NatConfig;
+
+// Re-export connection module for TCP state machine
+pub const connection = @import("connection.zig");
 
 // Re-export SOCKS5 module
 pub const socks5 = @import("proxy/socks5.zig");
@@ -271,6 +274,56 @@ const UdpSession = struct {
     last_active: i64,
 };
 
+/// TCP connection tracking entry (defined before Router to avoid container field ordering issues)
+const TcpConnEntry = struct {
+    /// Connection 4-tuple
+    src_ip: u32,
+    src_port: u16,
+    dst_ip: u32,
+    dst_port: u16,
+
+    /// Associated SOCKS5 client (null if still connecting)
+    socks5_client: ?*Socks5Conn,
+
+    /// TCP state from connection.zig
+    tcp_state: connection.State,
+
+    /// Activity timestamp
+    last_active: i64,
+
+    /// Whether this entry is in use
+    used: bool,
+};
+
+/// Pending TCP connection (waiting for SOCKS5 handshake)
+const PendingTcpConn = struct {
+    src_ip: u32,
+    src_port: u16,
+    dst_ip: u32,
+    dst_port: u16,
+
+    /// Client's initial sequence number
+    client_seq: u32,
+
+    /// When this pending connection was created (for timeout)
+    created_at: i64,
+};
+
+/// UDP session for SOCKS5 UDP Associate forwarding
+const Socks5UdpSession = struct {
+    /// Original source 4-tuple
+    src_ip: u32,
+    src_port: u16,
+    dst_ip: u32,
+    dst_port: u16,
+
+    /// Activity timestamp
+    last_active: i64,
+
+    /// Whether this entry is in use
+    used: bool,
+};
+
 /// Router - Transparent proxy forwarding engine with libxev
 pub const Router = struct {
     /// libxev event loop
@@ -297,8 +350,20 @@ pub const Router = struct {
     /// NAT session table (for UDP forwarding)
     nat_table: ?*NatTable,
 
-    /// SOCKS5 proxy connection (using socks5.Socks5Client)
-    socks5_conn: ?*Socks5Conn,
+    /// SOCKS5 proxy connection pool for concurrent connections
+    socks5_pool: []*Socks5Conn,
+
+    /// TCP connection table (4-tuple -> connection state)
+    tcp_conn_pool: []TcpConnEntry,
+
+    /// Pending TCP connections (waiting for SOCKS5 handshake)
+    pending_tcp_pool: []PendingTcpConn,
+
+    /// UDP session table for SOCKS5 UDP Associate
+    udp_sessions: []Socks5UdpSession,
+
+    /// UDP Associate client (single shared client for all UDP flows)
+    udp_associate: ?*socks5.Socks5UdpAssociate,
 
     /// UDP socket for NAT forwarding
     udp_sock: ?std.posix.socket_t = null,
@@ -323,13 +388,6 @@ pub const Router = struct {
 
     /// ICMP reply buffer (dedicated to avoid race conditions)
     icmp_buf: [65536]u8,
-
-    /// Pending SYN info for SOCKS5 proxy handshake
-    pending_syn: ?struct {
-        src_ip: u32,
-        src_port: u16,
-        seq_num: u32,
-    } = null,
 
     /// Mock HTTP state for testing (tracks TCP handshake)
     mock_state: ?*MockState = null,
@@ -384,8 +442,7 @@ pub const Router = struct {
                 router.write_buf[3] = 0;
 
                 // Debug: dump first 4 bytes of data being copied
-                std.debug.print("[TUN-WRITE-DBG] data[0..4] before copy: {x:0>2} {x:0>2} {x:0>2} {x:0>2}\n",
-                    .{ data[0], data[1], data[2], data[3] });
+                std.debug.print("[TUN-WRITE-DBG] data[0..4] before copy: {x:0>2} {x:0>2} {x:0>2} {x:0>2}\n", .{ data[0], data[1], data[2], data[3] });
             }
 
             // Always copy data to write_buf if not already there (avoid aliasing)
@@ -394,10 +451,7 @@ pub const Router = struct {
             }
 
             // Debug: verify copied data
-            std.debug.print("[TUN-WRITE-DBG] write_buf[{}..{}] after copy: {x:0>2} {x:0>2} {x:0>2} {x:0>2}\n",
-                .{ header_len, header_len + 4,
-                   router.write_buf[header_len], router.write_buf[header_len + 1],
-                   router.write_buf[header_len + 2], router.write_buf[header_len + 3] });
+            std.debug.print("[TUN-WRITE-DBG] write_buf[{}..{}] after copy: {x:0>2} {x:0>2} {x:0>2} {x:0>2}\n", .{ header_len, header_len + 4, router.write_buf[header_len], router.write_buf[header_len + 1], router.write_buf[header_len + 2], router.write_buf[header_len + 3] });
 
             // Debug: dump what we're writing
             std.debug.print("[TUN-WRITE] writing ", .{});
@@ -417,10 +471,7 @@ pub const Router = struct {
             router._stats.bytes_tx += bytes_written;
 
             // Final verification: dump first 12 bytes of what was written
-            std.debug.print("[TUN-WRITE-DBG] final verify: {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2}\n",
-                .{ router.write_buf[0], router.write_buf[1], router.write_buf[2], router.write_buf[3],
-                   router.write_buf[4], router.write_buf[5], router.write_buf[6], router.write_buf[7],
-                   router.write_buf[8], router.write_buf[9], router.write_buf[10], router.write_buf[11] });
+            std.debug.print("[TUN-WRITE-DBG] final verify: {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2}\n", .{ router.write_buf[0], router.write_buf[1], router.write_buf[2], router.write_buf[3], router.write_buf[4], router.write_buf[5], router.write_buf[6], router.write_buf[7], router.write_buf[8], router.write_buf[9], router.write_buf[10], router.write_buf[11] });
         }
     }
 
@@ -452,24 +503,51 @@ pub const Router = struct {
         // Create libxev loop first (needed for Socks5Client creation)
         var loop = try xev.Loop.init(.{});
 
-        // Create SOCKS5 connection if proxy is configured
-        var socks5_conn_ptr: ?*Socks5Conn = null;
-        if (config.proxy) |proxy| {
-            std.debug.print("[ROUTER] Creating SOCKS5 connection for proxy: {s}\n", .{proxy.addr});
+        // Allocate SOCKS5 connection pool (lazy allocation - create on demand)
+        const socks5_pool_size = config.tcp_pool_size;
+        const socks5_pool = try allocator.alloc(*Socks5Conn, socks5_pool_size);
+        @memset(socks5_pool, null);
 
-            // Parse proxy address
-            if (parseProxyAddr(proxy.addr)) |proxy_addr| {
-                const proxy_net_addr = std.net.Address.initIp4(
-                    .{ @as(u8, @truncate(proxy_addr.ip >> 24)), @as(u8, @truncate(proxy_addr.ip >> 16)), @as(u8, @truncate(proxy_addr.ip >> 8)), @as(u8, @truncate(proxy_addr.ip)) },
-                    proxy_addr.port,
-                );
-                socks5_conn_ptr = try Socks5Conn.create(allocator, &loop, proxy_net_addr);
+        // Allocate TCP connection table
+        const tcp_conn_pool = try allocator.alloc(TcpConnEntry, config.tcp_pool_size);
+        for (tcp_conn_pool) |*entry| {
+            entry.* = .{
+                .src_ip = 0,
+                .src_port = 0,
+                .dst_ip = 0,
+                .dst_port = 0,
+                .socks5_client = null,
+                .tcp_state = .Closed,
+                .last_active = 0,
+                .used = false,
+            };
+        }
 
-                std.debug.print("[ROUTER] SOCKS5 client created: {x:0>8}:{}\n", .{
-                    proxy_addr.ip, proxy_addr.port });
-            } else |_| {
-                std.debug.print("[ROUTER] Failed to parse proxy address\n", .{});
-            }
+        // Allocate pending TCP connection pool
+        const pending_pool_size = @divExact(config.tcp_pool_size, 4);
+        const pending_tcp_pool = try allocator.alloc(PendingTcpConn, pending_pool_size);
+        for (pending_tcp_pool) |*entry| {
+            entry.* = .{
+                .src_ip = 0,
+                .src_port = 0,
+                .dst_ip = 0,
+                .dst_port = 0,
+                .client_seq = 0,
+                .created_at = 0,
+            };
+        }
+
+        // Allocate UDP session table for SOCKS5 UDP Associate
+        const udp_sessions = try allocator.alloc(Socks5UdpSession, config.udp_nat_size);
+        for (udp_sessions) |*entry| {
+            entry.* = .{
+                .src_ip = 0,
+                .src_port = 0,
+                .dst_ip = 0,
+                .dst_port = 0,
+                .last_active = 0,
+                .used = false,
+            };
         }
 
         // Initialize egress interface name from config
@@ -487,7 +565,11 @@ pub const Router = struct {
             .udp_completion = .{},
             .config = config,
             .nat_table = nat_table,
-            .socks5_conn = socks5_conn_ptr,
+            .socks5_pool = socks5_pool,
+            .tcp_conn_pool = tcp_conn_pool,
+            .pending_tcp_pool = pending_tcp_pool,
+            .udp_sessions = udp_sessions,
+            .udp_associate = null,
             .udp_sock = udp_sock,
             .raw_sock = raw_sock,
             .state = .init,
@@ -513,11 +595,6 @@ pub const Router = struct {
             }
         }
 
-        // Update Socks5Client callbacks to point to this Router
-        if (router.socks5_conn) |client| {
-            client.setCallbacks(&router, onSocks5Data, onSocks5TunnelReady, onSocks5Ready, onSocks5Error);
-        }
-
         return router;
     }
 
@@ -532,9 +609,27 @@ pub const Router = struct {
             monitor.destroyNetworkMonitor(mon);
         }
 
-        // Close SOCKS5 connection
-        if (router.socks5_conn) |conn| {
-            Socks5Conn.destroy(conn, router.allocator);
+        // Close all SOCKS5 connections in the pool
+        for (router.socks5_pool) |*conn_ptr| {
+            if (conn_ptr.*) |conn| {
+                Socks5Conn.destroy(conn, router.allocator);
+                conn_ptr.* = null;
+            }
+        }
+        router.allocator.free(router.socks5_pool);
+
+        // Free TCP connection pool
+        router.allocator.free(router.tcp_conn_pool);
+
+        // Free pending TCP pool
+        router.allocator.free(router.pending_tcp_pool);
+
+        // Free UDP session table
+        router.allocator.free(router.udp_sessions);
+
+        // Destroy UDP associate
+        if (router.udp_associate) |ua| {
+            socks5.Socks5UdpAssociate.destroy(ua, router.allocator);
         }
 
         // Close UDP socket
@@ -572,13 +667,16 @@ pub const Router = struct {
             router.submitNatTimer();
         }
 
-        // Run event loop
-
-        // Run event loop
+        // Run event loop - use no_wait in loop to keep running
         std.debug.print("[ROUTER] Starting event loop...\n", .{});
-        router.loop.run(.until_done) catch {
-            std.debug.print("[ROUTER] Event loop error!\n", .{});
-        };
+        while (router.state == .running) {
+            router.loop.run(.no_wait) catch {
+                std.debug.print("[ROUTER] Event loop error!\n", .{});
+                break;
+            };
+            // Small sleep to prevent busy loop and allow signal handling
+            std.time.sleep(10 * std.time.ns_per_ms);
+        }
         std.debug.print("[ROUTER] Event loop exited.\n", .{});
         router.state = .stopped;
     }
@@ -686,19 +784,19 @@ pub const Router = struct {
 
         switch (decision) {
             .Direct => {
-                std.debug.print("[FWD] Direct: {s}:{} -> {s}:{}\n", .{
-                    fmtIp(packet.src_ip), packet.src_port,
-                    fmtIp(packet.dst_ip), packet.dst_port });
+                std.debug.print("[FWD] Direct: {s}:{} -> {s}:{}\n", .{ fmtIp(packet.src_ip), packet.src_port, fmtIp(packet.dst_ip), packet.dst_port });
                 try router.forwardToEgress(packet);
                 router._stats.packets_forwarded += 1;
             },
             .Socks5 => {
-                std.debug.print("[FWD] Socks5: {s}:{} -> {s}:{}\n", .{
-                    fmtIp(packet.src_ip), packet.src_port,
-                    fmtIp(packet.dst_ip), packet.dst_port });
+                std.debug.print("[FWD] Socks5: {s}:{} -> {s}:{} proto={}\n", .{ fmtIp(packet.src_ip), packet.src_port, fmtIp(packet.dst_ip), packet.dst_port, packet.protocol });
                 if (router.config.mock_enabled) {
                     try router.handleMockHttp(packet);
+                } else if (packet.protocol == 17) {
+                    // UDP packet - forward via SOCKS5 UDP Associate
+                    try router.forwardUdpToSocks5(packet);
                 } else {
+                    // TCP packet - forward via SOCKS5 TCP tunnel
                     try router.forwardToProxy(packet);
                 }
                 router._stats.packets_forwarded += 1;
@@ -707,9 +805,7 @@ pub const Router = struct {
                 router._stats.packets_dropped += 1;
             },
             .Local => {
-                std.debug.print("[FWD] Local: {s}:{} -> {s}:{}\n", .{
-                    fmtIp(packet.src_ip), packet.src_port,
-                    fmtIp(packet.dst_ip), packet.dst_port });
+                std.debug.print("[FWD] Local: {s}:{} -> {s}:{}\n", .{ fmtIp(packet.src_ip), packet.src_port, fmtIp(packet.dst_ip), packet.dst_port });
                 try router.writeToTun(packet);
                 router._stats.packets_forwarded += 1;
             },
@@ -722,186 +818,250 @@ pub const Router = struct {
     }
 
     /// Forward packet through SOCKS5 proxy (TCP)
-    /// This is the CRITICAL PATH for TCP connections via SOCKS5 proxy
+    /// Uses connection pool for concurrent connections to different destinations
     fn forwardToProxy(router: *Router, packet: *const Packet) !void {
         std.debug.print("\n[SOCKS5-PATH] ============================================\n", .{});
-        std.debug.print("[SOCKS5-PATH] forwardToProxy called at {}\n", .{std.time.nanoTimestamp()});
-        std.debug.print("[SOCKS5-PATH] Packet: {s}:{} -> {s}:{} proto={}\n", .{
-            fmtIp(packet.src_ip), packet.src_port,
-            fmtIp(packet.dst_ip), packet.dst_port,
-            packet.protocol });
+        std.debug.print("[SOCKS5-PATH] forwardToProxy called\n", .{});
+        std.debug.print("[SOCKS5-PATH] Packet: {s}:{} -> {s}:{} proto={}\n", .{ fmtIp(packet.src_ip), packet.src_port, fmtIp(packet.dst_ip), packet.dst_port, packet.protocol });
 
-        // TCP packets are handled via SOCKS5 proxy
-
-        if (router.socks5_conn == null) {
-            std.debug.print("[SOCKS5-PATH-ERROR] No SOCKS5 connection available!\n", .{});
-            std.debug.print("[SOCKS5-PATH-ACTION] Dropping packet\n", .{});
-            router._stats.packets_dropped += 1;
-            return;
-        }
-
-        const client = router.socks5_conn.?;
-        const state = client.getState();
-
-        std.debug.print("[SOCKS5-PATH] Client state: {s}\n", .{@tagName(state)});
-        std.debug.print("[SOCKS5-PATH] Client dst_ip: {s}:{}\n", .{fmtIp(client.dst_ip), client.dst_port});
-        std.debug.print("[SOCKS5-PATH] Packet dst_ip: {s}:{}\n", .{fmtIp(packet.dst_ip), packet.dst_port});
-
-        // Check if we're already connected for this destination
-        if (state == .Ready) {
-            std.debug.print("[SOCKS5-PATH] Client is Ready\n", .{});
-            // Check if this is a new connection to a different destination
-            if (client.dst_ip != packet.dst_ip or client.dst_port != packet.dst_port) {
-                std.debug.print("[SOCKS5-PATH] Different destination, will reconnect\n", .{});
-                // Different destination - close old connection and start new one
-                client.close();
-                client.state = .Disconnected;
-                client.dst_ip = 0;
-                client.dst_port = 0;
-            } else {
-                std.debug.print("[SOCKS5-PATH] Same destination, will forward data\n", .{});
-            }
-        } else {
-            std.debug.print("[SOCKS5-PATH] Client state is {s}, not Ready\n", .{@tagName(state)});
-        }
-
-        // Extract TCP flags to check if this is a SYN packet
-        // TCP flags byte is at: IP header (20) + TCP offset 13
-        var tcp_flags: u8 = 0;
-        if (packet.data.len >= 34) {
-            tcp_flags = packet.data[33];
-        }
-
-        // CRITICAL: Use TCP flags to determine SYN, NOT payload length
-        // SYN packets have TCP header but NO payload, but may have TCP options (MSS, etc.)
+        // Extract TCP flags
+        const tcp_flags = if (packet.data.len >= 34) packet.data[33] else 0;
         const is_syn = (tcp_flags & TCP_SYN) != 0 and (tcp_flags & TCP_ACK) == 0;
+        const is_fin = (tcp_flags & TCP_FIN) != 0;
+        const is_rst = (tcp_flags & TCP_RST) != 0;
 
-        std.debug.print("[SOCKS5-PATH] TCP flags: 0x{X:0>2} SYN={} ACK={}\n", .{tcp_flags, (tcp_flags & TCP_SYN) != 0, (tcp_flags & TCP_ACK) != 0});
-        std.debug.print("[SOCKS5-PATH] is_syn: {} (based on TCP flags)\n", .{is_syn});
+        std.debug.print("[SOCKS5-PATH] TCP flags: 0x{X:0>2} SYN={} FIN={} RST={}\n", .{ tcp_flags, is_syn, is_fin, is_rst });
 
-        // If client is Connecting and this is NOT a SYN, drop the packet
-        // Retries will resend the SYN after timeout
-        if (state != .Ready and !is_syn) {
-            std.debug.print("[SOCKS5-PATH-WARN] Client connecting, dropping non-SYN packet (will retry)\n", .{});
-            std.debug.print("[SOCKS5-PATH-ACTION] Dropping packet, waiting for SOCKS5 handshake\n", .{});
-            router._stats.packets_dropped += 1;
-            std.debug.print("[SOCKS5-PATH-EXIT] ============================================\n\n", .{});
-            return;
-        }
+        // Look up existing connection by 4-tuple
+        const tcp_conn = router.lookupTcpConnection(packet.src_ip, packet.src_port, packet.dst_ip, packet.dst_port);
 
-        if (is_syn) {
-            // SYN packet - need to complete SOCKS5 connection then send SYN-ACK
-            std.debug.print("[SOCKS5-PATH] SYN detected - initiating SOCKS5 connection\n", .{});
+        if (tcp_conn) |conn| {
+            // Existing connection found
+            std.debug.print("[SOCKS5-PATH] Found existing connection: state={s}\n", .{connection.stateToString(conn.tcp_state)});
 
-            // Extract sequence number for SYN-ACK response
-            const seq_num = extractTcpSeqNum(packet);
-            std.debug.print("[SOCKS5-PATH] Client SEQ: {}\n", .{seq_num});
+            // Handle connection closure
+            if (is_rst or is_fin) {
+                std.debug.print("[SOCKS5-PATH] Connection closing (RST/FIN)\n", .{});
+                router.removeTcpConnection(packet.src_ip, packet.src_port, packet.dst_ip, packet.dst_port);
+            }
 
-            // Store pending SYN info for SYN-ACK response later
-            router.pending_syn = .{
-                .src_ip = packet.src_ip,
-                .src_port = packet.src_port,
-                .seq_num = seq_num,
-            };
-
-            std.debug.print("[SOCKS5-PATH] Stored pending_syn: {s}:{} seq={}\n", .{
-                fmtIp(packet.src_ip), packet.src_port, seq_num });
-
-            client.dst_ip = packet.dst_ip;
-            client.dst_port = packet.dst_port;
-
-            // Connect to SOCKS5 proxy using blocking connect (simpler for SYN handling)
-            std.debug.print("[SOCKS5-PATH] Blocking connect to proxy...\n", .{});
-            client.connectBlocking(packet.dst_ip, packet.dst_port) catch |err| {
-                std.debug.print("[SOCKS5-PATH-ERROR] blocking connect failed: {}\n", .{err});
-                std.debug.print("[SOCKS5-PATH-ACTION] Dropping packet, clearing pending_syn\n", .{});
-                router._stats.packets_dropped += 1;
-                router.pending_syn = null;
-                return;
-            };
-            std.debug.print("[SOCKS5-PATH] Blocking connect succeeded!\n", .{});
-
-            // Send SYN-ACK to complete TCP handshake
-            // SYN-ACK should appear to come from the server (target)
-            // to the client that sent the original SYN
-            if (router.pending_syn) |syn| {
-                std.debug.print("[SYNACK-PATH] Sending SYN-ACK...\n", .{});
-                std.debug.print("[SYNACK-PATH] Server (src): {s}:{}\n", .{fmtIp(client.dst_ip), client.dst_port});
-                std.debug.print("[SYNACK-PATH] Client (dst): {s}:{}\n", .{fmtIp(syn.src_ip), syn.src_port});
-                router.sendSynAck(
-                    client.dst_ip,   // src_ip: server IP (111.45.11.5)
-                    client.dst_port, // src_port: server port (80)
-                    syn.src_ip,      // dst_ip: client IP (10.0.0.1)
-                    syn.src_port,    // dst_port: client port
-                    syn.seq_num,
-                ) catch |err| {
-                    std.debug.print("[SYNACK-PATH-ERROR] sendSynAck failed: {}\n", .{err});
-                    router.pending_syn = null;
-                    return;
-                };
-                router.pending_syn = null;
-                std.debug.print("[SYNACK-PATH] SYN-ACK sent successfully!\n", .{});
-            } else {
-                std.debug.print("[SYNACK-PATH-WARN] No pending_syn found!\n", .{});
+            // Forward data if connection is established
+            if (conn.tcp_state == .Established and conn.socks5_client) |client| {
+                if (!is_syn) { // Don't forward SYN on established connection
+                    try router.forwardTcpData(client, packet);
+                }
             }
         } else {
-            // Non-SYN packet - check if we need to establish a new SOCKS5 connection
-            std.debug.print("[SOCKS5-PATH] Forwarding non-SYN packet (state={s})\n", .{@tagName(state)});
-            std.debug.print("[SOCKS5-PATH] Current dst: {s}:{}, New dst: {s}:{}\n", .{
-                fmtIp(client.dst_ip), client.dst_port,
-                fmtIp(packet.dst_ip), packet.dst_port });
-
-            // Check if the destination matches the current SOCKS5 connection
-            const same_dst = client.dst_ip == packet.dst_ip and client.dst_port == packet.dst_port;
-            std.debug.print("[SOCKS5-PATH] Same destination: {}\n", .{same_dst});
-
-            if (!same_dst) {
-                // Different destination - need to establish new SOCKS5 connection
-                std.debug.print("[SOCKS5-PATH] Different destination, will reconnect\n", .{});
-                client.close();
-                client.state = .Disconnected;
-                client.dst_ip = 0;
-                client.dst_port = 0;
-
-                // Set dst info and do blocking connect
-                client.dst_ip = packet.dst_ip;
-                client.dst_port = packet.dst_port;
-
-                std.debug.print("[SOCKS5-PATH] Blocking connect to proxy for new dst...\n", .{});
-                client.connectBlocking(packet.dst_ip, packet.dst_port) catch |err| {
-                    std.debug.print("[SOCKS5-PATH-ERROR] reconnect failed: {}\n", .{err});
-                    router._stats.packets_dropped += 1;
-                    return;
-                };
-                std.debug.print("[SOCKS5-PATH] Reconnect succeeded!\n", .{});
-            }
-
-            // Forward the data
-            const payload = extractTcpPayload(packet);
-            std.debug.print("[SOCKS5-PATH] Payload len: {}\n", .{payload.len});
-            if (payload.len > 0) {
-                std.debug.print("[SOCKS5-PATH] Calling send...\n", .{});
-                _ = client.send(packet.data) catch |err| {
-                    std.debug.print("[SOCKS5-PATH-ERROR] client.send failed: {}\n", .{err});
-                    router._stats.packets_dropped += 1;
-                };
-                std.debug.print("[SOCKS5-PATH] Send completed, checking for response...\n", .{});
-
-                // Manually check for proxy response (workaround for libxev callback issue)
-                client.checkForResponse() catch |err| {
-                    std.debug.print("[SOCKS5-PATH] checkForResponse error: {}\n", .{err});
-                };
-                std.debug.print("[SOCKS5-PATH] checkForResponse done\n", .{});
+            // No existing connection
+            if (is_syn) {
+                // New connection - initiate SOCKS5 connection
+                std.debug.print("[SOCKS5-PATH] New connection, initiating SOCKS5 tunnel\n", .{});
+                try router.initiateSocks5Tunnel(packet);
             } else {
-                std.debug.print("[SOCKS5-PATH] No payload to forward\n", .{});
+                // Non-SYN packet for non-existent connection - drop
+                std.debug.print("[SOCKS5-PATH-WARN] Dropping non-SYN packet for non-existent connection\n", .{});
+                router._stats.packets_dropped += 1;
             }
         }
+
         std.debug.print("[SOCKS5-PATH-EXIT] ============================================\n\n", .{});
     }
 
+    /// Look up TCP connection by 4-tuple
+    fn lookupTcpConnection(router: *Router, src_ip: u32, src_port: u16, dst_ip: u32, dst_port: u16) ?*TcpConnEntry {
+        for (router.tcp_conn_pool) |*entry| {
+            if (entry.used and
+                entry.src_ip == src_ip and entry.src_port == src_port and
+                entry.dst_ip == dst_ip and entry.dst_port == dst_port)
+            {
+                return entry;
+            }
+        }
+        return null;
+    }
+
+    /// Find or create pending TCP connection
+    fn findOrCreatePending(router: *Router, src_ip: u32, src_port: u16, dst_ip: u32, dst_port: u16) !*PendingTcpConn {
+        // Check for existing pending connection
+        for (router.pending_tcp_pool) |*entry| {
+            if (entry.src_ip == src_ip and entry.src_port == src_port and
+                entry.dst_ip == dst_ip and entry.dst_port == dst_port)
+            {
+                return entry;
+            }
+        }
+
+        // Find empty slot
+        for (router.pending_tcp_pool) |*entry| {
+            if (entry.src_ip == 0 and entry.dst_ip == 0) {
+                entry.* = .{
+                    .src_ip = src_ip,
+                    .src_port = src_port,
+                    .dst_ip = dst_ip,
+                    .dst_port = dst_port,
+                    .client_seq = 0,
+                    .created_at = std.time.timestamp(),
+                };
+                return entry;
+            }
+        }
+
+        return error.PendingConnectionPoolFull;
+    }
+
+    /// Initiate SOCKS5 tunnel for new TCP connection (async)
+    fn initiateSocks5Tunnel(router: *Router, packet: *const Packet) !void {
+        std.debug.print("[SOCKS5] initiateSocks5Tunnel for {s}:{} -> {s}:{}\n", .{ fmtIp(packet.src_ip), packet.src_port, fmtIp(packet.dst_ip), packet.dst_port });
+
+        // Extract client's initial sequence number
+        const client_seq = router.extractTcpSeqNum(packet);
+        std.debug.print("[SOCKS5] Client SEQ: {}\n", .{client_seq});
+
+        // Create pending connection entry
+        const pending = try router.findOrCreatePending(packet.src_ip, packet.src_port, packet.dst_ip, packet.dst_port);
+        pending.client_seq = client_seq;
+
+        // Find empty slot in SOCKS5 pool and create client
+        const proxy_config = router.config.proxy orelse {
+            std.debug.print("[SOCKS5-ERROR] No proxy configured\n", .{});
+            return error.NoProxyConfigured;
+        };
+
+        const proxy_addr = parseProxyAddr(proxy_config.addr) catch {
+            std.debug.print("[SOCKS5-ERROR] Failed to parse proxy address\n", .{});
+            return error.InvalidProxyAddr;
+        };
+
+        const proxy_net_addr = std.net.Address.initIp4(
+            .{ @as(u8, @truncate(proxy_addr.ip >> 24)), @as(u8, @truncate(proxy_addr.ip >> 16)), @as(u8, @truncate(proxy_addr.ip >> 8)), @as(u8, @truncate(proxy_addr.ip)) },
+            proxy_addr.port,
+        );
+
+        // Find empty slot in pool
+        var pool_idx: usize = 0;
+        for (router.socks5_pool, 0..) |*conn_ptr, idx| {
+            if (conn_ptr.* == null) {
+                pool_idx = idx;
+                break;
+            }
+        } else {
+            return error.Socks5PoolFull;
+        }
+
+        // Create new SOCKS5 client
+        const client = try Socks5Conn.create(router.allocator, &router.loop, proxy_net_addr);
+
+        // Set the 4-tuple in the client for callback access
+        client.src_ip = packet.src_ip;
+        client.src_port = packet.src_port;
+        client.dst_ip = packet.dst_ip;
+        client.dst_port = packet.dst_port;
+
+        // Set callbacks
+        client.setCallbacks(router, onSocks5Data, onSocks5TunnelReady, onSocks5Ready, onSocks5Error);
+        router.socks5_pool[pool_idx] = client;
+
+        std.debug.print("[SOCKS5] Starting async connect to proxy...\n", .{});
+
+        // Initiate async connection - will call back onSocks5TunnelReady when done
+        client.connectAsync(packet.dst_ip, packet.dst_port) catch |err| {
+            std.debug.print("[SOCKS5-ERROR] connectAsync failed: {}\n", .{err});
+            router.socks5_pool[pool_idx] = null;
+            Socks5Conn.destroy(client, router.allocator);
+            return err;
+        };
+
+        std.debug.print("[SOCKS5] Async connect initiated\n", .{});
+    }
+
+    /// Forward TCP data through SOCKS5 connection
+    fn forwardTcpData(router: *Router, client: *Socks5Conn, packet: *const Packet) !void {
+        const payload = router.extractTcpPayload(packet);
+        std.debug.print("[SOCKS5-DATA] Forwarding {} bytes\n", .{payload.len});
+
+        if (payload.len > 0) {
+            client.send(packet.data) catch |err| {
+                std.debug.print("[SOCKS5-DATA-ERROR] send failed: {}\n", .{err});
+                router._stats.packets_dropped += 1;
+            };
+        }
+    }
+
+    /// Register established TCP connection
+    fn registerTcpConnection(router: *Router, src_ip: u32, src_port: u16, dst_ip: u32, dst_port: u16, client: *Socks5Conn) !void {
+        for (router.tcp_conn_pool) |*entry| {
+            if (!entry.used) {
+                entry.* = .{
+                    .src_ip = src_ip,
+                    .src_port = src_port,
+                    .dst_ip = dst_ip,
+                    .dst_port = dst_port,
+                    .socks5_client = client,
+                    .tcp_state = .Established,
+                    .last_active = std.time.timestamp(),
+                    .used = true,
+                };
+                std.debug.print("[TCP] Registered connection: {s}:{} -> {s}:{}\n", .{ fmtIp(src_ip), src_port, fmtIp(dst_ip), dst_port });
+                return;
+            }
+        }
+        return error.TcpPoolFull;
+    }
+
+    /// Remove TCP connection
+    fn removeTcpConnection(router: *Router, src_ip: u32, src_port: u16, dst_ip: u32, dst_port: u16) void {
+        for (router.tcp_conn_pool) |*entry| {
+            if (entry.used and
+                entry.src_ip == src_ip and entry.src_port == src_port and
+                entry.dst_ip == dst_ip and entry.dst_port == dst_port)
+            {
+
+                // Close associated SOCKS5 client
+                if (entry.socks5_client) |client| {
+                    // Remove from pool
+                    for (router.socks5_pool, 0..) |*conn_ptr, idx| {
+                        if (conn_ptr.* == client) {
+                            conn_ptr.* = null;
+                            break;
+                        }
+                    }
+                    client.close();
+                }
+
+                entry.used = false;
+                std.debug.print("[TCP] Removed connection: {s}:{} -> {s}:{}\n", .{ fmtIp(src_ip), src_port, fmtIp(dst_ip), dst_port });
+                return;
+            }
+        }
+    }
+
+    /// Get pending connection info
+    fn getPendingConnection(router: *Router, src_ip: u32, src_port: u16, dst_ip: u32, dst_port: u16) ?*PendingTcpConn {
+        for (router.pending_tcp_pool) |*entry| {
+            if (entry.src_ip == src_ip and entry.src_port == src_port and
+                entry.dst_ip == dst_ip and entry.dst_port == dst_port)
+            {
+                return entry;
+            }
+        }
+        return null;
+    }
+
+    /// Clear pending connection
+    fn clearPendingConnection(router: *Router, src_ip: u32, src_port: u16, dst_ip: u32, dst_port: u16) void {
+        for (router.pending_tcp_pool) |*entry| {
+            if (entry.src_ip == src_ip and entry.src_port == src_port and
+                entry.dst_ip == dst_ip and entry.dst_port == dst_port)
+            {
+                entry.src_ip = 0;
+                entry.dst_ip = 0;
+                return;
+            }
+        }
+    }
+
     /// Extract TCP payload from packet
-    /// Uses ipstack for TCP header parsing (handles TCP options correctly)
-    fn extractTcpPayload(packet: *const Packet) []const u8 {
+    fn extractTcpPayload(router: *Router, packet: *const Packet) []const u8 {
         const ip_header_len = ((packet.data[0] & 0x0F) * 4);
         const tcp_info = ipstack.tcp.parseHeader(
             packet.data.ptr + ip_header_len,
@@ -909,12 +1069,11 @@ pub const Router = struct {
         ) orelse {
             return &[_]u8{};
         };
-        return packet.data[ip_header_len + tcp_info.header_len..];
+        return packet.data[ip_header_len + tcp_info.header_len ..];
     }
 
     /// Extract TCP sequence number from packet
-    /// Uses ipstack for TCP header parsing
-    fn extractTcpSeqNum(packet: *const Packet) u32 {
+    fn extractTcpSeqNum(router: *Router, packet: *const Packet) u32 {
         const ip_header_len = ((packet.data[0] & 0x0F) * 4);
         const tcp_info = ipstack.tcp.parseHeader(
             packet.data.ptr + ip_header_len,
@@ -1038,6 +1197,300 @@ pub const Router = struct {
         router.writeToTunBuf(router.write_buf[0..data.len]) catch {};
     }
 
+    // ============ SOCKS5 UDP Associate Methods ============
+
+    /// Forward UDP packet through SOCKS5 proxy (UDP Associate)
+    fn forwardUdpToSocks5(router: *Router, packet: *const Packet) !void {
+        std.debug.print("\n[UDP-SOCKS5] ============================================\n", .{});
+        std.debug.print("[UDP-SOCKS5] forwardUdpToSocks5 called\n", .{});
+        std.debug.print("[UDP-SOCKS5] Packet: {s}:{} -> {s}:{}\n", .{ fmtIp(packet.src_ip), packet.src_port, fmtIp(packet.dst_ip), packet.dst_port });
+
+        // Check if UDP associate is ready
+        if (router.udp_associate) |ua| {
+            if (ua.isReady()) {
+                // Extract UDP payload
+                const ip_header_len = ((packet.data[0] & 0x0F) * 4);
+                const udp_header_offset = ip_header_len;
+                const udp_payload_offset = udp_header_offset + 8; // UDP header is 8 bytes
+
+                if (packet.data.len >= udp_payload_offset) {
+                    const udp_payload = packet.data[udp_payload_offset..];
+
+                    // Send through SOCKS5 UDP associate
+                    ua.sendDatagram(udp_payload, packet.dst_ip, packet.dst_port) catch |err| {
+                        std.debug.print("[UDP-SOCKS5-ERROR] sendDatagram failed: {}\n", .{err});
+                        router._stats.packets_dropped += 1;
+                        return;
+                    };
+
+                    // Create/update UDP session for response lookup
+                    router.upsertUdpSession(packet.src_ip, packet.src_port, packet.dst_ip, packet.dst_port);
+
+                    std.debug.print("[UDP-SOCKS5] Sent {} bytes to proxy\n", .{udp_payload.len});
+                }
+            } else {
+                std.debug.print("[UDP-SOCKS5-WARN] UDP associate not ready, state={s}\n", .{@tagName(ua.state)});
+                router._stats.packets_dropped += 1;
+            }
+        } else {
+            std.debug.print("[UDP-SOCKS5-WARN] No UDP associate configured\n", .{});
+            router._stats.packets_dropped += 1;
+        }
+
+        std.debug.print("[UDP-SOCKS5-EXIT] ============================================\n\n", .{});
+    }
+
+    /// Create or update UDP session for SOCKS5 UDP Associate
+    fn upsertUdpSession(router: *Router, src_ip: u32, src_port: u16, dst_ip: u32, dst_port: u16) void {
+        // Check for existing session
+        for (router.udp_sessions) |*entry| {
+            if (entry.used and
+                entry.src_ip == src_ip and entry.src_port == src_port and
+                entry.dst_ip == dst_ip and entry.dst_port == dst_port)
+            {
+                entry.last_active = std.time.timestamp();
+                return;
+            }
+        }
+
+        // Find empty slot
+        for (router.udp_sessions) |*entry| {
+            if (!entry.used) {
+                entry.* = .{
+                    .src_ip = src_ip,
+                    .src_port = src_port,
+                    .dst_ip = dst_ip,
+                    .dst_port = dst_port,
+                    .last_active = std.time.timestamp(),
+                    .used = true,
+                };
+                return;
+            }
+        }
+
+        // Table full, drop oldest session
+        var oldest_idx: usize = 0;
+        var oldest_time: i64 = std.time.timestamp();
+        for (router.udp_sessions, 0..) |*entry, idx| {
+            if (entry.used and entry.last_active < oldest_time) {
+                oldest_time = entry.last_active;
+                oldest_idx = idx;
+            }
+        }
+
+        const entry = &router.udp_sessions[oldest_idx];
+        entry.* = .{
+            .src_ip = src_ip,
+            .src_port = src_port,
+            .dst_ip = dst_ip,
+            .dst_port = dst_port,
+            .last_active = std.time.timestamp(),
+            .used = true,
+        };
+    }
+
+    /// Find UDP session by 4-tuple
+    fn findUdpSession(router: *Router, src_ip: u32, src_port: u16, dst_ip: u32, dst_port: u16) ?*Socks5UdpSession {
+        for (router.udp_sessions) |*entry| {
+            if (entry.used and
+                entry.src_ip == src_ip and entry.src_port == src_port and
+                entry.dst_ip == dst_ip and entry.dst_port == dst_port)
+            {
+                return entry;
+            }
+        }
+        return null;
+    }
+
+    /// Handle UDP datagram received from SOCKS5 proxy
+    fn handleSocks5UdpResponse(router: *Router, data: []const u8, src_ip: u32, src_port: u16) void {
+        std.debug.print("\n[UDP-SOCKS5-RESP] ============================================\n", .{});
+        std.debug.print("[UDP-SOCKS5-RESP] Received {} bytes from {s}:{}\n", .{ data.len, fmtIp(src_ip), src_port });
+
+        // Find matching UDP session
+        // The response source is the original destination
+        var found_session: ?*Socks5UdpSession = null;
+
+        for (router.udp_sessions) |*entry| {
+            if (entry.used and entry.dst_ip == src_ip and entry.dst_port == src_port) {
+                found_session = entry;
+                break;
+            }
+        }
+
+        if (found_session) |session| {
+            std.debug.print("[UDP-SOCKS5-RESP] Found session: {s}:{} -> {s}:{}\n", .{
+                fmtIp(session.src_ip), session.src_port,
+                fmtIp(session.dst_ip), session.dst_port,
+            });
+
+            // Build IP+UDP packet with original 4-tuple
+            // IP header (20 bytes) + UDP header (8 bytes) + data
+            const ip_header_len = 20;
+            const udp_header_len = 8;
+            const total_len = ip_header_len + udp_header_len + data.len;
+
+            if (router.write_buf.len < total_len) {
+                std.debug.print("[UDP-SOCKS5-RESP-ERROR] Buffer too small\n", .{});
+                return;
+            }
+
+            // Build IP header
+            router.write_buf[0] = 0x45; // Version + IHL
+            router.write_buf[1] = 0; // TOS
+            std.mem.writeInt(u16, router.write_buf[2..4], @as(u16, @intCast(total_len)), .big);
+            router.write_buf[4] = 0; // ID
+            router.write_buf[5] = 0;
+            router.write_buf[6] = 0x40; // DF flag
+            router.write_buf[7] = 0; // Fragment offset
+            router.write_buf[8] = 64; // TTL
+            router.write_buf[9] = 17; // Protocol = UDP
+            router.write_buf[10] = 0; // Checksum (placeholder)
+            router.write_buf[11] = 0;
+
+            // Source IP = original destination
+            std.mem.writeInt(u32, router.write_buf[12..16], session.dst_ip, .big);
+            // Destination IP = original source
+            std.mem.writeInt(u32, router.write_buf[16..20], session.src_ip, .big);
+
+            // Calculate IP checksum
+            const ip_sum = ipstack.checksum.checksum(router.write_buf[0..ip_header_len], 0);
+            std.mem.writeInt(u16, router.write_buf[10..12], ip_sum, .big);
+
+            // Build UDP header
+            // Source port = original destination port
+            std.mem.writeInt(u16, router.write_buf[ip_header_len .. ip_header_len + 2], session.dst_port, .big);
+            // Destination port = original source port
+            std.mem.writeInt(u16, router.write_buf[ip_header_len + 2 .. ip_header_len + 4], session.src_port, .big);
+            // Length
+            std.mem.writeInt(u16, router.write_buf[ip_header_len + 4 .. ip_header_len + 6], @as(u16, @intCast(udp_header_len + data.len)), .big);
+            router.write_buf[ip_header_len + 6] = 0; // Checksum placeholder
+            router.write_buf[ip_header_len + 7] = 0;
+
+            // Copy data
+            @memcpy(router.write_buf[ip_header_len + udp_header_len .. total_len], data);
+
+            // Calculate UDP checksum
+            const udp_sum = ipstack.checksum.checksumPseudoIPv4(
+                session.dst_ip,
+                session.src_ip,
+                17,
+                @as(u16, @intCast(udp_header_len + data.len)),
+            );
+            var sum: u32 = udp_sum;
+            const udp_header_u16 = @as([*]const u16, @ptrCast(router.write_buf[ip_header_len .. ip_header_len + 8]));
+            sum += udp_header_u16[0]; // src_port + dst_port
+            sum += udp_header_u16[1]; // length
+            sum += udp_header_u16[2]; // checksum (0) + padding
+
+            var i: usize = 0;
+            while (i + 1 < data.len) : (i += 2) {
+                sum += @as(u16, data[i]) | (@as(u16, data[i + 1]) << 8);
+            }
+            if (i < data.len) {
+                sum += @as(u16, data[i]);
+            }
+
+            while (sum >> 16 != 0) {
+                sum = (sum & 0xFFFF) + (sum >> 16);
+            }
+
+            const udp_checksum = @as(u16, @bitCast(~sum));
+            std.mem.writeInt(u16, router.write_buf[ip_header_len + 6 .. ip_header_len + 8], udp_checksum, .big);
+
+            // Write to TUN
+            router.writeToTunBuf(router.write_buf[0..total_len]) catch |err| {
+                std.debug.print("[UDP-SOCKS5-RESP-ERROR] writeToTunBuf failed: {}\n", .{err});
+            };
+
+            std.debug.print("[UDP-SOCKS5-RESP] Wrote {} bytes to TUN\n", .{total_len});
+        } else {
+            std.debug.print("[UDP-SOCKS5-RESP-WARN] No matching session found for {s}:{}\n", .{ fmtIp(src_ip), src_port });
+        }
+
+        std.debug.print("[UDP-SOCKS5-RESP-EXIT] ============================================\n\n", .{});
+    }
+
+    /// Initialize UDP Associate with SOCKS5 proxy
+    fn initUdpAssociate(router: *Router) !void {
+        const proxy_config = router.config.proxy orelse {
+            std.debug.print("[UDP-SOCKS5] No proxy configured\n", .{});
+            return error.NoProxyConfigured;
+        };
+
+        if (proxy_config.type != .Socks5) {
+            std.debug.print("[UDP-SOCKS5] Proxy type is not SOCKS5\n", .{});
+            return error.NotSocks5Proxy;
+        }
+
+        const proxy_addr = parseProxyAddr(proxy_config.addr) catch {
+            std.debug.print("[UDP-SOCKS5-ERROR] Failed to parse proxy address\n", .{});
+            return error.InvalidProxyAddr;
+        };
+
+        const proxy_net_addr = std.net.Address.initIp4(
+            .{ @as(u8, @truncate(proxy_addr.ip >> 24)), @as(u8, @truncate(proxy_addr.ip >> 16)), @as(u8, @truncate(proxy_addr.ip >> 8)), @as(u8, @truncate(proxy_addr.ip)) },
+            proxy_addr.port,
+        );
+
+        // Create TCP connection to proxy (needed for UDP associate handshake)
+        const tcp_client = try Socks5Conn.create(router.allocator, &router.loop, proxy_net_addr);
+        errdefer Socks5Conn.destroy(tcp_client, router.allocator);
+
+        // Store the TCP client for later
+        var tcp_idx: usize = 0;
+        for (router.socks5_pool, 0..) |*conn_ptr, idx| {
+            if (conn_ptr.* == null) {
+                tcp_idx = idx;
+                break;
+            }
+        } else {
+            return error.Socks5PoolFull;
+        }
+
+        // Connect to proxy
+        tcp_client.setCallbacks(router, null, null, null, onSocks5Error);
+        tcp_client.connect(0, 0, null) catch |err| {
+            std.debug.print("[UDP-SOCKS5-ERROR] TCP connect failed: {}\n", .{err});
+            return err;
+        };
+
+        // Wait for connection to establish (simplified - in production use async waiting)
+        std.time.sleep(100 * std.time.ns_per_ms);
+
+        if (tcp_client.getState() != .Ready) {
+            return error.Socks5ConnectionFailed;
+        }
+
+        // Create UDP associate
+        const udp_associate = try socks5.Socks5UdpAssociate.create(router.allocator, &router.loop, tcp_client);
+        errdefer socks5.Socks5UdpAssociate.destroy(udp_associate, router.allocator);
+
+        // Set callbacks
+        udp_associate.setCallbacks(router, onSocks5UdpData, null);
+
+        // Establish UDP associate
+        udp_associate.associate() catch |err| {
+            std.debug.print("[UDP-SOCKS5-ERROR] UDP associate failed: {}\n", .{err});
+            return err;
+        };
+
+        // Start reading UDP datagrams from proxy
+        udp_associate.submitRead();
+
+        router.socks5_pool[tcp_idx] = tcp_client;
+        router.udp_associate = udp_associate;
+
+        std.debug.print("[UDP-SOCKS5] UDP associate established\n", .{});
+    }
+
+    /// Submit UDP associate read operation
+    fn submitUdpAssociateRead(router: *Router) void {
+        if (router.udp_associate) |ua| {
+            ua.submitRead();
+        }
+    }
+
     /// Forward packet to egress interface using raw socket
     fn forwardToEgress(router: *Router, packet: *const Packet) !void {
         const raw_sock = router.raw_sock orelse {
@@ -1095,9 +1548,9 @@ pub const Router = struct {
     fn sendSynAck(router: *Router, src_ip: u32, src_port: u16, dst_ip: u32, dst_port: u16, client_seq: u32) !void {
         std.debug.print("\n[SYNACK] ============================================\n", .{});
         std.debug.print("[SYNACK] sendSynAck called at {}\n", .{std.time.nanoTimestamp()});
-        std.debug.print("[SYNACK] src_ip={s}:{} (server)\n", .{fmtIp(src_ip), src_port});
-        std.debug.print("[SYNACK] dst_ip={s}:{} (client)\n", .{fmtIp(dst_ip), dst_port});
-        std.debug.print("[SYNACK] client_seq={} ack_num={}\n", .{client_seq, client_seq + 1});
+        std.debug.print("[SYNACK] src_ip={s}:{} (server)\n", .{ fmtIp(src_ip), src_port });
+        std.debug.print("[SYNACK] dst_ip={s}:{} (client)\n", .{ fmtIp(dst_ip), dst_port });
+        std.debug.print("[SYNACK] client_seq={} ack_num={}\n", .{ client_seq, client_seq + 1 });
 
         std.debug.print("[SYNACK] Building SYN-ACK packet using ipstack...\n", .{});
 
@@ -1119,16 +1572,16 @@ pub const Router = struct {
             router.write_buf[tcp_offset..].ptr,
             src_ip,
             dst_ip,
-            src_port,     // Server port
-            dst_port,     // Client port
-            0,            // Server's initial sequence number (will be random in real impl)
+            src_port, // Server port
+            dst_port, // Client port
+            0, // Server's initial sequence number (will be random in real impl)
             client_seq + 1, // ACK number = client_seq + 1
-            0x12,         // Flags: SYN + ACK
-            65535,        // Window size
-            &[0]u8{},     // No payload for SYN-ACK
+            0x12, // Flags: SYN + ACK
+            65535, // Window size
+            &[0]u8{}, // No payload for SYN-ACK
         );
 
-        std.debug.print("[SYNACK] TCP header built at offset {}, len={}\n", .{tcp_offset, tcp_len});
+        std.debug.print("[SYNACK] TCP header built at offset {}, len={}\n", .{ tcp_offset, tcp_len });
 
         const total_len = ip_offset + tcp_len;
         std.debug.print("[SYNACK] Total packet length: {}\n", .{total_len});
@@ -1150,8 +1603,8 @@ pub const Router = struct {
     };
 
     const MockStage = enum {
-        syn_received,  // Waiting for ACK
-        established,   // Connection established, can send data
+        syn_received, // Waiting for ACK
+        established, // Connection established, can send data
     };
 
     /// Handle mock HTTP response (SYN -> SYN-ACK, then HTTP on ACK)
@@ -1164,7 +1617,7 @@ pub const Router = struct {
         const is_ack = (tcp_flags & 0x10) != 0;
 
         std.debug.print("\n[MOCK] ============================================\n", .{});
-        std.debug.print("[MOCK] handleMockHttp: SYN={} ACK={}\n", .{is_syn, is_ack});
+        std.debug.print("[MOCK] handleMockHttp: SYN={} ACK={}\n", .{ is_syn, is_ack });
 
         // Store mock state for tracking
         if (router.mock_state == null) {
@@ -1176,7 +1629,7 @@ pub const Router = struct {
             .src_port = packet.dst_port,
             .dst_ip = packet.src_ip,
             .dst_port = packet.src_port,
-            .client_seq = std.mem.readInt(u32, packet.data[tcp_offset + 4..tcp_offset + 8], .big),
+            .client_seq = std.mem.readInt(u32, packet.data[tcp_offset + 4 .. tcp_offset + 8], .big),
             .stage = if (is_syn) .syn_received else .established,
         };
 
@@ -1238,12 +1691,12 @@ pub const Router = struct {
             router.write_buf[tcp_offset..].ptr,
             src_ip,
             dst_ip,
-            src_port,  // Server port
-            dst_port,  // Client port
-            0,         // Server's initial sequence number
-            seq_num,   // ACK number
-            0x18,      // Flags: PSH + ACK
-            65535,     // Window size
+            src_port, // Server port
+            dst_port, // Client port
+            0, // Server's initial sequence number
+            seq_num, // ACK number
+            0x18, // Flags: PSH + ACK
+            65535, // Window size
             http_response,
         );
 
@@ -1260,12 +1713,27 @@ pub const Router = struct {
         std.debug.print("[NET] Network paused\n", .{});
         router.is_paused = true;
 
-        // Close SOCKS5 connection
-        if (router.socks5_conn) |conn| {
-            Socks5Conn.destroy(conn, router.allocator);
-            router.socks5_conn = null;
+        // Close all SOCKS5 connections in the pool
+        for (router.socks5_pool, 0..) |*conn_ptr, idx| {
+            if (conn_ptr.*) |conn| {
+                conn.close();
+                Socks5Conn.destroy(conn, router.allocator);
+                conn_ptr.* = null;
+            }
         }
-        router.pending_syn = null;
+
+        // Close UDP associate
+        if (router.udp_associate) |ua| {
+            ua.close();
+            socks5.Socks5UdpAssociate.destroy(ua, router.allocator);
+            router.udp_associate = null;
+        }
+
+        // Clear pending TCP connections
+        for (router.pending_tcp_pool) |*entry| {
+            entry.src_ip = 0;
+            entry.dst_ip = 0;
+        }
     }
 
     /// Handle network resume (after being paused)
@@ -1351,7 +1819,7 @@ pub const Router = struct {
             return;
         }
 
-        const packet = router.packet_buf[packet_offset..packet_offset + packet_len];
+        const packet = router.packet_buf[packet_offset .. packet_offset + packet_len];
 
         if (packet.len < ip_header_len + 8) {
             std.debug.print("[ICMP] Packet too small for ICMP\n", .{});
@@ -1525,7 +1993,7 @@ fn onTunReadable(
         return .disarm;
     }
 
-    std.debug.print("[TUN-CB] Read {} bytes from TUN (fd={})\n", .{n, router.tunFd()});
+    std.debug.print("[TUN-CB] Read {} bytes from TUN (fd={})\n", .{ n, router.tunFd() });
     router._stats.bytes_rx += n;
 
     // Check for macOS utun 4-byte AF_INET header
@@ -1544,11 +2012,10 @@ fn onTunReadable(
 
     // Extract packet info for logging
     const proto_byte = router.packet_buf[packet_offset + 9];
-    const src_ip = std.mem.readInt(u32, router.packet_buf[packet_offset + 12..][0..4], .big);
-    const dst_ip = std.mem.readInt(u32, router.packet_buf[packet_offset + 16..][0..4], .big);
+    const src_ip = std.mem.readInt(u32, router.packet_buf[packet_offset + 12 ..][0..4], .big);
+    const dst_ip = std.mem.readInt(u32, router.packet_buf[packet_offset + 16 ..][0..4], .big);
 
-    std.debug.print("[TUN-CB] Packet: {s} -> {s} proto={}\n", .{
-        fmtIp(src_ip), fmtIp(dst_ip), proto_byte });
+    std.debug.print("[TUN-CB] Packet: {s} -> {s} proto={}\n", .{ fmtIp(src_ip), fmtIp(dst_ip), proto_byte });
 
     // Check for ICMP echo request (protocol=1, type=8)
     if (proto_byte == 1) {
@@ -1577,10 +2044,7 @@ fn onTunReadable(
         return .disarm;
     };
 
-    std.debug.print("[TUN-CB] Parsed: {s}:{} -> {s}:{} proto={}\n", .{
-        fmtIp(packet.src_ip), packet.src_port,
-        fmtIp(packet.dst_ip), packet.dst_port,
-        packet.protocol });
+    std.debug.print("[TUN-CB] Parsed: {s}:{} -> {s}:{} proto={}\n", .{ fmtIp(packet.src_ip), packet.src_port, fmtIp(packet.dst_ip), packet.dst_port, packet.protocol });
 
     router.forwardPacket(&packet) catch |err| {
         std.debug.print("[TUN-CB-ERROR] forwardPacket failed: {}\n", .{err});
@@ -1622,22 +2086,14 @@ fn onNatTimer(
 }
 
 /// SOCKS5 data callback - forward received data from proxy to TUN
-fn onSocks5Data(userdata: ?*anyopaque, data: []const u8) void {
+fn onSocks5Data(userdata: ?*anyopaque, data: []const u8, client: *Socks5Client) void {
     const router = @as(*Router, @ptrCast(@alignCast(userdata orelse return)));
 
     std.debug.print("\n[SOCKS5-DATA] ============================================\n", .{});
     std.debug.print("[SOCKS5-DATA] onSocks5Data called at {}\n", .{std.time.nanoTimestamp()});
     std.debug.print("[SOCKS5-DATA] Received {} bytes from proxy\n", .{data.len});
 
-    // Get destination info from Socks5Client
-    if (router.socks5_conn == null) {
-        std.debug.print("[SOCKS5-DATA-ERROR] No SOCKS5 client, dropping data\n", .{});
-        return;
-    }
-    const client = router.socks5_conn.?;
-
-    std.debug.print("[SOCKS5-DATA] From target: {s}:{}\n", .{fmtIp(client.dst_ip), client.dst_port});
-    std.debug.print("[SOCKS5-DATA] To TUN client: {s}:{}\n", .{fmtIp(router.config.tun.ip), 0});
+    std.debug.print("[SOCKS5-DATA] From target: {s}:{} (client src: {s}:{})\n", .{ fmtIp(client.dst_ip), client.dst_port, fmtIp(client.src_ip), client.src_port });
 
     // Build IP header at position 0-19
     const total_len = 20 + data.len; // IP header + payload
@@ -1660,9 +2116,8 @@ fn onSocks5Data(userdata: ?*anyopaque, data: []const u8) void {
     // Source IP: destination server IP (from SOCKS5 connection)
     std.mem.writeInt(u32, router.write_buf[12..16], client.dst_ip, .big);
 
-    // Destination IP: TUN interface IP (where curl is)
-    const dst_ip = router.config.tun.ip;
-    std.mem.writeInt(u32, router.write_buf[16..20], dst_ip, .big);
+    // Destination IP: original client IP (from 4-tuple)
+    std.mem.writeInt(u32, router.write_buf[16..20], client.src_ip, .big);
 
     // Recalculate IP header checksum
     router.write_buf[10] = 0;
@@ -1681,64 +2136,83 @@ fn onSocks5Data(userdata: ?*anyopaque, data: []const u8) void {
 }
 
 /// SOCKS5 tunnel ready callback - SOCKS5 CONNECT succeeded, send SYN-ACK to client
-fn onSocks5TunnelReady(userdata: ?*anyopaque) void {
+fn onSocks5TunnelReady(userdata: ?*anyopaque, client: *Socks5Client) void {
     const router = @as(*Router, @ptrCast(@alignCast(userdata orelse return)));
 
     std.debug.print("\n[SOCKS5-TUNNEL] ============================================\n", .{});
-    std.debug.print("[SOCKS5-TUNNEL] onSocks5TunnelReady called at {}\n", .{std.time.nanoTimestamp()});
+    std.debug.print("[SOCKS5-TUNNEL] onSocks5TunnelReady called\n", .{});
+    std.debug.print("[SOCKS5-TUNNEL] SOCKS5 client state: {s}\n", .{@tagName(client.getState())});
+    std.debug.print("[SOCKS5-TUNNEL] Client target: {s}:{} (src: {s}:{})\n", .{ fmtIp(client.dst_ip), client.dst_port, fmtIp(client.src_ip), client.src_port });
 
-    if (router.socks5_conn) |client| {
-        std.debug.print("[SOCKS5-TUNNEL] SOCKS5 client state: {s}\n", .{@tagName(client.getState())});
-        std.debug.print("[SOCKS5-TUNNEL] Client target: {s}:{}\n", .{fmtIp(client.dst_ip), client.dst_port});
+    // Look up pending connection
+    const pending = router.getPendingConnection(client.src_ip, client.src_port, client.dst_ip, client.dst_port);
 
-        if (router.pending_syn) |syn| {
-            std.debug.print("[SOCKS5-TUNNEL] Pending SYN found:\n", .{});
-            std.debug.print("[SOCKS5-TUNNEL]   client: {s}:{} seq={}\n", .{
-                fmtIp(syn.src_ip), syn.src_port, syn.seq_num });
-            std.debug.print("[SOCKS5-TUNNEL]   server: {s}:{}\n", .{
-                fmtIp(client.dst_ip), client.dst_port });
+    if (pending) |syn| {
+        std.debug.print("[SOCKS5-TUNNEL] Pending SYN found: client={s}:{} seq={}\n", .{ fmtIp(syn.src_ip), syn.src_port, syn.client_seq });
 
-            // Send SYN-ACK to complete TCP handshake
-            // SYN-ACK appears to come from server (target) to client
-            router.sendSynAck(
-                client.dst_ip,   // src_ip: server IP (as source in SYN-ACK)
-                client.dst_port, // src_port: server port
-                syn.src_ip,      // dst_ip: client IP (as destination in SYN-ACK)
-                syn.src_port,    // dst_port: client port
-                syn.seq_num,
-            ) catch |err| {
-                std.debug.print("[SOCKS5-TUNNEL-ERROR] sendSynAck failed: {}\n", .{err});
-                router.pending_syn = null;
-                return;
-            };
+        // Send SYN-ACK to complete TCP handshake
+        router.sendSynAck(
+            client.dst_ip, // src_ip: server IP
+            client.dst_port, // src_port: server port
+            syn.src_ip, // dst_ip: client IP
+            syn.src_port, // dst_port: client port
+            syn.client_seq,
+        ) catch |err| {
+            std.debug.print("[SOCKS5-TUNNEL-ERROR] sendSynAck failed: {}\n", .{err});
+            router.clearPendingConnection(client.src_ip, client.src_port, client.dst_ip, client.dst_port);
+            return;
+        };
 
-            // Clear pending SYN since we've responded
-            router.pending_syn = null;
-            std.debug.print("[SOCKS5-TUNNEL] SYN-ACK sent, handshake complete!\n", .{});
-            std.debug.print("[SOCKS5-TUNNEL] pending_syn cleared\n", .{});
-        } else {
-            std.debug.print("[SOCKS5-TUNNEL-WARN] Tunnel ready but no pending SYN!\n", .{});
-            std.debug.print("[SOCKS5-TUNNEL-WARN] This should not happen - SYN should be stored before connect()\n", .{});
-        }
+        // Register the connection
+        router.registerTcpConnection(client.src_ip, client.src_port, client.dst_ip, client.dst_port, client) catch {
+            std.debug.print("[SOCKS5-TUNNEL-WARN] Failed to register connection\n", .{});
+        };
+
+        // Clear pending
+        router.clearPendingConnection(client.src_ip, client.src_port, client.dst_ip, client.dst_port);
+        std.debug.print("[SOCKS5-TUNNEL] SYN-ACK sent, connection registered!\n", .{});
     } else {
-        std.debug.print("[SOCKS5-TUNNEL-ERROR] No SOCKS5 client!\n", .{});
+        std.debug.print("[SOCKS5-TUNNEL-WARN] No pending SYN found for this connection!\n", .{});
     }
     std.debug.print("[SOCKS5-TUNNEL-EXIT] ============================================\n\n", .{});
 }
 
 /// SOCKS5 ready callback - connection established
-fn onSocks5Ready(userdata: ?*anyopaque) void {
+fn onSocks5Ready(userdata: ?*anyopaque, client: *Socks5Client) void {
+    _ = client;
     const router = @as(*Router, @ptrCast(@alignCast(userdata orelse return)));
     router._stats.tcp_connections += 1;
-
-    if (router.socks5_conn != null) {
-        std.debug.print("[SOCKS5-READY] Connection established\n", .{});
-    }
+    std.debug.print("[SOCKS5-READY] Connection established\n", .{});
 }
 
 /// SOCKS5 error callback - handle connection errors
-fn onSocks5Error(userdata: ?*anyopaque, err: socks5.Socks5Error) void {
-    _ = userdata;
-    std.debug.print("[SOCKS5] Error occurred: {}\n", .{err});
+fn onSocks5Error(userdata: ?*anyopaque, err: socks5.Socks5Error, client: *Socks5Client) void {
+    const router = @as(*Router, @ptrCast(@alignCast(userdata orelse return)));
+    std.debug.print("[SOCKS5-ERROR] Error occurred: {} for {s}:{}\n", .{ err, fmtIp(client.dst_ip), client.dst_port });
+
+    // Clean up pending connection if any
+    router.clearPendingConnection(client.src_ip, client.src_port, client.dst_ip, client.dst_port);
+
+    // Remove from connection pool
+    for (router.socks5_pool, 0..) |*conn_ptr, idx| {
+        if (conn_ptr.* == client) {
+            conn_ptr.* = null;
+            break;
+        }
+    }
+
+    // Close client
+    client.close();
 }
 
+/// SOCKS5 UDP datagram callback - handle incoming UDP data from proxy
+fn onSocks5UdpData(userdata: ?*anyopaque, data: []const u8, src_ip: u32, src_port: u16) void {
+    const router = @as(*Router, @ptrCast(@alignCast(userdata orelse return)));
+
+    std.debug.print("\n[SOCKS5-UDP-DATA] ============================================\n", .{});
+    std.debug.print("[SOCKS5-UDP-DATA] Received {} bytes from {s}:{}\n", .{ data.len, fmtIp(src_ip), src_port });
+
+    router.handleSocks5UdpResponse(data, src_ip, src_port);
+
+    std.debug.print("[SOCKS5-UDP-DATA-EXIT] ============================================\n\n", .{});
+}
