@@ -105,6 +105,11 @@ const zig_modules = &[_]framework.ZigModule{
         .deps = &[_][]const u8{ "ipstack_checksum", "ipstack_ipv4", "ipstack_ipv6" },
     },
     .{
+        .name = "ipstack_icmpv6",
+        .file = "src/ipstack/icmpv6.zig",
+        .deps = &[_][]const u8{ "ipstack_checksum", "ipstack_ipv6" },
+    },
+    .{
         .name = "ipstack_callbacks",
         .file = "src/ipstack/callbacks.zig",
         .deps = &[_][]const u8{"ipstack_connection"},
@@ -124,6 +129,7 @@ const zig_modules = &[_]framework.ZigModule{
             "ipstack_tcp",
             "ipstack_udp",
             "ipstack_icmp",
+            "ipstack_icmpv6",
             "ipstack_callbacks",
             "ipstack_connection",
             "tun",

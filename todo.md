@@ -7,198 +7,65 @@
 
 ## Current Tasks
 
-### Phase 12: Graceful Shutdown (IN PROGRESS)
+### Phase 19: Connection Pool Optimization (PENDING)
+
+**Goal**: TCP connection pooling for SOCKS5 proxy
+
+---
+
+### Phase 20: Log System (PENDING)
+
+**Goal**: Production-grade logging with levels and structured output
+
+---
+
+## Completed Phases
+
+### Phase 18: IPv6 Support (COMPLETED)
 
 **Date**: 2026-02-13
 
-**Goal**: Forward UDP traffic through SOCKS5 UDP Associate, DNS queries work correctly
+**Goal**: IPv6 packet parsing and ICMPv6 echo reply support
 
 **Key Changes Implemented**:
 
-1. **SOCKS5 UDP Associate Client**
-   - Added `Socks5UdpAssociate` struct in socks5.zig
-   - UDP socket creation and binding to SOCKS5 proxy
-   - `sendDatagram()` - Send UDP datagram with SOCKS5 UDP header encapsulation
-   - `associate()` - Establish UDP relay binding with proxy
-   - Async read callback for receiving datagrams from proxy
+1. **ICMPv6 Module** (`src/ipstack/icmpv6.zig`)
+   - Created `Icmpv6Header`, `Icmpv6Echo`, `Icmpv6PacketTooBig`, etc.
+   - Implemented `buildEchoReply()` and `buildEchoRequest()` with checksum
+   - ICMPv6 checksum using pseudo-header (src_ip + dst_ip + length + next_header)
+   - Type constants: ECHO_REQUEST=128, ECHO_REPLY=129, etc.
 
-2. **SOCKS5 UDP Header Format**
-   ```
-   RSV(2) + ATYP(1) + DST.ADDR + DST.PORT(2) + DATA
-   ATYP: 0x01=IPv4, 0x03=Domain, 0x04=IPv6
-   ```
+2. **IPv6 Packet Processing**
+   - Added `processIpv6Packet()` in ipstack/mod.zig
+   - Added `processIpv6UdpPacket()` for UDP over IPv6
+   - Added `processIcmpv6Packet()` for ICMPv6 handling
+   - Added `buildIcmpv6EchoReply()` and `ipv6UdpSend()` helpers
 
-3. **UDP Session Tracking**
-   - Added `Socks5UdpSession` struct for tracking UDP flows
-   - `upsertUdpSession()` - Create/update session on outgoing UDP
-   - `findUdpSession()` - Lookup session for response routing
-   - Session table with configurable size (`udp_nat_size`)
+3. **Router Integration**
+   - Added macOS UTUN header detection for IPv6 (AF_INET6=24 at byte 3)
+   - Added `onIpv6PacketReceived()` placeholder for IPv6 packet handling
+   - Added `fmtIpv6()` helper for IPv6 address formatting
 
-4. **Router Integration**
-   - Added `udp_sessions: []Socks5UdpSession` table
-   - Added `udp_associate: ?*Socks5UdpAssociate` client
-   - Added `forwardUdpToSocks5()` - Route UDP+SOCKS5 decisions
-   - Added `handleSocks5UdpResponse()` - Forward responses to TUN
-   - Added `initUdpAssociate()` - Initialize UDP relay
-   - Updated `forwardPacket()` to route UDP packets to `forwardUdpToSocks5()`
+4. **Callbacks Extension**
+   - Added `OnIpv6Udp`, `OnIcmpv6`, `OnIcmpv6Echo` callback types
+   - Added `invokeIpv6Udp()`, `invokeIcmpv6()`, `invokeIcmpv6Echo()` helpers
+   - Updated `Callbacks` struct with new IPv6 callback fields
 
-5. **UDP Response Handling**
-   - Parse SOCKS5 UDP response header
-   - Extract source IP/port from proxy response
-   - Lookup original session by destination
-   - Rebuild IP+UDP packet with original 4-tuple
-   - Write response back to TUN
+5. **Statistics**
+   - Added `icmpv6_packets` and `ipv6_packets` counters to Statistics
 
-6. **Network Change Recovery**
-   - Fixed `handleNetworkPause()` to work with pool architecture
-   - Close all SOCKS5 connections and UDP associate on pause
+**Files Created**:
+| File | Description |
+|------|-------------|
+| `src/ipstack/icmpv6.zig` | ICMPv6 protocol utilities |
 
 **Files Modified**:
 | File | Changes |
 |------|---------|
-| `src/router/proxy/socks5.zig` | Added `Socks5UdpAssociate`, `UdpAssociateState`, UDP callbacks |
-| `src/router/mod.zig` | UDP session tracking, SOCKS5 UDP routing, response handling |
-| `src/router/route.zig` | (no changes needed) |
-
-**Architecture**:
-```
-TUN UDP Packet → forwardPacket()
-  └─ route_cb returns .Socks5
-     └─ forwardUdpToSocks5()
-        ├─ Lookup/create UDP session
-        └─ udp_associate.sendDatagram() → SOCKS5 proxy
-
-SOCKS5 UDP Response → onSocks5UdpData()
-  └─ handleSocks5UdpResponse()
-     ├─ Parse SOCKS5 UDP header
-     ├─ Find session by 4-tuple
-     └─ writeToTunBuf() → TUN
-```
-
-**Status**: COMPLETED
-
-**Key Features Implemented**:
-- SOCKS5 UDP Associate client with async handshake
-- UDP datagram encapsulation (RSV + ATYP + DST.ADDR + DST.PORT + DATA)
-- UDP session tracking for response routing
-- DNS query identification (port 53)
-- DNS request tracking with transaction ID
-- DNS timeout detection and statistics
-- UDP session timeout cleanup (60s)
-- Periodic cleanup via NAT timer
-
----
-
-### Phase 12: Graceful Shutdown (IN PROGRESS)
-
----
-
-### Phase 12: Graceful Shutdown (COMPLETED)
-
-**Goal**: Implement graceful shutdown for all components
-
-**Key Features**:
-- Signal handler for SIGINT/SIGTERM
-- stop() method with graceful TCP FIN sending
-- RouterState.stopping state for shutdown tracking
-- Signal handler wired to global router pointer
-
-**Files Modified**:
-| File | Changes |
-|------|---------|
-| `src/router/mod.zig` | Added stop(), sendFin(), RouterState.stopping |
-| `src/tun2socks.zig` | Added signal handler, global router pointer |
-
----
-
-### Phase 13: Network Monitor Integration (COMPLETED)
-
-**Goal**: Handle network changes automatically
-
-**Key Features**:
-- handleNetworkPause() - cleanup SOCKS5/UDP associate on network loss
-- handleNetworkResume() - reselect egress interface
-- handleRoutesChanged() - handle route updates
-- reselectEgressInterface() - recreate raw socket
-
-**Status**: Basic implementation complete. Connections will reconnect on new packets.
-
----
-
-### Phase 14: HTTP Proxy Support (COMPLETED)
-
-**Goal**: Support HTTP CONNECT proxy as outbound
-
-**Key Changes**:
-
-1. **HTTP CONNECT Client** (`src/router/proxy/http.zig`)
-   - `HttpClient` struct with async connect
-   - HTTP CONNECT request/reply handling
-   - `send()` and `recv()` for tunnel data
-   - Support for 407 Proxy Authentication Required
-
-2. **Outbound Integration** (`src/router/outbound.zig`)
-   - Added `OutboundType.http` enum
-   - Added `HttpOutbound` context
-   - `httpConnect()`, `httpSend()`, `httpDestroy()`
-   - `OutboundConfig.http_addr` field
-
-**Files Modified**:
-| File | Changes |
-|------|---------|
-| `src/router/proxy/http.zig` | New HTTP CONNECT client implementation |
-| `src/router/outbound.zig` | Added HTTP outbound type and integration |
-
----
-
-### Phase 15: JSON Configuration Support (COMPLETED)
-
-**Goal**: Support JSON configuration file
-
-**Key Changes**:
-
-1. **Config Module** (`src/config.zig`)
-   - `Config` struct for full configuration
-   - `TunConfig`, `OutboundConfig`, `RouteConfig`, `DnsConfig`
-   - JSON parsing with `parse()` function
-   - Support for all major configuration sections
-
-**Files Modified**:
-| File | Changes |
-|------|---------|
-| `src/config.zig` | New JSON configuration parser |
-
----
-
-## Current Tasks
-
-### Phase 16: Fake-IP + DNS Interception (COMPLETED)
-
-**Goal**: Implement Fake-IP mode for DNS-based routing
-
-**Key Changes**:
-
-1. **DNS Module** (`src/dns.zig`)
-   - `DnsModule` struct with Fake-IP pool management
-   - `getFakeIp()` - allocate Fake-IP for domain
-   - `lookupByIp()` - find domain by Fake-IP
-   - `parseQuery()` - parse DNS query domain name
-   - `buildResponse()` - build Fake-IP DNS response
-
-2. **Fake-IP Range**
-   - 198.18.0.0/15 (198.18.0.0 - 198.19.255.255)
-   - Pool size configurable (default 8192 entries)
-   - Thread-safe allocation
-
-3. **DNS Features**
-   - DNS query parsing with name compression support
-   - Standard DNS response building
-   - TTL support (default 300 seconds)
-
-**Files Modified**:
-| File | Changes |
-|------|---------|
-| `src/dns.zig` | New DNS module with Fake-IP support |
+| `src/ipstack/mod.zig` | Added IPv6 packet processing functions |
+| `src/ipstack/callbacks.zig` | Added IPv6 callbacks (OnIpv6Udp, OnIcmpv6, OnIcmpv6Echo) |
+| `src/router/mod.zig` | Added UTUN IPv6 detection, IPv6 packet handler |
+| `build.zig` | Added `ipstack_icmpv6` module |
 
 ---
 
@@ -230,67 +97,110 @@ SOCKS5 UDP Response → onSocks5UdpData()
 
 ---
 
-### Phase 18: IPv6 Support (IN PROGRESS)
+### Phase 16: Fake-IP + DNS Interception (COMPLETED)
 
-### Phase 10: TCP Full-Duplex Data Forwarding (COMPLETED)
+**Goal**: Implement Fake-IP mode for DNS-based routing
 
-**Date**: 2026-02-13
+**Key Changes**:
 
-**Goal**: Ensure TCP traffic through SOCKS5 proxy works end-to-end with bidirectional data transfer
+1. **DNS Module** (`src/dns.zig`)
+   - `DnsModule` struct with Fake-IP pool management
+   - `getFakeIp()` - allocate Fake-IP for domain
+   - `lookupByIp()` - find domain by Fake-IP
+   - `parseQuery()` - parse DNS query domain name
+   - `buildResponse()` - build Fake-IP DNS response
 
-**Key Changes Implemented**:
+2. **Fake-IP Range**
+   - 198.18.0.0/15 (198.18.0.0 - 198.19.255.255)
+   - Pool size configurable (default 8192 entries)
+   - Thread-safe allocation
 
-1. **TCP Connection Pool Architecture**
-   - Added `TcpConnEntry` struct for tracking active TCP connections by 4-tuple
-   - Added `PendingTcpConn` struct for tracking connections during SOCKS5 handshake
-   - Pool sizes configurable via `RouterConfig.tcp_pool_size`
-
-2. **Replaced Single Connection with Pool**
-   - Changed `socks5_conn: ?*Socks5Conn` → `socks5_pool: []*Socks5Conn`
-   - Added `tcp_conn_pool: []TcpConnEntry` for connection state tracking
-   - Added `pending_tcp_pool: []PendingTcpConn` for pending connections
-
-3. **Async Connection Initiation**
-   - Added `connectAsync()` method in socks5.zig for non-blocking SOCKS5 connect
-   - Removed blocking `connectBlocking()` from critical path
-   - Connection state transitions via libxev callbacks
-
-4. **Connection State Machine Integration**
-   - Using `connection.zig` state machine for TCP state tracking
-   - Added `tcp_state: connection.State` to TcpConnEntry
-
-5. **Callback Updates**
-   - Updated callback signatures to include `client: *Socks5Client` parameter
-   - `onSocks5Data()`, `onSocks5TunnelReady()`, `onSocks5Ready()`, `onSocks5Error()`
-   - Callbacks can access 4-tuple via client fields
-
-6. **New Router Methods**
-   - `lookupTcpConnection()` - Find existing connection by 4-tuple
-   - `findOrCreatePending()` - Get/create pending connection slot
-   - `initiateSocks5Tunnel()` - Start async SOCKS5 connection
-   - `registerTcpConnection()` - Register established connection
-   - `removeTcpConnection()` - Clean up closed connection
-   - `getPendingConnection()` / `clearPendingConnection()` - Pending management
+3. **DNS Features**
+   - DNS query parsing with name compression support
+   - Standard DNS response building
+   - TTL support (default 300 seconds)
 
 **Files Modified**:
 | File | Changes |
 |------|---------|
-| `src/router/mod.zig` | TCP connection pool, async connect, connection state integration |
-| `src/router/proxy/socks5.zig` | Async connect, client 4-tuple fields, updated callbacks |
+| `src/dns.zig` | New DNS module with Fake-IP support |
 
-**Architecture**:
-```
-TUN Packet → forwardToProxy()
-  ├─ lookupTcpConnection() - Check existing connection
-  ├─ initiateSocks5Tunnel() - New async SOCKS5 connect
-  │   └─ connectAsync() → libxev → onSocks5TunnelReady()
-  │       └─ registerTcpConnection() → tcp_conn_pool
-  └─ forwardTcpData() - Send data through established connection
+---
 
-Proxy Response → onSocks5Data()
-  └─ Lookup by client.dst_ip:client.dst_port
-     └─ writeToTunBuf() - Forward to TUN
-```
+### Phase 15: JSON Configuration Support (COMPLETED)
+
+**Goal**: Support JSON configuration file
+
+**Key Changes**:
+
+1. **Config Module** (`src/config.zig`)
+   - `Config` struct for full configuration
+   - `TunConfig`, `OutboundConfig`, `RouteConfig`, `DnsConfig`
+   - JSON parsing with `parse()` function
+   - Support for all major configuration sections
+
+**Files Modified**:
+| File | Changes |
+|------|---------|
+| `src/config.zig` | New JSON configuration parser |
+
+---
+
+### Phase 14: HTTP Proxy Support (COMPLETED)
+
+**Goal**: Support HTTP CONNECT proxy as outbound
+
+**Key Changes**:
+
+1. **HTTP CONNECT Client** (`src/router/proxy/http.zig`)
+   - `HttpClient` struct with async connect
+   - HTTP CONNECT request/reply handling
+   - `send()` and `recv()` for tunnel data
+   - Support for 407 Proxy Authentication Required
+
+2. **Outbound Integration** (`src/router/outbound.zig`)
+   - Added `OutboundType.http` enum
+   - Added `HttpOutbound` context
+   - `httpConnect()`, `httpSend()`, `httpDestroy()`
+   - `OutboundConfig.http_addr` field
+
+**Files Modified**:
+| File | Changes |
+|------|---------|
+| `src/router/proxy/http.zig` | New HTTP CONNECT client implementation |
+| `src/router/outbound.zig` | Added HTTP outbound type and integration |
+
+---
+
+### Phase 13: Network Monitor Integration (COMPLETED)
+
+**Goal**: Handle network changes automatically
+
+**Key Features**:
+- `handleNetworkPause()` - cleanup SOCKS5/UDP associate on network loss
+- `handleNetworkResume()` - reselect egress interface
+- `handleRoutesChanged()` - handle route updates
+- `reselectEgressInterface()` - recreate raw socket
+
+**Status**: Basic implementation complete. Connections will reconnect on new packets.
+
+---
+
+### Phase 12: Graceful Shutdown (COMPLETED)
+
+**Goal**: Implement graceful shutdown for all components
+
+**Key Features**:
+- Signal handler for SIGINT/SIGTERM
+- `stop()` method with graceful TCP FIN sending
+- `RouterState.stopping` state for shutdown tracking
+- Signal handler wired to global router pointer
+
+**Files Modified**:
+| File | Changes |
+|------|---------|
+| `src/router/mod.zig` | Added `stop()`, `sendFin()`, `RouterState.stopping` |
+| `src/tun2socks.zig` | Added signal handler, global router pointer |
 
 ---
 
@@ -332,160 +242,46 @@ Proxy Response → onSocks5Data()
 
 ---
 
-### Phase 9: ICMP Echo on macOS Fix (COMPLETED)
+### Phase 10: TCP Full-Duplex Data Forwarding (COMPLETED)
 
 **Date**: 2026-02-13
 
-**Goal**: Fix ICMP Echo Reply functionality on macOS
+**Goal**: Ensure TCP traffic through SOCKS5 proxy works end-to-end with bidirectional data transfer
 
-**Issues Fixed**:
-1. **macOS utun header byte order**: Changed from big-endian to little-endian
-   - Before: `00 00 00 02` (incorrect)
-   - After: `02 00 00 00` (correct)
+**Key Changes Implemented**:
 
-2. **Pointer alignment issues**: Changed from struct casting to direct byte-level access
-   - `ipv4.zig`: `parseHeader()`, `buildHeader()`, `checksum()`
-   - `tcp.zig`: `parseHeader()`, `buildHeader()`
+1. **TCP Connection Pool Architecture**
+   - Added `TcpConnEntry` struct for tracking active TCP connections by 4-tuple
+   - Added `PendingTcpConn` struct for tracking connections during SOCKS5 handshake
+   - Pool sizes configurable via `RouterConfig.tcp_pool_size`
 
-3. **Data copy logic**: Fixed `writeToTunBuf` to always copy regardless of header_len
+2. **Replaced Single Connection with Pool**
+   - Changed `socks5_conn: ?*Socks5Conn` → `socks5_pool: []*Socks5Conn`
+   - Added `tcp_conn_pool: []TcpConnEntry` for connection state tracking
+   - Added `pending_tcp_pool: []PendingTcpConn` for pending connections
 
-4. **ICMP checksum**: Fixed pseudo-header IP order (swap src/dst for reply)
+3. **Async Connection Initiation**
+   - Added `connectAsync()` method in socks5.zig for non-blocking SOCKS5 connect
+   - Removed blocking `connectBlocking()` from critical path
+   - Connection state transitions via libxev callbacks
+
+4. **Connection State Machine Integration**
+   - Using `connection.zig` state machine for TCP state tracking
+   - Added `tcp_state: connection.State` to TcpConnEntry
+
+5. **New Router Methods**
+   - `lookupTcpConnection()` - Find existing connection by 4-tuple
+   - `findOrCreatePending()` - Get/create pending connection slot
+   - `initiateSocks5Tunnel()` - Start async SOCKS5 connection
+   - `registerTcpConnection()` - Register established connection
+   - `removeTcpConnection()` - Clean up closed connection
+   - `getPendingConnection()` / `clearPendingConnection()` - Pending management
 
 **Files Modified**:
 | File | Changes |
 |------|---------|
-| `src/router/mod.zig` | Fixed utun header byte order, data copy logic |
-| `src/ipstack/ipv4.zig` | Byte-level access for header parsing/building |
-| `src/ipstack/tcp.zig` | Byte-level access for header parsing/building |
-
-**Verification**:
-```
-[TUN-CB] ICMP echo request detected, sending reply
-[ICMP] Echo request received, sending reply
-[TUN]   src=10.0.0.2 dst=10.0.0.1 proto=1
-[ICMP] Reply sent successfully
-```
-
-**Git Commit**: `75be1de`
-
----
-
-### Phase 8: Outbound Abstraction + ipstack Integration (COMPLETED)
-
-**Date**: 2026-02-13
-
-**Goal**: Refactor Router to use ipstack for protocol parsing and add Outbound abstraction layer
-
-**Architecture**:
-```
-TUN → Router → Outbound (interface) → SOCKS5/Direct (impl) → ipstack (protocol)
-```
-
-**Files Created**:
-| File | Description |
-|------|-------------|
-| `src/router/outbound.zig` | Outbound abstraction (SOCKS5 + Direct) |
-
-**Files Modified**:
-| File | Changes |
-|------|---------|
-| `src/router/mod.zig` | Use ipstack for protocol parsing |
-| `build.zig` | Added router_outbound module |
-
----
-
-### Phase 7.13: Network Monitor Bug Fixes (COMPLETED)
-
-**Date**: 2026-02-13
-
-**Issues Fixed**:
-- Removed dead code: `handleNetworkChange()` referenced non-existent `network_listener` field
-- Fixed event mapping: `address_removed` now pauses network instead of resuming
-- Updated `onNetworkChangeCallback` to correctly handle all network events
-
----
-
-### Phase 7.11: Cross-Platform Network Monitor Implementation (COMPLETED)
-
-**Date**: 2026-02-12
-
-**Result**: Successfully implemented cross-platform network change detection
-
-**Architecture**:
-```
-src/system/monitor.zig           # Main facade (cross-platform interface)
-├── monitor_darwin.zig          # BSD Routing Socket (macOS)
-├── monitor_linux.zig           # rtnetlink (Linux)
-└── monitor_windows.zig         # NotifyAddrChange (Windows)
-```
-
-**Files Created**:
-| File | Description |
-|------|-------------|
-| `src/system/monitor.zig` | Main interface |
-| `src/system/monitor_darwin.zig` | macOS implementation |
-| `src/system/monitor_linux.zig` | Linux implementation |
-| `src/system/monitor_windows.zig` | Windows implementation |
-
----
-
-### Phase 7.9: Network Change Detection and Handling (COMPLETED)
-
-**Date**: 2026-02-12
-
-**Reference**: sing-box `route/network.go` architecture
-
-**Result**: BSD Routing Socket listener and network change handlers implemented
-
----
-
-### Phase 7.8: SOCKS5 TCP Handshake Fix (COMPLETED)
-
-**Date**: 2026-02-12
-
-**Result**: TCP three-way handshake through SOCKS5 proxy now works correctly
-
----
-
-### Phase 7.7: TUN and Routing Bug Fixes (COMPLETED)
-
-**Date**: 2026-02-12
-
-**Result**: TUN routing configuration fixed for macOS utun interfaces
-
----
-
-### Phase 7.6: SOCKS5 Client Refactoring (COMPLETED)
-
-**Date**: 2026-02-12
-
-**Result**: SOCKS5 client moved to standalone module `src/router/proxy/socks5.zig`
-
----
-
-### Phase 7: Pure Zig Migration (COMPLETED)
-
-**Date**: 2026-02-12
-
-**Result**: All network functions migrated to pure Zig implementation
-
----
-
-### Phase 6: Production Readiness (COMPLETED v0.2.0)
-
-- Cross-platform builds: macOS, Linux, Windows, iOS
-- ICMP auto-reply, UDP NAT proxy, SOCKS5 integration
-- Integration tests: 90/90 PASSED
-
----
-
-## Recent Changes
-
-- **2026-02-13**: Phase 15 - JSON Configuration Support
-- **2026-02-13**: Phase 14 - HTTP CONNECT Proxy Support
-- **2026-02-13**: Phase 12 - Graceful Shutdown
-- **2026-02-13**: Phase 11 - UDP over SOCKS5 + DNS (UDP Associate implementation)
-- **2026-02-13**: Phase 10 - TCP Full-Duplex Data Forwarding (connection pool architecture)
+| `src/router/mod.zig` | TCP connection pool, async connect, connection state integration |
+| `src/router/proxy/socks5.zig` | Async connect, client 4-tuple fields, updated callbacks |
 
 ---
 

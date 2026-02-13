@@ -133,6 +133,52 @@ pub const OnIpv6Packet = *const fn (
     data: []const u8,
 ) void;
 
+/// IPv6 UDP Data Callback
+/// Called when a UDP packet is received over IPv6.
+/// src_ip: Source IPv6 address
+/// src_port: Source port
+/// dst_ip: Destination IPv6 address
+/// dst_port: Destination port
+/// data: UDP payload
+pub const OnIpv6Udp = *const fn (
+    src_ip: *const [16]u8,
+    src_port: u16,
+    dst_ip: *const [16]u8,
+    dst_port: u16,
+    data: []const u8,
+) void;
+
+/// ICMPv6 Packet Callback
+/// Called when an ICMPv6 packet is received (non-echo).
+/// Used for error handling and network diagnostics.
+/// src_ip: Source IPv6 address
+/// dst_ip: Destination IPv6 address
+/// msg_type: ICMPv6 type
+/// code: ICMPv6 code
+/// data: ICMPv6 payload
+pub const OnIcmpv6 = *const fn (
+    src_ip: *const [16]u8,
+    dst_ip: *const [16]u8,
+    msg_type: u8,
+    code: u8,
+    data: []const u8,
+) void;
+
+/// ICMPv6 Echo Request Callback
+/// Called when an ICMPv6 Echo Request (ping) is received.
+/// src_ip: Source IPv6 address
+/// dst_ip: Destination IPv6 address
+/// identifier: ICMPv6 identifier
+/// sequence: ICMPv6 sequence number
+/// payload: Echo payload
+pub const OnIcmpv6Echo = *const fn (
+    src_ip: *const [16]u8,
+    dst_ip: *const [16]u8,
+    identifier: u16,
+    sequence: u16,
+    payload: []const u8,
+) void;
+
 /// Error Callback
 /// Called when an error occurs in the IP stack.
 /// err: Error type
@@ -165,10 +211,13 @@ pub const Callbacks = struct {
 
     // UDP callback
     onUdp: ?OnUdp = null,
+    onIpv6Udp: ?OnIpv6Udp = null,
 
     // ICMP callbacks
     onIcmp: ?OnIcmp = null,
     onIcmpEcho: ?OnIcmpEcho = null,
+    onIcmpv6: ?OnIcmpv6 = null,
+    onIcmpv6Echo: ?OnIcmpv6Echo = null,
 
     // Raw packet callbacks
     onIpv4Packet: ?OnIpv4Packet = null,
@@ -278,6 +327,45 @@ pub fn invokeError(
 ) void {
     if (callbacks.onError) |cb| {
         cb(err, message);
+    }
+}
+
+pub fn invokeIpv6Udp(
+    callbacks: *const Callbacks,
+    src_ip: *const [16]u8,
+    src_port: u16,
+    dst_ip: *const [16]u8,
+    dst_port: u16,
+    data: []const u8,
+) void {
+    if (callbacks.onIpv6Udp) |cb| {
+        cb(src_ip, src_port, dst_ip, dst_port, data);
+    }
+}
+
+pub fn invokeIcmpv6(
+    callbacks: *const Callbacks,
+    src_ip: *const [16]u8,
+    dst_ip: *const [16]u8,
+    msg_type: u8,
+    code: u8,
+    data: []const u8,
+) void {
+    if (callbacks.onIcmpv6) |cb| {
+        cb(src_ip, dst_ip, msg_type, code, data);
+    }
+}
+
+pub fn invokeIcmpv6Echo(
+    callbacks: *const Callbacks,
+    src_ip: *const [16]u8,
+    dst_ip: *const [16]u8,
+    identifier: u16,
+    sequence: u16,
+    payload: []const u8,
+) void {
+    if (callbacks.onIcmpv6Echo) |cb| {
+        cb(src_ip, dst_ip, identifier, sequence, payload);
     }
 }
 

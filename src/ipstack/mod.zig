@@ -13,6 +13,7 @@ pub const ipv6 = @import("ipstack_ipv6");
 pub const tcp = @import("ipstack_tcp");
 pub const udp = @import("ipstack_udp");
 pub const icmp = @import("ipstack_icmp");
+pub const icmpv6 = @import("ipstack_icmpv6");
 pub const connection = @import("ipstack_connection");
 pub const callbacks = @import("ipstack_callbacks");
 
@@ -35,6 +36,8 @@ pub const Statistics = struct {
     tcp_active: u32 = 0,
     udp_packets: u32 = 0,
     icmp_packets: u32 = 0,
+    icmpv6_packets: u32 = 0,
+    ipv6_packets: u32 = 0,
     dropped_packets: u32 = 0,
     checksum_errors: u32 = 0,
     connection_timeouts: u32 = 0,
@@ -420,6 +423,175 @@ fn sendIcmpEchoReply(ipstack: *StaticIpstack, req: [*]const u8, req_len: usize, 
     // Send via write callback (not implemented in this core module)
     // Application would register a write callback for this
     _ = ip_len;
+}
+
+/// Process incoming IPv6 packet
+/// ipstack: IP stack context
+/// data: Raw IP packet data (starts with IPv6 header)
+/// len: Packet length
+/// Returns: error on failure
+pub fn processIpv6Packet(ipstack: *StaticIpstack, data: [*]const u8, len: usize) Error!void {
+    if (!ipstack.ipv6_config.enabled) {
+        return error.NotSupported;
+    }
+
+    if (len < ipv6.HDR_SIZE) {
+        return error.InvalidPacket;
+    }
+
+    const ip_info = ipv6.parseHeader(data, len) orelse {
+        ipstack.stats.dropped_packets += 1;
+        return error.InvalidPacket;
+    };
+
+    ipstack.stats.ipv6_packets += 1;
+
+    // Route to appropriate protocol handler
+    switch (ip_info.next_header) {
+        ipv6.NH_TCP => {
+            // TCP over IPv6 not fully implemented - delegate to raw callback
+            if (ipstack.config.callbacks.onIpv6Packet) |cb| {
+                const payload = data[ipv6.HDR_SIZE..len];
+                cb(&ip_info.src_addr, &ip_info.dst_addr, ip_info.next_header, payload);
+            }
+        },
+        ipv6.NH_UDP => {
+            // UDP over IPv6
+            try processIpv6UdpPacket(ipstack, data, len, &ip_info);
+        },
+        ipv6.NH_ICMPV6 => {
+            try processIcmpv6Packet(ipstack, data, len, &ip_info);
+        },
+        else => {
+            // Raw packet callback
+            if (ipstack.config.callbacks.onIpv6Packet) |cb| {
+                const payload = data[ipv6.HDR_SIZE..len];
+                cb(&ip_info.src_addr, &ip_info.dst_addr, ip_info.next_header, payload);
+            }
+        },
+    }
+}
+
+/// Process UDP packet over IPv6
+fn processIpv6UdpPacket(ipstack: *StaticIpstack, data: [*]const u8, len: usize, ip_info: *const ipv6.PacketInfo) Error!void {
+    const udp_offset = ipv6.HDR_SIZE;
+    const udp_len = len - udp_offset;
+
+    if (udp_len < udp.HDR_SIZE) {
+        return error.InvalidPacket;
+    }
+
+    const udp_info = udp.parseHeader(data + udp_offset, udp_len) orelse {
+        ipstack.stats.dropped_packets += 1;
+        return error.InvalidPacket;
+    };
+
+    ipstack.stats.udp_packets += 1;
+
+    // IPv6 UDP doesn't have checksum verification in this simplified implementation
+    const payload = data + udp_offset + udp.HDR_SIZE;
+    if (ipstack.config.callbacks.onIpv6Udp) |cb| {
+        cb(&ip_info.src_addr, udp_info.src_port, &ip_info.dst_addr, udp_info.dst_port, payload[0..udp_info.payload_len]);
+    }
+}
+
+/// Process ICMPv6 packet
+fn processIcmpv6Packet(ipstack: *StaticIpstack, data: [*]const u8, len: usize, ip_info: *const ipv6.PacketInfo) Error!void {
+    const icmp_offset = ipv6.HDR_SIZE;
+    const icmp_len = len - icmp_offset;
+
+    if (icmp_len < icmpv6.HDR_SIZE) {
+        return error.InvalidPacket;
+    }
+
+    const icmp_info = icmpv6.parseHeader(data + icmp_offset, icmp_len, &ip_info.src_addr, &ip_info.dst_addr) orelse {
+        ipstack.stats.checksum_errors += 1;
+        return error.ChecksumError;
+    };
+
+    ipstack.stats.icmpv6_packets += 1;
+
+    // Handle echo request
+    if (icmp_info.type == icmpv6.TYPE_ECHO_REQUEST) {
+        const icmp_payload = if (icmp_len > icmpv6.HDR_SIZE) data[icmp_offset + icmpv6.HDR_SIZE ..len] else &[_]u8{};
+        if (ipstack.config.callbacks.onIcmpv6Echo) |cb| {
+            cb(&ip_info.src_addr, &ip_info.dst_addr, icmp_info.identifier, icmp_info.sequence, icmp_payload);
+        }
+    } else if (icmpv6.needsResponse(icmp_info.type)) {
+        // Handle other query types that need responses
+        if (ipstack.config.callbacks.onIcmpv6) |cb| {
+            cb(&ip_info.src_addr, &ip_info.dst_addr, icmp_info.type, icmp_info.code, &.{});
+        }
+    } else {
+        // Error messages - forward if callback exists
+        if (ipstack.config.callbacks.onIcmpv6) |cb| {
+            cb(&ip_info.src_addr, &ip_info.dst_addr, icmp_info.type, icmp_info.code, &.{});
+        }
+    }
+}
+
+/// Send ICMPv6 Echo Reply
+/// ipstack: IP stack context
+/// src_addr: Original sender IPv6 address
+/// dst_addr: TUN interface IPv6 address
+/// identifier: ICMPv6 identifier from request
+/// sequence: ICMPv6 sequence from request
+/// payload: Payload from request
+/// reply_buf: Output buffer for reply
+/// Returns: Total reply length
+pub fn buildIcmpv6EchoReply(
+    ipstack: *StaticIpstack,
+    src_addr: *const [16]u8,
+    dst_addr: *const [16]u8,
+    identifier: u16,
+    sequence: u16,
+    payload: []const u8,
+    reply_buf: []u8,
+) Error!usize {
+    _ = ipstack; // Reserved for future use
+    const total_len = icmpv6.HDR_SIZE + payload.len;
+    if (total_len > reply_buf.len) {
+        return error.BufferTooSmall;
+    }
+
+    // Build ICMPv6 echo reply with checksum
+    const len = icmpv6.buildEchoReply(reply_buf.ptr, identifier, sequence, payload, dst_addr, src_addr);
+    return len;
+}
+
+/// Send IPv6 UDP packet
+pub fn ipv6UdpSend(
+    ipstack: *StaticIpstack,
+    src_addr: *const [16]u8,
+    src_port: u16,
+    dst_addr: *const [16]u8,
+    dst_port: u16,
+    data: []const u8,
+    buf: []u8,
+) Error!usize {
+    _ = ipstack; // Reserved for future use
+    const udp_len = udp.HDR_SIZE + data.len;
+    const total_len = ipv6.HDR_SIZE + udp_len;
+
+    if (total_len > buf.len) {
+        return error.BufferTooSmall;
+    }
+
+    // Build IPv6 header
+    ipv6.buildHeader(buf.ptr, src_addr, dst_addr, ipv6.NH_UDP, udp_len);
+
+    // Build UDP header with checksum
+    const udp_offset = ipv6.HDR_SIZE;
+    _ = udp.buildHeaderWithChecksum(
+        buf[udp_offset..].ptr,
+        @as(*const [16]u8, @ptrCast(src_addr))[0..16].ptr,
+        @as(*const [16]u8, @ptrCast(dst_addr))[0..16].ptr,
+        src_port,
+        dst_port,
+        data,
+    );
+
+    return total_len;
 }
 
 /// Find free connection slot

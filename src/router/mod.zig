@@ -2066,6 +2066,29 @@ pub const Router = struct {
         std.debug.print("[ICMP] Reply sent successfully\n", .{});
     }
 
+    /// Format IPv6 address for logging
+    fn fmtIpv6(ip: *const [16]u8) [46]u8 {
+        var buf: [46]u8 = undefined;
+        const formatted = ipstack.ipv6.formatIp(ip, &buf);
+        @memcpy(buf[0..formatted.len], formatted);
+        if (formatted.len < buf.len) {
+            buf[formatted.len] = 0;
+        }
+        return buf;
+    }
+
+    /// Handle IPv6 packet received from TUN
+    fn onIpv6PacketReceived(router: *Router, packet_offset: usize, n: usize) xev.CallbackAction {
+        _ = router;
+        _ = packet_offset;
+        _ = n;
+        // TODO: Implement IPv6 packet handling
+        // For now, drop IPv6 packets and resubmit read
+        std.debug.print("[IPv6] IPv6 packet received, not yet implemented - dropping\n", .{});
+        router.submitTunRead();
+        return .disarm;
+    }
+
     /// Parse IP packet and extract 4-tuple
     /// Uses ipstack for protocol parsing
     fn parsePacket(router: *Router, data: []const u8) !Packet {
@@ -2143,19 +2166,37 @@ fn onTunReadable(
     std.debug.print("[TUN-CB] Read {} bytes from TUN (fd={})\n", .{ n, router.tunFd() });
     router._stats.bytes_rx += n;
 
-    // Check for macOS utun 4-byte AF_INET header
-    // macOS format: bytes 0-3 = 00 00 00 02 (AF_INET=2 at byte 3 in network byte order)
+    // Check for macOS utun header (AF_INET=2 or AF_INET6=24 at byte 3 in network byte order)
     var packet_offset: usize = 0;
-    if (n >= 4 and router.packet_buf[3] == 2) {
-        std.debug.print("[TUN-CB] UTUN header detected (AF_INET=2), skipping 4 bytes\n", .{});
-        packet_offset = 4;
+    var is_ipv6 = false;
+    if (n >= 4) {
+        const af_type = router.packet_buf[3];
+        if (af_type == 2) {
+            // IPv4
+            std.debug.print("[TUN-CB] UTUN header detected (AF_INET=2), skipping 4 bytes\n", .{});
+            packet_offset = 4;
+        } else if (af_type == 24 or af_type == 0x18) {
+            // IPv6 (AF_INET6 = 24 = 0x18)
+            std.debug.print("[TUN-CB] UTUN header detected (AF_INET6={}), skipping 4 bytes\n", .{af_type});
+            packet_offset = 4;
+            is_ipv6 = true;
+        }
     }
 
-    if (n - packet_offset < 20) {
-        std.debug.print("[TUN-CB-WARN] Packet too small ({} < 20), dropping\n", .{n - packet_offset});
+    // Check minimum size based on IP version
+    const min_size = if (is_ipv6) 40 else 20; // IPv6 header is 40 bytes, IPv4 is 20
+    if (n - packet_offset < min_size) {
+        std.debug.print("[TUN-CB-WARN] Packet too small ({} < {}), dropping\n", .{ n - packet_offset, min_size });
         router.submitTunRead();
         return .disarm;
     }
+
+    // Handle IPv6 packets
+    if (is_ipv6) {
+        return router.onIpv6PacketReceived(packet_offset, n);
+    }
+
+    // IPv4 packet handling continues below...
 
     // Extract packet info for logging
     const proto_byte = router.packet_buf[packet_offset + 9];
