@@ -151,7 +151,22 @@ SOCKS5 UDP Response → onSocks5UdpData()
 
 ---
 
-### Phase 15: JSON Configuration Support (IN PROGRESS)
+### Phase 15: JSON Configuration Support (COMPLETED)
+
+**Goal**: Support JSON configuration file
+
+**Key Changes**:
+
+1. **Config Module** (`src/config.zig`)
+   - `Config` struct for full configuration
+   - `TunConfig`, `OutboundConfig`, `RouteConfig`, `DnsConfig`
+   - JSON parsing with `parse()` function
+   - Support for all major configuration sections
+
+**Files Modified**:
+| File | Changes |
+|------|---------|
+| `src/config.zig` | New JSON configuration parser |
 
 ---
 
