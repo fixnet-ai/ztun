@@ -1205,6 +1205,12 @@ pub const Router = struct {
         std.debug.print("[UDP-SOCKS5] forwardUdpToSocks5 called\n", .{});
         std.debug.print("[UDP-SOCKS5] Packet: {s}:{} -> {s}:{}\n", .{ fmtIp(packet.src_ip), packet.src_port, fmtIp(packet.dst_ip), packet.dst_port });
 
+        // Check if this is a DNS query
+        const is_dns = router.isDnsQuery(packet.dst_port);
+        if (is_dns) {
+            std.debug.print("[UDP-SOCKS5] DNS query detected (port 53)\n", .{});
+        }
+
         // Check if UDP associate is ready
         if (router.udp_associate) |ua| {
             if (ua.isReady()) {
@@ -2079,10 +2085,37 @@ fn onNatTimer(
         _ = router.nat_table.?.cleanup();
     }
 
+    // Cleanup expired UDP sessions (60 second timeout)
+    router.cleanupUdpSessions();
+
     // Resubmit timer
     router.submitNatTimer();
 
     return .disarm;
+}
+
+/// Cleanup expired UDP sessions
+fn cleanupUdpSessions(router: *Router) void {
+    const now = std.time.timestamp();
+    const timeout: i64 = 60; // 60 seconds timeout
+
+    var cleaned: usize = 0;
+    for (router.udp_sessions) |*entry| {
+        if (entry.used and now - entry.last_active > timeout) {
+            entry.used = false;
+            cleaned += 1;
+        }
+    }
+
+    if (cleaned > 0) {
+        std.debug.print("[UDP-SESSION] Cleaned {} expired sessions\n", .{cleaned});
+    }
+}
+
+/// Check if packet is a DNS query (UDP port 53)
+fn isDnsQuery(router: *Router, dst_port: u16) bool {
+    _ = router;
+    return dst_port == 53;
 }
 
 /// SOCKS5 data callback - forward received data from proxy to TUN

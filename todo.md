@@ -75,12 +75,16 @@ SOCKS5 UDP Response → onSocks5UdpData()
      └─ writeToTunBuf() → TUN
 ```
 
-**Required Changes** (remaining):
-- [ ] Implement SOCKS5 UDP Associate handshake (UDP bind request/reply)
-- [ ] DNS query identification (port 53) and forwarding
+**Required Changes** (IN PROGRESS):
+- [x] SOCKS5 UDP Associate client infrastructure
+- [x] UDP session tracking
+- [x] UDP data encapsulation/decapsulation
+- [x] UDP response handling and TUN writeback
+- [x] SOCKS5 UDP Associate handshake (UDP bind request/reply)
+- [x] DNS query identification (port 53)
 - [ ] DNS response tunneling back to TUN
 - [ ] DNS timeout and retry logic
-- [ ] UDP session timeout and cleanup
+- [x] UDP session timeout and cleanup
 
 ---
 

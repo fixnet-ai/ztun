@@ -91,6 +91,9 @@ pub const UdpAssociateState = enum(u8) {
 /// UDP datagram callback
 pub const UdpDatagramCallback = *const fn (userdata: ?*anyopaque, data: []const u8, src_ip: u32, src_port: u16) void;
 
+/// Callback when UDP associate is ready
+pub const UdpReadyCallback = *const fn (userdata: ?*anyopaque, client: *Socks5UdpAssociate) void;
+
 /// SOCKS5 UDP Associate client for UDP forwarding through proxy
 pub const Socks5UdpAssociate = struct {
     /// libxev event loop
@@ -120,6 +123,7 @@ pub const Socks5UdpAssociate = struct {
 
     /// Callbacks
     on_udp_data: ?UdpDatagramCallback = null,
+    on_ready: ?UdpReadyCallback = null,
     on_error: ?*const fn (userdata: ?*anyopaque, err: Socks5Error) void,
 
     /// Create a new UDP Associate client
@@ -150,19 +154,70 @@ pub const Socks5UdpAssociate = struct {
         self: *Socks5UdpAssociate,
         userdata: ?*anyopaque,
         on_udp_data: ?UdpDatagramCallback,
+        on_ready: ?UdpReadyCallback,
         on_error: ?*const fn (userdata: ?*anyopaque, err: Socks5Error) void,
     ) void {
         self.userdata = userdata;
         self.on_udp_data = on_udp_data;
+        self.on_ready = on_ready;
         if (on_error) |cb| self.on_error = cb;
     }
 
-    /// Establish UDP associate binding via SOCKS5 proxy
-    pub fn associate(
-        self: *Socks5UdpAssociate,
-    ) Socks5Error!void {
+    /// Establish UDP associate binding via SOCKS5 proxy (async)
+    /// Sends UDP ASSOCIATE request through TCP connection and waits for reply
+    pub fn associateAsync(self: *Socks5UdpAssociate) Socks5Error!void {
         std.debug.print("\n[SOCKS5-UDP] ============================================\n", .{});
-        std.debug.print("[SOCKS5-UDP] associate() called\n", .{});
+        std.debug.print("[SOCKS5-UDP] associateAsync() called\n", .{});
+        std.debug.print("[SOCKS5-UDP] TCP connection state: {s}\n", .{@tagName(self.tcp_conn.getState())});
+
+        // Check if TCP connection is ready
+        if (self.tcp_conn.getState() != .Ready) {
+            std.debug.print("[SOCKS5-UDP-ERROR] TCP connection not ready: {s}\n", .{@tagName(self.tcp_conn.getState())});
+            return error.NotReady;
+        }
+
+        self.state = .Binding;
+        std.debug.print("[SOCKS5-UDP-STATE] Changed to .Binding\n", .{});
+
+        // Build UDP ASSOCIATE request
+        // Format: VER=5, CMD=3 (UDP ASSOCIATE), RSV=0, ATYP=1 (IPv4), DST.ADDR=0.0.0.0, DST.PORT=0
+        self.write_buf[0] = 0x05; // VER
+        self.write_buf[1] = 0x03; // CMD = UDP ASSOCIATE
+        self.write_buf[2] = 0x00; // RSV
+        self.write_buf[3] = 0x01; // ATYP = IPv4
+        self.write_buf[4] = 0x00; // DST.ADDR = 0.0.0.0
+        self.write_buf[5] = 0x00;
+        self.write_buf[6] = 0x00;
+        self.write_buf[7] = 0x00;
+        self.write_buf[8] = 0x00; // DST.PORT = 0
+        self.write_buf[9] = 0x00;
+
+        std.debug.print("[SOCKS5-UDP] Sending UDP ASSOCIATE request...\n", .{});
+        std.debug.print("[SOCKS5-UDP] Request: 05 03 00 01 00 00 00 00 00 00\n", .{});
+
+        // Send request through TCP connection
+        self.tcp_conn.write(self.write_buf[0..10]) catch |err| {
+            std.debug.print("[SOCKS5-UDP-ERROR] Failed to send UDP ASSOCIATE: {}\n", .{err});
+            self.state = .Error;
+            if (self.on_error) |cb| cb(self.userdata, error.ConnectionFailed);
+            return error.ConnectionFailed;
+        };
+
+        // Submit read for UDP ASSOCIATE reply
+        self.tcp_conn.read(self.read_buf[0..10], onUdpAssociateReply) catch |err| {
+            std.debug.print("[SOCKS5-UDP-ERROR] Failed to submit read: {}\n", .{err});
+            self.state = .Error;
+            if (self.on_error) |cb| cb(self.userdata, error.ConnectionFailed);
+            return error.ConnectionFailed;
+        };
+
+        std.debug.print("[SOCKS5-UDP] Waiting for UDP ASSOCIATE reply...\n", .{});
+        std.debug.print("[SOCKS5-UDP-EXIT] ============================================\n\n", .{});
+    }
+
+    /// Create and connect UDP socket after successful UDP ASSOCIATE
+    fn createUdpSocket(self: *Socks5UdpAssociate) Socks5Error!void {
+        std.debug.print("[SOCKS5-UDP] Creating UDP socket...\n", .{});
 
         // Create UDP socket
         self.udp_sock = std.posix.socket(
@@ -174,9 +229,9 @@ pub const Socks5UdpAssociate = struct {
             return error.SocketFailed;
         };
 
-        std.debug.print("[SOCKS5-UDP] socket created: fd={}\n", .{self.udp_sock});
+        std.debug.print("[SOCKS5-UDP] UDP socket created: fd={}\n", .{self.udp_sock});
 
-        // Connect UDP socket to proxy (for sending UDP datagrams)
+        // Connect UDP socket to proxy's UDP relay address
         std.posix.connect(self.udp_sock, &self.tcp_conn.proxy_addr.any, self.tcp_conn.proxy_addr.getOsSockLen()) catch |err| {
             std.debug.print("[SOCKS5-UDP-ERROR] connect() failed: {}\n", .{err});
             std.posix.close(self.udp_sock);
@@ -184,7 +239,19 @@ pub const Socks5UdpAssociate = struct {
         };
 
         std.debug.print("[SOCKS5-UDP] UDP socket connected to proxy\n", .{});
-        std.debug.print("[SOCKS5-UDP-EXIT] ============================================\n\n", .{});
+
+        // Start reading UDP datagrams from proxy
+        self.submitRead();
+
+        // Notify ready
+        self.state = .Ready;
+        std.debug.print("[SOCKS5-UDP-STATE] Changed to .Ready\n", .{});
+
+        if (self.on_ready) |cb| {
+            std.debug.print("[SOCKS5-UDP] Calling on_ready callback...\n", .{});
+            cb(self.userdata, self);
+            std.debug.print("[SOCKS5-UDP] on_ready callback returned\n", .{});
+        }
     }
 
     /// Send UDP datagram through SOCKS5 proxy
@@ -271,6 +338,105 @@ pub const Socks5UdpAssociate = struct {
 fn onDefaultError(userdata: ?*anyopaque, err: Socks5Error) void {
     _ = userdata;
     std.debug.print("[SOCKS5-UDP-ERROR] {}\n", .{err});
+}
+
+/// UDP ASSOCIATE reply callback - handles the UDP ASSOCIATE response from SOCKS5 proxy
+fn onUdpAssociateReply(
+    userdata: ?*anyopaque,
+    loop: *xev.Loop,
+    completion: *xev.Completion,
+    result: xev.Result,
+) xev.CallbackAction {
+    _ = loop;
+    _ = completion;
+
+    const self: *Socks5UdpAssociate = @ptrCast(@alignCast(userdata orelse return .disarm));
+
+    const n = result.read catch |err| {
+        std.debug.print("[SOCKS5-UDP-ERROR] UDP ASSOCIATE reply read failed: {}\n", .{err});
+        self.state = .Error;
+        if (self.on_error) |cb| cb(self.userdata, error.ConnectionFailed);
+        return .disarm;
+    };
+
+    if (n == 0) {
+        std.debug.print("[SOCKS5-UDP-ERROR] UDP ASSOCIATE reply: EOF\n", .{});
+        self.state = .Error;
+        if (self.on_error) |cb| cb(self.userdata, error.InvalidData);
+        return .disarm;
+    }
+
+    std.debug.print("[SOCKS5-UDP] UDP ASSOCIATE reply received: {} bytes\n", .{n});
+    std.debug.print("[SOCKS5-UDP] Reply: {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2}\n", .{
+        self.read_buf[0], self.read_buf[1], self.read_buf[2], self.read_buf[3],
+        self.read_buf[4], self.read_buf[5], self.read_buf[6], self.read_buf[7],
+        self.read_buf[8], self.read_buf[9],
+    });
+
+    // Parse UDP ASSOCIATE reply
+    // Format: VER=5, REP=0 (success), RSV=0, ATYP=1 (IPv4), BND.ADDR, BND.PORT
+    const ver = self.read_buf[0];
+    const rep = self.read_buf[1];
+
+    if (ver != 0x05) {
+        std.debug.print("[SOCKS5-UDP-ERROR] Invalid VER in UDP ASSOCIATE reply: {x:0>2}\n", .{ver});
+        self.state = .Error;
+        if (self.on_error) |cb| cb(self.userdata, error.InvalidData);
+        return .disarm;
+    }
+
+    if (rep != 0x00) {
+        std.debug.print("[SOCKS5-UDP-ERROR] UDP ASSOCIATE failed with REP={x:0>2}\n", .{rep});
+        self.state = .Error;
+        if (self.on_error) |cb| cb(self.userdata, error.ConnectionFailed);
+        return .disarm;
+    }
+
+    std.debug.print("[SOCKS5-UDP] UDP ASSOCIATE successful!\n", .{});
+
+    // Parse BND.ADDR and BND.PORT
+    const atyp = self.read_buf[3];
+    if (atyp != 0x01) {
+        std.debug.print("[SOCKS5-UDP-ERROR] Only IPv4 BND.ADDR supported, got ATYP={x:0>2}\n", .{atyp});
+        self.state = .Error;
+        if (self.on_error) |cb| cb(self.userdata, error.NotSupported);
+        return .disarm;
+    }
+
+    const bnd_ip = std.mem.readInt(u32, self.read_buf[4..8], .big);
+    const bnd_port = std.mem.readInt(u16, self.read_buf[8..10], .big);
+
+    std.debug.print("[SOCKS5-UDP] UDP relay address: {s}:{}\n", .{ fmtIp(bnd_ip), bnd_port });
+
+    // Create and connect UDP socket
+    self.createUdpSocket() catch |err| {
+        std.debug.print("[SOCKS5-UDP-ERROR] Failed to create UDP socket: {}\n", .{err});
+        self.state = .Error;
+        if (self.on_error) |cb| cb(self.userdata, error.SocketFailed);
+        return .disarm;
+    };
+
+    return .disarm;
+}
+
+/// Write completion callback
+fn onWrite(
+    userdata: ?*anyopaque,
+    loop: *xev.Loop,
+    completion: *xev.Completion,
+    result: xev.Result,
+) xev.CallbackAction {
+    _ = loop;
+    _ = completion;
+
+    const self: *Socks5Client = @ptrCast(@alignCast(userdata orelse return .disarm));
+
+    _ = result.write catch |err| {
+        std.debug.print("[SOCKS5-WARN] Write failed: {}\n", .{err});
+        return .disarm;
+    };
+
+    return .disarm;
 }
 
 /// UDP read callback - receive datagrams from proxy
@@ -432,6 +598,40 @@ pub const Socks5Client = struct {
         self.on_tunnel_ready = on_tunnel_ready;
         self.on_ready = on_ready;
         self.on_error = on_error;
+    }
+
+    /// Read from socket with custom callback (for UDP ASSOCIATE reply)
+    pub fn read(
+        self: *Socks5Client,
+        buf: []u8,
+        comptime callback: fn (userdata: ?*anyopaque, loop: *xev.Loop, completion: *xev.Completion, result: xev.Result) xev.CallbackAction,
+    ) !void {
+        self.completion = .{
+            .op = .{
+                .read = .{
+                    .fd = self.sock,
+                    .buffer = .{ .slice = buf },
+                },
+            },
+            .userdata = self,
+            .callback = callback,
+        };
+        self.loop.add(&self.completion);
+    }
+
+    /// Write to socket
+    pub fn write(self: *Socks5Client, data: []const u8) !void {
+        self.completion = .{
+            .op = .{
+                .write = .{
+                    .fd = self.sock,
+                    .buffer = .{ .slice = data },
+                },
+            },
+            .userdata = self,
+            .callback = onWrite,
+        };
+        self.loop.add(&self.completion);
     }
 
     /// Connect to SOCKS5 proxy asynchronously
